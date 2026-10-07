@@ -13,7 +13,6 @@ A prioritized roadmap of strategic enhancements, UX refinements, and native OS i
 | **NB-03** | **Production-Grade Transfer Manager (Retry & History)** | 5 | Medium | High | P1 | In Progress |
 | **NB-04** | **Global Drag-and-Drop Everywhere** | 3 | Low-Med | High | P2 | Ready |
 | **NB-05** | **Windows Shell & Share Menu Integration** | 5 | Medium | High | P2 | Ready |
-| **NB-06** | **Close Window Dialog: Minimize to Tray vs. Exit** | 2 | Low | Med-High | P2 | Tracked (#1) |
 
 ---
 
@@ -105,19 +104,3 @@ A prioritized roadmap of strategic enhancements, UX refinements, and native OS i
 - **Acceptance Criteria:**
   - Clicking "Send with NearBeam" launches the app (or opens tray instance) with the target file queued for sending.
 
----
-
-### NB-06: Window Close Action Dialog (Minimize to Tray vs. Exit)
-- **Theme:** Desktop Quality of Life
-- **Story Points:** `2 pts` | **Effort:** `Low` | **Impact:** `Medium-High`
-- **Reference:** GitHub Issue [#1](https://github.com/tanumay-deb/NearBeam/issues/1)
-- **User Story:** As a desktop user, I want to know whether clicking 'X' will kill active transfers or keep the server running in the background.
-- **Key Deliverables:**
-  - Intercept `closeEvent` in PySide6 `MainWindow`.
-  - Show choice dialog:
-    1. **Minimize to Tray** *(Keeps Wi-Fi server online for incoming files)*
-    2. **Exit NearBeam** *(Completely closes app & server)*
-    3. **Cancel**
-  - "Remember my choice" option saved in `config.json`.
-- **Acceptance Criteria:**
-  - Choosing "Minimize to Tray" hides the window to the system notification area without terminating active downloads.

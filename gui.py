@@ -1273,12 +1273,31 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event):
-        # Clean shutdown when user closes the window
-        if self.server_instance:
-            self.server_instance.shutdown()
-        if self.server_thread:
-            self.server_thread.shutdown()
-        event.accept()
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Close NearBeam")
+        msg_box.setText("Do you want to run NearBeam in the background?")
+        msg_box.setInformativeText("Minimizing to tray keeps NearBeam active for background file transfers.")
+        
+        minimize_btn = msg_box.addButton("Minimize to Tray", QMessageBox.AcceptRole)
+        exit_btn = msg_box.addButton("Exit App", QMessageBox.DestructiveRole)
+        cancel_btn = msg_box.addButton(QMessageBox.Cancel)
+        
+        msg_box.exec()
+        
+        if msg_box.clickedButton() == minimize_btn:
+            self.hide()
+            self.tray_icon.showMessage(
+                "NearBeam is still running",
+                "NearBeam has been minimized to the system tray and is running in the background.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+            event.ignore()
+        elif msg_box.clickedButton() == exit_btn:
+            self._clean_exit()
+            event.accept()
+        else:
+            event.ignore()
 
 
 def run_gui(start_minimized: bool = False):
