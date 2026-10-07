@@ -2,7 +2,7 @@
 ; Bundles LANDrop into a professional Windows Setup Installer
 
 #define MyAppName "LANDrop"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.3.1"
 #define MyAppPublisher "Tanumay Goswami"
 #define MyAppURL "https://github.com/tanumay-deb/LANDrop"
 #define MyAppExeName "LANDrop.exe"
@@ -27,6 +27,8 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; Close a running (tray) LANDrop so its locked exe can be replaced
+CloseApplications=force
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

@@ -6,7 +6,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8") if
 
 setup(
     name="landrop",
-    version="1.3.0",
+    version="1.3.1",
     description="High-Speed Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh",
     long_description=long_description,
     long_description_content_type="text/markdown",
