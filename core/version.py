@@ -1,5 +1,5 @@
 """
-LANDrop Version and Update Management.
+NearBeam Version and Update Management.
 Checks for updates against GitHub Releases API.
 """
 
@@ -8,9 +8,9 @@ import re
 import urllib.error
 import urllib.request
 
-APP_VERSION = "1.3.1"
-APP_NAME = "LANDrop"
-GITHUB_REPO = "tanumay-deb/LANDrop"
+APP_VERSION = "1.4.0"
+APP_NAME = "NearBeam"
+GITHUB_REPO = "tanumay-deb/NearBeam"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -52,7 +52,7 @@ def check_for_updates(timeout_sec: float = 4.0) -> dict:
         req = urllib.request.Request(
             LATEST_RELEASE_API,
             headers={
-                "User-Agent": f"LANDrop-Client/{APP_VERSION}",
+                "User-Agent": f"NearBeam-Client/{APP_VERSION}",
                 "Accept": "application/vnd.github.v3+json",
             },
         )
@@ -64,7 +64,7 @@ def check_for_updates(timeout_sec: float = 4.0) -> dict:
 
                 result["latest_version"] = tag_name.lstrip("v")
                 result["release_url"] = data.get("html_url", f"{RELEASES_URL}/latest")
-                result["release_title"] = data.get("name", f"LANDrop {tag_name}")
+                result["release_title"] = data.get("name", f"NearBeam {tag_name}")
                 result["release_notes"] = data.get("body", "")
 
                 if remote_tuple > current_tuple:

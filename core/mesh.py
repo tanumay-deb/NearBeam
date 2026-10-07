@@ -1,5 +1,5 @@
 """
-LANDrop Mesh & Cluster Management Layer.
+NearBeam Mesh & Cluster Management Layer.
 Enables Leader-Follower auto-discovery, heartbeat monitoring,
 and unified multi-host file transfer and clipboard coordination.
 """
@@ -120,7 +120,7 @@ class MeshManager:
 
     def _discover_and_elect(self):
         """Broadcasts WHO_IS_LEADER and listens for existing leader announcements."""
-        print("  [Mesh] Searching for existing LANDrop Leader on Wi-Fi...")
+        print("  [Mesh] Searching for existing NearBeam Leader on Wi-Fi...")
         leader_found = False
         start_time = time.time()
 

@@ -1,5 +1,5 @@
 """
-Configuration and persistence management for LANDrop.
+Configuration and persistence management for NearBeam.
 Handles Safe List folders, Auto-Save preferences, and settings.
 """
 
@@ -22,7 +22,7 @@ class ConfigManager:
             self.config_path = Path(config_path)
 
         # Default save directory in user's Downloads folder
-        downloads_dir = Path.home() / "Downloads" / "LANDrop_Received"
+        downloads_dir = Path.home() / "Downloads" / "NearBeam_Received"
         self.default_save_dir = str(downloads_dir)
 
         self.data = {

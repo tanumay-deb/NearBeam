@@ -1,31 +1,23 @@
 """
-Main entry point for LANDrop.
-Supports both Desktop GUI (default) and Headless CLI mode (--headless).
+Main entry point for NearBeam.
+Launches the PySide6 Desktop GUI, or runs headless CLI server with --headless / --cli.
 """
 
 import argparse
 import os
 import sys
-import time
+from pathlib import Path
 
-# Ensure stdout and stderr are never None in --noconsole windowed GUI binaries
-if sys.stdout is None:
-    try:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
-    except Exception:
-        pass
-if sys.stderr is None:
-    try:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
-    except Exception:
-        pass
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Set AppUserModelID so Windows taskbar shows our custom icon instead of generic Python
 if sys.platform == "win32":
     try:
-        if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        if sys.stderr and hasattr(sys.stderr, "reconfigure"):
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "NearBeam.WiFiTransfer.Desktop.1"
+        )
     except Exception:
         pass
 
@@ -36,22 +28,22 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
-from core.server import LandropServer
+from core.server import NearBeamServer, LandropServer
 
 
 def run_headless(port: int = 5000):
     actual_port = find_available_port(port)
-    server = LandropServer(port=actual_port)
+    server = NearBeamServer(port=actual_port)
     urls = get_connection_urls(actual_port)
 
     print("\n" + "=" * 60)
-    print("  🚀 LANDrop Server is ONLINE & READY ON WI-FI")
+    print("  🚀 NearBeam Server is ONLINE & READY ON WI-FI")
     print("=" * 60)
-    print(f"\n  ⭐ Permanent URL:          {urls['landrop_url']}")
+    print(f"\n  ⭐ Permanent URL:          {urls['nearbeam_url']}")
     print(f"  👉 Hostname URL:           {urls['mdns_url']}")
     print(f"  👉 Direct IP URL:          {urls['primary_url']}")
     print(f"  🔍 Network Auto-Finder:    {urls['primary_url']}/finder")
-    print("\n  💡 Tip: Bookmark 'http://landrop.local:5000' on your phone.")
+    print("\n  💡 Tip: Bookmark 'http://nearbeam.local:5000' on your phone.")
     print("  It automatically stays connected even if your router changes your IP!\n")
     print(f"  📁 Auto-Save Destination:  {config.save_directory}")
     print(f"  🔒 Safe List Folders:      {len(config.get_safe_folders())} folder(s) shared")
@@ -69,13 +61,13 @@ def run_headless(port: int = 5000):
         WSGIRequestHandler.timeout = 60
         server.app.run(host="0.0.0.0", port=actual_port, threaded=True)
     except KeyboardInterrupt:
-        print("\n  Shutting down LANDrop server...")
+        print("\n  Shutting down NearBeam server...")
     finally:
         server.shutdown()
 
 
 def ensure_windows_start_menu_shortcut():
-    """Ensures LANDrop is registered in the Windows Start Menu 'All apps' list."""
+    """Ensures NearBeam is registered in the Windows Start Menu 'All apps' list."""
     if sys.platform != "win32":
         return
     try:
@@ -83,7 +75,16 @@ def ensure_windows_start_menu_shortcut():
         if not appdata:
             return
         programs_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs")
-        shortcut_path = os.path.join(programs_dir, "LANDrop.lnk")
+        
+        # Clean up legacy shortcut if present
+        legacy_shortcut = os.path.join(programs_dir, "LANDrop.lnk")
+        if os.path.exists(legacy_shortcut):
+            try:
+                os.remove(legacy_shortcut)
+            except Exception:
+                pass
+
+        shortcut_path = os.path.join(programs_dir, "NearBeam.lnk")
         if os.path.exists(shortcut_path):
             return
 
@@ -95,7 +96,9 @@ def ensure_windows_start_menu_shortcut():
             target = sys.executable
             icon_path = target
         else:
-            scripts_exe = os.path.join(os.path.dirname(sys.executable), "Scripts", "landrop.exe")
+            scripts_exe = os.path.join(os.path.dirname(sys.executable), "Scripts", "nearbeam.exe")
+            if not os.path.exists(scripts_exe):
+                scripts_exe = os.path.join(os.path.dirname(sys.executable), "Scripts", "landrop.exe")
             if os.path.exists(scripts_exe):
                 target = scripts_exe
             else:
@@ -126,7 +129,7 @@ def ensure_windows_start_menu_shortcut():
 
 def main():
     ensure_windows_start_menu_shortcut()
-    parser = argparse.ArgumentParser(description="LANDrop - Wi-Fi File Sharing & Explorer")
+    parser = argparse.ArgumentParser(description="NearBeam - Wi-Fi File Sharing & Explorer")
     parser.add_argument(
         "--headless",
         "--cli",
@@ -142,7 +145,7 @@ def main():
     parser.add_argument(
         "--minimized",
         action="store_true",
-        help="Start LANDrop minimized directly to the Windows system tray",
+        help="Start NearBeam minimized directly to the Windows system tray",
     )
     args = parser.parse_args()
 
@@ -156,7 +159,7 @@ def main():
             import traceback
             err_msg = traceback.format_exc()
             try:
-                with open("landrop_error.log", "w", encoding="utf-8") as f:
+                with open("nearbeam_error.log", "w", encoding="utf-8") as f:
                     f.write(err_msg)
             except Exception:
                 pass
@@ -165,8 +168,8 @@ def main():
                 import ctypes
                 ctypes.windll.user32.MessageBoxW(
                     0,
-                    f"LANDrop could not open the desktop window:\n\n{e}\n\nDetails saved to landrop_error.log",
-                    "LANDrop Launch Notice",
+                    f"NearBeam could not open the desktop window:\n\n{e}\n\nDetails saved to nearbeam_error.log",
+                    "NearBeam Launch Notice",
                     0x30,
                 )
             except Exception:

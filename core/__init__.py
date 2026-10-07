@@ -1,3 +1,3 @@
 """
-LANDrop Core Package
+NearBeam Core Package
 """

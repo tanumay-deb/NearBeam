@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LANDrop - Auto Finder</title>
+  <title>NearBeam - Auto Finder</title>
   <link rel="icon" type="image/png" href="/static/favicon.png" />
   <style>
     body {
@@ -103,17 +103,17 @@
       document.getElementById("desc").innerText = "Scanning local Wi-Fi to find your computer's updated IP address.";
 
       // First check permanent mDNS
-      document.getElementById("status").innerText = "Checking landrop.local...";
+      document.getElementById("status").innerText = "Checking nearbeam.local...";
       try {
-        const mres = await checkHost("landrop.local");
+        const mres = await checkHost("nearbeam.local");
         if (mres) {
-          onFound("landrop.local", mres.data);
+          onFound("nearbeam.local", mres.data);
           return;
         }
       } catch (e) {}
 
       // Get last known IP from localStorage if available
-      const lastIp = localStorage.getItem("landrop_last_ip");
+      const lastIp = localStorage.getItem("nearbeam_last_ip") || localStorage.getItem("landrop_last_ip");
       if (lastIp) {
         document.getElementById("status").innerText = `Checking last known IP (${lastIp})...`;
         const res = await checkHost(lastIp);
@@ -144,13 +144,13 @@
       // If not found
       document.getElementById("spinner").style.display = "none";
       document.getElementById("title").innerText = "PC Not Found";
-      document.getElementById("desc").innerText = "Make sure LANDrop is running on your computer and both devices are on the same Wi-Fi.";
+      document.getElementById("desc").innerText = "Make sure NearBeam is running on your computer and both devices are on the same Wi-Fi.";
       document.getElementById("status").innerText = "";
       document.getElementById("retryBtn").style.display = "inline-block";
     }
 
     function onFound(ip, data) {
-      localStorage.setItem("landrop_last_ip", ip);
+      localStorage.setItem("nearbeam_last_ip", ip);
       document.getElementById("spinner").style.display = "none";
       document.getElementById("title").innerText = "PC Found!";
       document.getElementById("desc").innerText = `Connecting to ${data.hostname} at ${ip}...`;

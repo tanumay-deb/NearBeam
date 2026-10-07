@@ -1,88 +1,137 @@
-# LANDrop 🚀
+# ⚡ NearBeam
 
-> High-speed, private local Wi-Fi file transfer & Safe List folder explorer for Windows, Android, iOS, Mac, and Linux.
+<p align="center">
+  <img src="assets/icon.png" width="128" height="128" alt="NearBeam Logo" />
+</p>
+
+<p align="center">
+  <strong>Ultra-fast, zero-cloud Wi-Fi file transfers & shared folder explorer across Windows, iOS, Android, macOS & Linux.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/tanumay-deb/NearBeam/releases/latest"><img src="https://img.shields.io/github/v/release/tanumay-deb/NearBeam?color=blue&label=Latest%20Release" alt="Latest Release"></a>
+  <a href="https://github.com/tanumay-deb/NearBeam/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-indigo.svg" alt="Platforms">
+  <img src="https://img.shields.io/badge/Network-100%25%20Local%20LAN%20%7C%20Zero%20Cloud-success.svg" alt="100% Local">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg" alt="Python 3.8+">
+</p>
 
 ---
 
-## ✨ Highlights
+## 💡 Why NearBeam?
 
-- **⚡ No QR Code & No IP Hassle**:
-  - **Permanent Address**: Bookmark **`http://landrop.local:5000`** on your phone. Even when your Wi-Fi router changes or reassigns your computer's IP address (DHCP renewal), mDNS automatically resolves to the new IP!
-  - **Automatic Subnet Finder**: If needed, visit **`http://<any-ip>:5000/finder`** or use the auto-finder. In 1–2 seconds, it sweeps your Wi-Fi network and reconnects to your PC automatically.
-- **🔒 Safe List Folder Explorer**: Choose specific folders on your computer to share. Remote devices can browse subfolders, view files with breadcrumbs, preview media, and download single files or whole directories as a ZIP.
-- **📥 Instant Auto-Save**: Incoming files from phones/tablets are **automatically saved** straight to your designated folder (`Downloads/LANDrop_Received`) with automatic duplicate protection (`photo (1).jpg`).
-- **📋 Cross-Device Shared Clipboard**: Seamlessly copy/paste links, notes, and text between PC and mobile with 1-tap copy.
-- **🌐 Leader-Follower Mesh Cluster**: Running LANDrop on both your PC and Laptop? They automatically discover each other on your Wi-Fi! The first computer acts as the **Primary Leader** (`landrop.local`), while the second joins as a **Secondary Node (Satellite)**. Phones and tablets connect to a single unified portal, pick the destination computer with 1 tap (`[ PC ] [ Laptop ] [ All Hosts ]`), and text copied anywhere syncs across all computer clipboards!
-- **🚀 Maximum LAN Speed**: Uses direct Wi-Fi local network bandwidth (30–100+ MB/s). No cloud servers, no file size caps, zero data usage.
-- **🖥️ Dual Mode**: Sleek native Windows Desktop GUI (with system tray minimize) or Headless CLI (`--headless`).
+Tired of emailing files to yourself, uploading GBs to cloud drives just to download them to your phone, or fighting proprietary AirDrop/Quick Share barriers?
+
+**NearBeam** turns any computer into a blazing-fast local Wi-Fi drop zone with a beautiful web client. **No app installation is required on your phones or tablets**—just open your browser, connect, and beam files at maximum Wi-Fi speeds (30–100+ MB/s).
 
 ---
 
-## 🛠️ Installation & Quick Start
+## ✨ Superpowers
 
-### ⚡ Option 1: 1-Line Web Installer (Windows PowerShell - No Python Required)
-Run this single command in PowerShell to automatically download and launch the installer:
+| Feature | Description |
+|:---|:---|
+| ⚡ **Socket-Stream Speed** | Direct socket-to-disk TCP streaming with parallel 50MB chunks. Zero double-buffering disk penalties—saturates your gigabit Wi-Fi. |
+| 🏷️ **Permanent Address** | Bookmark **`http://nearbeam.local:5000`** on Safari, Chrome, or Firefox. mDNS automatically tracks your PC even when your router DHCP assigns a new IP! |
+| 🛸 **Multi-Host Mesh Cluster** | Run NearBeam on your PC and Laptop simultaneously. They auto-discover each other; mobile clients pick the destination computer with one tap (`[ Desktop ] [ Laptop ] [ All Hosts ]`). |
+| 🔒 **Safe List Sandboxed Explorer** | Share specific folders or external drives. Browsers can navigate subfolders, stream media, and download whole directories as auto-packaged ZIPs. |
+| 🎁 **Guest Drop Zones** | Generate temporary, expiring drop links. Guests can securely drop files to you without seeing your computer's files or Safe List. |
+| 📥 **Zero-Click Auto-Save** | Received files automatically save to your designated folder (`Downloads/NearBeam_Received`) with smart numbered duplicate protection (`photo (1).jpg`). |
+| 📁 **Folder Drag-and-Drop** | Drag nested folders directly from your browser. NearBeam recursively reconstructs the exact folder hierarchy on your disk. |
+| 📋 **Universal Shared Clipboard** | 1-tap clipboard synchronization between Windows, Mac, Linux, iPhone, iPad, and Android. |
+| 🖥️ **Dual Mode** | Sleek PySide6 Desktop GUI with system tray minimization, or headless CLI server (`--headless`) for remote servers and Raspberry Pi. |
+
+---
+
+## 📊 Feature Comparison
+
+| Feature | ⚡ NearBeam | Apple AirDrop | Google Quick Share | Cloud Drives (Drive/Dropbox) |
+|:---|:---:|:---:|:---:|:---:|
+| **Cross-Platform (Windows, Mac, iOS, Android)** | ✅ **Yes** (Any browser) | ❌ Apple only | ❌ Android/Windows only | ✅ Yes |
+| **Mobile App Install Required?** | ❌ **No (Web Native)** | ✅ Built-in only | ✅ Required | ✅ App required |
+| **Cloud / Internet Required?** | ❌ **100% Local Wi-Fi** | ❌ Offline only | ❌ Offline only | ⚠️ Needs Internet |
+| **File Size Limit** | 🚀 **Unlimited** | 🚀 Unlimited | 🚀 Unlimited | ⚠️ Quota capped |
+| **Multi-PC Mesh Clustering** | ✅ **Built-in** | ❌ No | ❌ No | ❌ No |
+| **Shared Safe Folders & In-browser Playback** | ✅ **Built-in** | ❌ No | ❌ No | ⚠️ Slow cloud sync |
+| **One-Click Guest Drop Links** | ✅ **Built-in** | ❌ No | ❌ No | ⚠️ Complex permissions |
+
+---
+
+## 🚀 Quick Start & Installation
+
+### Option 1: 1-Line Windows Web Installer *(Recommended — No Python Needed)*
+Open **PowerShell** and paste this single command:
 ```powershell
-irm https://raw.githubusercontent.com/tanumay-deb/LANDrop/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/tanumay-deb/NearBeam/main/install.ps1 | iex
+```
+*This queries the latest release, downloads the Windows Setup installer, and configures everything automatically.*
+
+---
+
+### Option 2: Windows Setup Installer (`.exe`)
+Download **`NearBeam-v1.4.0-Setup.exe`** from the [GitHub Releases](https://github.com/tanumay-deb/NearBeam/releases) page. Run the installer to get:
+- Start Menu & Desktop shortcuts
+- Optional background startup on Windows login
+- Automatic Windows Firewall configuration
+
+---
+
+### Option 3: Terminal Install (`pip`)
+```bash
+pip install git+https://github.com/tanumay-deb/NearBeam.git
+```
+Then launch anywhere from your terminal:
+```bash
+nearbeam
 ```
 
-### 📦 Option 2: 1-Line Git Install (pip / pipx)
-Install directly from GitHub into any terminal or environment:
-```bash
-pip install git+https://github.com/tanumay-deb/LANDrop.git
-```
-Then launch LANDrop anytime by typing:
-```bash
-landrop
-```
+---
 
-### 💻 Option 3: Windows Setup Installer (.exe)
-Download and run `LANDrop-v1.2.1-Setup.exe` from [GitHub Releases](https://github.com/tanumay-deb/LANDrop/releases).
-
-### 🐍 Option 4: Run from Source
+### Option 4: Run from Source
 ```bash
+git clone https://github.com/tanumay-deb/NearBeam.git
+cd NearBeam
+pip install -r requirements.txt
 python main.py
 ```
-*(Or headless terminal mode without GUI: `python main.py --headless`)*
+*(For headless/server mode without desktop window: `python main.py --headless`)*
 
 ---
 
-## 📱 How to Connect from Your Phone (No QR Needed)
+## 📱 Connecting From Your Phone (In 3 Seconds)
 
-1. Connect your phone to the **same Wi-Fi** as your PC.
-2. Open Safari, Chrome, or any browser on your phone.
-3. Type the local address shown on your desktop app:
-   - **Permanent URL**: `http://landrop.local:5000` (Works natively on iOS, Android, and macOS via mDNS)
-   - **Hostname URL**: `http://<your-pc-name>.local:5000`
-   - **Direct IP**: `http://192.168.1.101:5000`
-4. The web app will open immediately. You can now:
-   - Browse folders you added to your Safe List.
-   - Send photos, videos, and files directly to your PC (they will be auto-saved).
-   - Sync clipboard text back and forth.
+1. Make sure your phone/tablet is connected to the **same Wi-Fi** as your computer.
+2. Open Safari (iOS) or Chrome (Android) and visit:
+   - **⭐ Permanent Address:** `http://nearbeam.local:5000` *(Bookmark this!)*
+   - **👉 Direct IP:** `http://192.168.1.10:5000` *(Check NearBeam app for your exact IP)*
+   - **🔍 Subnet Auto-Finder:** Visit `http://<any-ip>:5000/finder` to automatically sweep and reconnect.
+3. **Drop files** to send them instantly, or **explore shared folders** on your PC!
 
 ---
 
-## 📂 Features Guide
+## 🛡️ Security & Privacy
 
-### 1. Safe List (Shared Folders)
-1. On the LANDrop desktop app, click **"+ Add Folder to Safe List"**.
-2. Select any folder or drive on your PC (e.g. `C:\Users\...\Documents` or `D:\Movies`).
-3. Connected devices can now navigate the folder tree, preview files, and download individual files or download folders as a ZIP.
-4. **Security**: Devices are strictly sandboxed inside the Safe List folders. Directory traversal attempts (`../`) are automatically blocked.
-
-### 2. Auto-Save Incoming Transfers
-1. When you send a file from your phone, it is saved immediately to `Downloads/LANDrop_Received`.
-2. If a file with the same name already exists, LANDrop automatically creates a numbered version (e.g. `document (1).pdf`) so nothing is ever overwritten or lost.
-3. You can change your auto-save directory at any time using the "Change Folder" button in the desktop app.
-
-### 3. Shared Clipboard
-- Copy text on your phone and tap **"Sync to All Devices"** — it instantly appears in the LANDrop app on your PC.
-- Paste text on your PC and tap **"Copy to My Clipboard"** on your phone to copy it immediately to your phone's clipboard.
+- **100% Local LAN Communication:** Transfers never route through any external server, cloud relay, or third-party tracking.
+- **Strict Directory Sandboxing:** The Safe List explorer verifies and canonicalizes all paths. Any path traversal attack attempts (`../`, symlink attacks) are strictly rejected with HTTP 403.
+- **Optional PIN Authentication:** Lock access to your Safe List and uploads behind a custom PIN configured right in the desktop app.
+- **Isolated Guest Tokens:** Guest drop links use cryptographically random UUID tokens that expire in 24 hours. Guests have zero access to your file explorer.
 
 ---
 
-## 🧪 Running Tests
-To run the automated test suite:
+## 🧪 Development & Testing
+
+NearBeam includes an extensive end-to-end and unit test suite covering chunked uploads, mesh cluster election, clipboard synchronization, and folder traversal security:
+
 ```bash
-python -m unittest tests/test_backend.py
+python -m unittest discover tests
 ```
+
+To build a standalone Windows binary:
+```bash
+python -m PyInstaller --noconfirm NearBeam.spec
+```
+
+---
+
+## 📄 License
+
+Distributed under the **MIT License**. Created with ❤️ by [Tanumay Goswami](https://github.com/tanumay-deb).

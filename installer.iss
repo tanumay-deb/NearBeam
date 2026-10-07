@@ -1,11 +1,11 @@
-; Inno Setup Script for LANDrop
-; Bundles LANDrop into a professional Windows Setup Installer
+; Inno Setup Script for NearBeam
+; Bundles NearBeam into a professional Windows Setup Installer
 
-#define MyAppName "LANDrop"
-#define MyAppVersion "1.3.1"
+#define MyAppName "NearBeam"
+#define MyAppVersion "1.4.0"
 #define MyAppPublisher "Tanumay Goswami"
-#define MyAppURL "https://github.com/tanumay-deb/LANDrop"
-#define MyAppExeName "LANDrop.exe"
+#define MyAppURL "https://github.com/tanumay-deb/NearBeam"
+#define MyAppExeName "NearBeam.exe"
 
 [Setup]
 AppId={{D37E7791-53C2-4DC6-A976-C9E6A7F2D884}
@@ -19,7 +19,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=dist
-OutputBaseFilename=LANDrop-v{#MyAppVersion}-Setup
+OutputBaseFilename=NearBeam-v{#MyAppVersion}-Setup
 SetupIconFile=assets\icon.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -27,7 +27,7 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; Close a running (tray) LANDrop so its locked exe can be replaced
+; Close a running (tray) NearBeam or legacy LANDrop so its locked exe can be replaced
 CloseApplications=force
 
 [Languages]
@@ -35,10 +35,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "autostart"; Description: "Automatically launch LANDrop on Windows startup"; GroupDescription: "Startup Options:"
+Name: "autostart"; Description: "Automatically launch NearBeam on Windows startup"; GroupDescription: "Startup Options:"
+
+[InstallDelete]
+; Clean up legacy LANDrop files and shortcuts on upgrade
+Type: files; Name: "{app}\LANDrop.exe"
+Type: files; Name: "{autoprograms}\LANDrop.lnk"
+Type: files; Name: "{autodesktop}\LANDrop.lnk"
 
 [Files]
-Source: "dist\LANDrop.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\NearBeam.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "assets\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "assets\icon.png"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "assets\checkmark.png"; DestDir: "{app}\assets"; Flags: ignoreversion
@@ -50,6 +56,7 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFile
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LANDrop"; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]

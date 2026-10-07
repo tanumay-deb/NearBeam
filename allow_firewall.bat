@@ -1,5 +1,5 @@
 @echo off
-title Configure Windows Firewall for LANDrop
+title Configure Windows Firewall for NearBeam
 cd /d "%~dp0"
 
 :: Check for administrative rights
@@ -10,16 +10,20 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-echo Adding permanent Windows Firewall rules for LANDrop (Port 5000 ^& mDNS)...
+echo Adding permanent Windows Firewall rules for NearBeam (Port 5000 ^& mDNS)...
 netsh advfirewall firewall delete rule name="LANDrop Wi-Fi File Transfer" >nul 2>&1
 netsh advfirewall firewall delete rule name="LANDrop Wi-Fi File Transfer UDP" >nul 2>&1
 netsh advfirewall firewall delete rule name="LANDrop mDNS Discovery" >nul 2>&1
 netsh advfirewall firewall delete rule name="LANDrop Mesh Peer Discovery" >nul 2>&1
+netsh advfirewall firewall delete rule name="NearBeam Wi-Fi File Transfer" >nul 2>&1
+netsh advfirewall firewall delete rule name="NearBeam Wi-Fi File Transfer UDP" >nul 2>&1
+netsh advfirewall firewall delete rule name="NearBeam mDNS Discovery" >nul 2>&1
+netsh advfirewall firewall delete rule name="NearBeam Mesh Peer Discovery" >nul 2>&1
 
-netsh advfirewall firewall add rule name="LANDrop Wi-Fi File Transfer" dir=in action=allow protocol=TCP localport=5000 profile=any
-netsh advfirewall firewall add rule name="LANDrop Wi-Fi File Transfer UDP" dir=in action=allow protocol=UDP localport=5000 profile=any
-netsh advfirewall firewall add rule name="LANDrop mDNS Discovery" dir=in action=allow protocol=UDP localport=5353 profile=any
-netsh advfirewall firewall add rule name="LANDrop Mesh Peer Discovery" dir=in action=allow protocol=UDP localport=5005 profile=any
+netsh advfirewall firewall add rule name="NearBeam Wi-Fi File Transfer" dir=in action=allow protocol=TCP localport=5000 profile=any
+netsh advfirewall firewall add rule name="NearBeam Wi-Fi File Transfer UDP" dir=in action=allow protocol=UDP localport=5000 profile=any
+netsh advfirewall firewall add rule name="NearBeam mDNS Discovery" dir=in action=allow protocol=UDP localport=5353 profile=any
+netsh advfirewall firewall add rule name="NearBeam Mesh Peer Discovery" dir=in action=allow protocol=UDP localport=5005 profile=any
 
 echo.
 echo ========================================================

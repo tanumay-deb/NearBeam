@@ -107,7 +107,7 @@ class TestLandrop(unittest.TestCase):
     def test_api_info_and_index(self):
         res = self.client.get("/")
         self.assertEqual(res.status_code, 200)
-        self.assertIn(b"LANDrop", res.data)
+        self.assertIn(b"NearBeam", res.data)
 
         res = self.client.get("/api/info")
         self.assertEqual(res.status_code, 200)

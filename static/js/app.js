@@ -1,5 +1,5 @@
 /**
- * LANDrop - Web Application Client Script
+ * NearBeam - Web Application Client Script
  * Handles Safe List browsing, drag & drop auto-save uploads,
  * real-time SSE synchronization, clipboard sync, and media previews.
  */
@@ -128,7 +128,7 @@ document.addEventListener("DOMContentLoaded", () => {
 // --- Theme Toggle ---
 
 function initTheme() {
-  const saved = localStorage.getItem("landrop_theme");
+  const saved = localStorage.getItem("nearbeam_theme") || localStorage.getItem("landrop_theme");
   if (saved === "light") {
     document.body.classList.remove("theme-dark");
     document.body.classList.add("theme-light");
@@ -137,11 +137,11 @@ function initTheme() {
     if (document.body.classList.contains("theme-light")) {
       document.body.classList.remove("theme-light");
       document.body.classList.add("theme-dark");
-      localStorage.setItem("landrop_theme", "dark");
+      localStorage.setItem("nearbeam_theme", "dark");
     } else {
       document.body.classList.remove("theme-dark");
       document.body.classList.add("theme-light");
-      localStorage.setItem("landrop_theme", "light");
+      localStorage.setItem("nearbeam_theme", "light");
     }
   });
 }
@@ -196,9 +196,9 @@ async function fetchServerInfo() {
     if (!res.ok) return;
     serverInfo = await res.json();
 
-    const hostLabel = serverInfo.landrop_url || `${serverInfo.hostname}.local`;
+    const hostLabel = serverInfo.nearbeam_url || serverInfo.landrop_url || `${serverInfo.hostname}.local`;
     hostNameDisplay.innerText = hostLabel;
-    qrUrlText.innerText = serverInfo.landrop_url || serverInfo.primary_url;
+    qrUrlText.innerText = serverInfo.nearbeam_url || serverInfo.landrop_url || serverInfo.primary_url;
 
     const faqDirectIp = document.getElementById("faqDirectIpDisplay");
     if (faqDirectIp && serverInfo.primary_url) {
@@ -211,7 +211,7 @@ async function fetchServerInfo() {
 
 // Click on host pill copies the permanent URL
 hostPill.addEventListener("click", async () => {
-  const url = serverInfo?.landrop_url || "http://landrop.local:5000";
+  const url = serverInfo?.nearbeam_url || serverInfo?.landrop_url || "http://nearbeam.local:5000";
   try {
     await navigator.clipboard.writeText(url);
     showToast("✓ Copied " + url + " to clipboard!", "success");
@@ -1342,7 +1342,7 @@ async function fetchReceivedFiles() {
     const res = await fetch("/api/received");
     if (!res.ok) return;
     const data = await res.json();
-    receivedPathDesc.innerText = data.save_directory || "Downloads/LANDrop_Received";
+    receivedPathDesc.innerText = data.save_directory || "Downloads/NearBeam_Received";
     renderReceivedFiles(data.files || []);
   } catch (e) {
     receivedFilesContainer.innerHTML = `<div class="empty-state"><p>Error loading received files</p></div>`;
@@ -1441,14 +1441,14 @@ function setupClipboardSync() {
   if (!chkKeepSyncingClipboard) return;
 
   // Restore saved preference (defaults to true)
-  const savedAutoSync = localStorage.getItem("landrop_keep_syncing_clipboard");
+  const savedAutoSync = localStorage.getItem("nearbeam_keep_syncing_clipboard") || localStorage.getItem("landrop_keep_syncing_clipboard");
   const isAutoSync = savedAutoSync !== null ? savedAutoSync === "1" : true;
   chkKeepSyncingClipboard.checked = isAutoSync;
   updateClipboardSyncUI(isAutoSync);
 
   chkKeepSyncingClipboard.addEventListener("change", () => {
     const active = chkKeepSyncingClipboard.checked;
-    localStorage.setItem("landrop_keep_syncing_clipboard", active ? "1" : "0");
+    localStorage.setItem("nearbeam_keep_syncing_clipboard", active ? "1" : "0");
     updateClipboardSyncUI(active);
 
     if (active) {

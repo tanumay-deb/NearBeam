@@ -1,5 +1,5 @@
 """
-PySide6 Desktop Application for LANDrop.
+PySide6 Desktop Application for NearBeam.
 Refined, perfectly scaled Windows 11 Dark theme control panel.
 Features High-DPI support, scrollable responsive cards, no-wrap buttons,
 and clean visual alignment.
@@ -63,7 +63,7 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
-from core.server import LandropServer
+from core.server import NearBeamServer, LandropServer
 from core.version import APP_VERSION, RELEASES_URL, check_for_updates
 
 
@@ -106,7 +106,7 @@ class QRDialog(QDialog):
     """Clean, properly scaled dialog showing QR code for mobile scanning."""
     def __init__(self, urls, initial_url: str = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("LANDrop - Mobile Connect & QR Code")
+        self.setWindowTitle("NearBeam - Mobile Connect & QR Code")
         self.setFixedSize(380, 450)
         self.setStyleSheet("""
             QDialog {
@@ -133,14 +133,14 @@ class QRDialog(QDialog):
 
         if isinstance(urls, dict):
             self.primary_url = urls.get("primary_url", "")
-            self.landrop_url = urls.get("landrop_url", "")
-            self.mdns_url = urls.get("mdns_url", self.landrop_url)
+            self.nearbeam_url = urls.get("nearbeam_url", urls.get("landrop_url", ""))
+            self.mdns_url = urls.get("mdns_url", self.nearbeam_url)
         else:
             self.primary_url = str(urls)
-            self.landrop_url = str(urls)
+            self.nearbeam_url = str(urls)
             self.mdns_url = str(urls)
 
-        self.initial_url = initial_url or self.landrop_url
+        self.initial_url = initial_url or self.nearbeam_url
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -216,8 +216,8 @@ class QRDialog(QDialog):
         self.btn_mode_mdns.setStyleSheet(active_btn)
         self.btn_mode_host.setStyleSheet(inactive_btn)
         self.btn_mode_direct.setStyleSheet(inactive_btn)
-        self.url_box.setText(self.landrop_url)
-        self._update_qr(self.landrop_url)
+        self.url_box.setText(self.nearbeam_url)
+        self._update_qr(self.nearbeam_url)
 
     def _select_host(self):
         active_btn = "background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; border-radius: 6px; font-weight: 600; font-size: 11px;"
@@ -225,7 +225,7 @@ class QRDialog(QDialog):
         self.btn_mode_host.setStyleSheet(active_btn)
         self.btn_mode_mdns.setStyleSheet(inactive_btn)
         self.btn_mode_direct.setStyleSheet(inactive_btn)
-        url = getattr(self, "mdns_url", self.landrop_url)
+        url = getattr(self, "mdns_url", self.nearbeam_url)
         self.url_box.setText(url)
         self._update_qr(url)
 
@@ -253,7 +253,7 @@ class QRDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LANDrop - Local Wi-Fi File Sharing & Explorer")
+        self.setWindowTitle("NearBeam - Local Wi-Fi File Sharing & Explorer")
         self.resize(860, 740)
         self.setMinimumSize(780, 620)
 
@@ -460,7 +460,7 @@ class MainWindow(QMainWindow):
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
 
-        app_title = QLabel("LANDrop")
+        app_title = QLabel("NearBeam")
         app_title.setStyleSheet("font-size: 20px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px;")
         title_col.addWidget(app_title)
 
@@ -547,7 +547,7 @@ class MainWindow(QMainWindow):
         mode_btn_row = QHBoxLayout()
         mode_btn_row.setSpacing(8)
 
-        self.btn_addr_perm = QPushButton("⭐ Permanent (landrop.local)")
+        self.btn_addr_perm = QPushButton("⭐ Permanent (nearbeam.local)")
         self.btn_addr_perm.setFixedHeight(28)
         self.btn_addr_perm.setCursor(Qt.PointingHandCursor)
         self.btn_addr_perm.clicked.connect(lambda: self._set_addr_mode("perm"))
@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
         addr_row = QHBoxLayout()
         addr_row.setSpacing(8)
 
-        self.url_label = QLineEdit("http://landrop.local:5000")
+        self.url_label = QLineEdit("http://nearbeam.local:5000")
         self.url_label.setReadOnly(True)
         self.url_label.setStyleSheet("""
             background-color: #131d31;
@@ -649,7 +649,7 @@ class MainWindow(QMainWindow):
         mesh_header_row.addWidget(self.btn_send_to_node)
         mesh_layout.addLayout(mesh_header_row)
 
-        self.mesh_nodes_summary = QLabel("Searching for other LANDrop computers on Wi-Fi...")
+        self.mesh_nodes_summary = QLabel("Searching for other NearBeam computers on Wi-Fi...")
         self.mesh_nodes_summary.setStyleSheet("color: #94a3b8; font-size: 11px;")
         mesh_layout.addWidget(self.mesh_nodes_summary)
 
@@ -825,13 +825,13 @@ class MainWindow(QMainWindow):
             self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
 
         tray_menu = QMenu(self)
-        show_action = QAction("Open LANDrop Control Panel", self)
+        show_action = QAction("Open NearBeam Control Panel", self)
         show_action.triggered.connect(self.showNormal)
         open_web_action = QAction("Open Web App in Browser", self)
         open_web_action.triggered.connect(self._open_browser)
         update_action = QAction(f"Check for Updates (v{APP_VERSION})...", self)
         update_action.triggered.connect(lambda: self._check_updates_async(manual=True))
-        quit_action = QAction("Exit LANDrop", self)
+        quit_action = QAction("Exit NearBeam", self)
         quit_action.triggered.connect(self._clean_exit)
 
         tray_menu.addAction(show_action)
@@ -847,7 +847,7 @@ class MainWindow(QMainWindow):
         try:
             actual_port = find_available_port(self.port)
             self.port = actual_port
-            self.server_instance = LandropServer(port=actual_port)
+            self.server_instance = NearBeamServer(port=actual_port)
 
             # Register activity callback
             self.server_instance.add_activity_callback(
@@ -869,14 +869,14 @@ class MainWindow(QMainWindow):
 
             urls = get_connection_urls(actual_port)
             self.active_urls = urls
-            self.active_landrop_url = urls["landrop_url"]
+            self.active_nearbeam_url = urls["nearbeam_url"]
             self.active_primary_url = urls["primary_url"]
             self.active_mdns_url = urls["mdns_url"]
 
             self.btn_addr_host.setText(f"🏷️ {urls['hostname']}.local")
             self.btn_addr_ip.setText(f"📱 Direct IP ({urls['primary_ip']})")
             self._set_addr_mode("perm")
-            self._append_log(f"Server started on port {actual_port}. Permanent address: {urls['landrop_url']}.", "info")
+            self._append_log(f"Server started on port {actual_port}. Permanent address: {urls['nearbeam_url']}.", "info")
 
             # Initialize mesh status display
             if self.server_instance.mesh:
@@ -891,7 +891,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Server Error", f"Failed to start server: {e}")
 
     def _set_addr_mode(self, mode: str):
-        """Switches displayed URL between Permanent (landrop.local), Hostname, and Direct IP."""
+        """Switches displayed URL between Permanent (nearbeam.local), Hostname, and Direct IP."""
         self.current_addr_mode = mode
         active_btn = "background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; border-radius: 6px; font-weight: 600; font-size: 11px; padding: 2px 10px;"
         inactive_btn = "background-color: #131d31; color: #94a3b8; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; font-weight: 500; font-size: 11px; padding: 2px 10px;"
@@ -901,10 +901,10 @@ class MainWindow(QMainWindow):
         self.btn_addr_ip.setStyleSheet(active_btn if mode == "ip" else inactive_btn)
 
         if mode == "perm":
-            url = getattr(self, "active_landrop_url", "http://landrop.local:5000")
+            url = getattr(self, "active_nearbeam_url", "http://nearbeam.local:5000")
             desc = "⭐ Permanent address: Never changes even if router reassigns your IP. Works on iPhone, iPad, Mac & Windows."
         elif mode == "host":
-            url = getattr(self, "active_mdns_url", "http://landrop.local:5000")
+            url = getattr(self, "active_mdns_url", "http://nearbeam.local:5000")
             desc = "🏷️ Hostname address: Permanent local address mapped to your computer name via native Windows mDNS."
         else:
             url = getattr(self, "active_primary_url", "http://127.0.0.1:5000")
@@ -914,7 +914,7 @@ class MainWindow(QMainWindow):
         self.ip_subtext.setText(desc)
 
     def _configure_firewall(self):
-        """Allows LANDrop through Windows Firewall with a single click."""
+        """Allows NearBeam through Windows Firewall with a single click."""
         bat_path = get_resource_path("allow_firewall.bat")
         if bat_path.exists():
             cmd = f'powershell -Command "Start-Process cmd -ArgumentList \'/c \"\"{bat_path}\"\"\' -Verb RunAs"'
@@ -930,10 +930,10 @@ class MainWindow(QMainWindow):
         else:
             ps_cmd = (
                 'powershell -Command "Start-Process powershell -ArgumentList \'-Command '
-                '\\\"New-NetFirewallRule -DisplayName \\\'LANDrop Wi-Fi File Transfer\\\' -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'LANDrop Wi-Fi File Transfer UDP\\\' -Direction Inbound -LocalPort 5000 -Protocol UDP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'LANDrop mDNS Discovery\\\' -Direction Inbound -LocalPort 5353 -Protocol UDP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'LANDrop Mesh Peer Discovery\\\' -Direction Inbound -LocalPort 5005 -Protocol UDP -Action Allow\\\"\' -Verb RunAs"'
+                '\\\"New-NetFirewallRule -DisplayName \\\'NearBeam Wi-Fi File Transfer\\\' -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow; '
+                'New-NetFirewallRule -DisplayName \\\'NearBeam Wi-Fi File Transfer UDP\\\' -Direction Inbound -LocalPort 5000 -Protocol UDP -Action Allow; '
+                'New-NetFirewallRule -DisplayName \\\'NearBeam mDNS Discovery\\\' -Direction Inbound -LocalPort 5353 -Protocol UDP -Action Allow; '
+                'New-NetFirewallRule -DisplayName \\\'NearBeam Mesh Peer Discovery\\\' -Direction Inbound -LocalPort 5005 -Protocol UDP -Action Allow\\\"\' -Verb RunAs"'
             )
             os.system(ps_cmd)
             QMessageBox.information(
@@ -976,7 +976,7 @@ class MainWindow(QMainWindow):
                 reply = QMessageBox.question(
                     self,
                     "Update Available",
-                    f"A new version of LANDrop is available: v{latest}!\n\nWould you like to open the GitHub release page to download it?",
+                    f"A new version of NearBeam is available: v{latest}!\n\nWould you like to open the GitHub release page to download it?",
                     QMessageBox.Yes | QMessageBox.No,
                 )
                 if reply == QMessageBox.Yes:
@@ -997,7 +997,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "manual_update_check", False):
                 QMessageBox.information(
                     self,
-                    "LANDrop Up to Date",
+                    "NearBeam Up to Date",
                     f"You are currently using the latest release: v{APP_VERSION}.",
                 )
 
@@ -1036,7 +1036,7 @@ class MainWindow(QMainWindow):
         is_leader = (role == "leader")
 
         if is_leader:
-            self.mesh_role_badge.setText("🟢 Primary Leader (landrop.local)")
+            self.mesh_role_badge.setText("🟢 Primary Leader (nearbeam.local)")
             self.mesh_role_badge.setStyleSheet("""
                 background-color: rgba(16, 185, 129, 0.12);
                 border: 1px solid rgba(16, 185, 129, 0.35);
@@ -1067,19 +1067,19 @@ class MainWindow(QMainWindow):
             self.btn_send_to_node.setEnabled(True)
             self.btn_send_to_node.setText(f"📤 Send to Peer ({len(peers)} Online)...")
         else:
-            self.mesh_nodes_summary.setText("No other LANDrop computers detected on Wi-Fi yet. (Waiting for peer beacons)")
+            self.mesh_nodes_summary.setText("No other NearBeam computers detected on Wi-Fi yet. (Waiting for peer beacons)")
             self.btn_send_to_node.setEnabled(False)
             self.btn_send_to_node.setText("📤 Send to Peer Host (None Online)")
 
     def _send_file_to_node_dialog(self):
-        """Allows 1-click native file sending from desktop to another running LANDrop computer."""
+        """Allows 1-click native file sending from desktop to another running NearBeam computer."""
         peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
         if not peers:
             QMessageBox.information(
                 self,
                 "No Peer Hosts Online",
-                "No secondary LANDrop laptops or PCs are currently detected on your Wi-Fi.\n\n"
-                "Launch LANDrop on another computer and it will appear here automatically!",
+                "No secondary NearBeam laptops or PCs are currently detected on your Wi-Fi.\n\n"
+                "Launch NearBeam on another computer and it will appear here automatically!",
             )
             return
 
@@ -1117,7 +1117,7 @@ class MainWindow(QMainWindow):
         import urllib.request
         import uuid
 
-        boundary = f"----LANDropBoundary{uuid.uuid4().hex}"
+        boundary = f"----NearBeamBoundary{uuid.uuid4().hex}"
         self._append_log(f"Sending {len(file_paths)} file(s) directly to {target_name} ({upload_url})...", "info")
 
         try:
@@ -1283,7 +1283,7 @@ class MainWindow(QMainWindow):
 
 def run_gui(start_minimized: bool = False):
     app = QApplication(sys.argv)
-    app.setApplicationName("LANDrop")
+    app.setApplicationName("NearBeam")
     window = MainWindow()
     if not start_minimized:
         window.show()

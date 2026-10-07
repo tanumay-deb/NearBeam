@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>LANDrop - Local Wi-Fi File Sharing & Explorer</title>
+  <title>NearBeam - Local Wi-Fi File Sharing & Explorer</title>
   <link rel="icon" type="image/png" href="/static/favicon.png" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
   <link rel="stylesheet" href="/static/css/style.css" />
@@ -26,7 +26,7 @@
             <line x1="12" y1="20" x2="12.01" y2="20"></line>
           </svg>
         </div>
-        <span class="logo-text">LANDrop</span>
+        <span class="logo-text">NearBeam</span>
       </div>
 
       <div class="host-pill" id="hostPill" title="Click to copy connection address">
@@ -289,7 +289,7 @@
         <div class="section-header-flex">
           <div>
             <h2 class="section-title">Received on PC</h2>
-            <p class="section-desc">Auto-saving files to <code class="folder-badge" id="receivedPathDesc">Downloads/LANDrop_Received</code></p>
+            <p class="section-desc">Auto-saving files to <code class="folder-badge" id="receivedPathDesc">Downloads/NearBeam_Received</code></p>
           </div>
           <button class="action-btn icon-only" id="btnRefreshReceived" title="Refresh list">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -376,7 +376,7 @@
               <span class="faq-toggle">▼</span>
             </div>
             <div class="faq-answer">
-              <p><strong>You are 100% safe and private.</strong> LANDrop transfers files strictly over your local home Wi-Fi network directly between your devices:</p>
+              <p><strong>You are 100% safe and private.</strong> NearBeam transfers files strictly over your local home Wi-Fi network directly between your devices:</p>
               <ul class="faq-points">
                 <li><strong>No Internet / Cloud Involved:</strong> Transfers never leave your home Wi-Fi router. Nobody outside your Wi-Fi can see or access your files.</li>
                 <li><strong>Why No HTTPS?:</strong> Official SSL/HTTPS certificates are issued only to public internet domains (like <code>google.com</code>). They cannot be issued for private local router IPs (like <code>192.168.x.x</code>).</li>
@@ -407,7 +407,7 @@
                 </div>
                 <div class="fix-step">
                   <span class="step-num">3</span>
-                  <div><strong>Best Solution: Use Safari:</strong> Safari is built into iOS and doesn't suffer from Chrome's restrictions. Open Safari and go to <code class="code-pill">http://landrop.local:5000</code> or <code class="code-pill">http://192.168.1.11:5000</code>.</div>
+                  <div><strong>Best Solution: Use Safari:</strong> Safari is built into iOS and doesn't suffer from Chrome's restrictions. Open Safari and go to <code class="code-pill">http://nearbeam.local:5000</code> or <code class="code-pill">http://192.168.1.11:5000</code>.</div>
                 </div>
               </div>
             </div>
@@ -459,9 +459,9 @@
               <span class="faq-toggle">▼</span>
             </div>
             <div class="faq-answer">
-              <p>LANDrop offers 3 convenient ways to connect:</p>
+              <p>NearBeam offers 3 convenient ways to connect:</p>
               <ul class="faq-points">
-                <li><strong>Permanent Address (Bookmark this!):</strong> <code class="code-pill">http://landrop.local:5000</code> &mdash; Even when your router changes your PC's IP address, mDNS keeps this URL working permanently on Safari, Mac, and iOS.</li>
+                <li><strong>Permanent Address (Bookmark this!):</strong> <code class="code-pill">http://nearbeam.local:5000</code> &mdash; Even when your router changes your PC's IP address, mDNS keeps this URL working permanently on Safari, Mac, and iOS.</li>
                 <li><strong>Direct IP:</strong> <code class="code-pill" id="faqDirectIpDisplay">http://192.168.1.11:5000</code> &mdash; Works on all browsers and platforms without exception.</li>
                 <li><strong>Subnet Auto-Finder:</strong> Visit <code class="code-pill">/finder</code> on any connected device. It sweeps your Wi-Fi subnet in 1 second and redirects you to the PC automatically!</li>
               </ul>
@@ -586,7 +586,7 @@
       </div>
       <div class="modal-body qr-body">
         <p class="qr-notice">Permanent local address (auto-updates when IP changes):</p>
-        <div class="url-badge" id="qrUrlText">http://landrop.local:5000</div>
+        <div class="url-badge" id="qrUrlText">http://nearbeam.local:5000</div>
         <div class="qr-img-wrap">
           <img id="qrImage" src="/api/qr" alt="Connection QR Code" />
         </div>

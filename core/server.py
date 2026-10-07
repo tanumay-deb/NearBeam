@@ -1,5 +1,5 @@
 """
-Flask Server for LANDrop.
+Flask Server for NearBeam.
 Provides REST and SSE endpoints for Safe List folder exploration,
 Auto-Save file uploads, clipboard synchronization, and media previews.
 """
@@ -81,7 +81,7 @@ def get_file_type_category(filename: str, is_dir: bool = False) -> str:
         return "file"
 
 
-class LandropServer:
+class NearBeamServer:
     def __init__(self, port: int = 5000, enable_mesh: bool = True):
         self.port = port
         if getattr(sys, "frozen", False):
@@ -119,9 +119,9 @@ class LandropServer:
             )
             self.mesh.start()
 
-        # Zeroconf mDNS broadcaster for permanent landrop.local address
-        # Only advertise landrop.local if Primary Leader (prevents mDNS name collisions)
-        self.broadcaster = ZeroconfBroadcaster(name="landrop", port=self.port)
+        # Zeroconf mDNS broadcaster for permanent nearbeam.local address
+        # Only advertise nearbeam.local if Primary Leader (prevents mDNS name collisions)
+        self.broadcaster = ZeroconfBroadcaster(name="nearbeam", port=self.port)
         if not self.mesh or self.mesh.role == "leader":
             self.broadcaster.start()
 
@@ -355,9 +355,10 @@ class LandropServer:
             urls = get_connection_urls(self.port)
             safe_folders = config.get_safe_folders()
             return jsonify({
-                "app": "LANDrop",
+                "app": "NearBeam",
                 "hostname": urls["hostname"],
-                "landrop_url": urls["landrop_url"],
+                "nearbeam_url": urls["nearbeam_url"],
+                "landrop_url": urls["nearbeam_url"],  # Legacy alias
                 "mdns_url": urls["mdns_url"],
                 "primary_ip": urls["primary_ip"],
                 "primary_url": urls["primary_url"],
@@ -560,7 +561,7 @@ class LandropServer:
                     total_bytes += f_size
 
             job_id = str(uuid.uuid4())
-            temp_zip_path = os.path.join(tempfile.gettempdir(), f"landrop_zip_{job_id}.zip")
+            temp_zip_path = os.path.join(tempfile.gettempdir(), f"nearbeam_zip_{job_id}.zip")
             cancel_event = threading.Event()
 
             with self.zip_jobs_lock:
@@ -747,7 +748,7 @@ class LandropServer:
             self.active_drop_zones[token] = {"expires_at": expires_at}
             
             urls = get_connection_urls(self.port)
-            drop_url = f"{urls['landrop_url'] or urls['primary_url']}/drop/{token}"
+            drop_url = f"{urls['nearbeam_url'] or urls['primary_url']}/drop/{token}"
             return jsonify({"success": True, "token": token, "url": drop_url})
 
         @app.route("/drop/<token>")
@@ -771,7 +772,7 @@ class LandropServer:
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
             relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
-            temp_dir = os.path.join(tempfile.gettempdir(), "landrop_uploads")
+            temp_dir = os.path.join(tempfile.gettempdir(), "nearbeam_uploads")
             os.makedirs(temp_dir, exist_ok=True)
             temp_path = os.path.join(temp_dir, f"{session_id}.tmp")
 
@@ -942,7 +943,7 @@ class LandropServer:
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
             relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
-            temp_dir = os.path.join(tempfile.gettempdir(), "landrop_uploads")
+            temp_dir = os.path.join(tempfile.gettempdir(), "nearbeam_uploads")
             os.makedirs(temp_dir, exist_ok=True)
             temp_path = os.path.join(temp_dir, f"{session_id}.tmp")
 
@@ -1029,7 +1030,7 @@ class LandropServer:
 
         @app.route("/api/upload/status/<session_id>")
         def api_upload_status(session_id):
-            temp_path = os.path.join(tempfile.gettempdir(), "landrop_uploads", f"{session_id}.tmp")
+            temp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
             if os.path.exists(temp_path):
                 size = os.path.getsize(temp_path)
                 return jsonify({"received_bytes": size})
@@ -1235,3 +1236,8 @@ class LandropServer:
             if png_bytes:
                 return Response(png_bytes, mimetype="image/png")
             return jsonify({"error": "QR code unavailable"}), 500
+
+
+# Backward-compatible alias for existing tests and scripts
+LandropServer = NearBeamServer
+

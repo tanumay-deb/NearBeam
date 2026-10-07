@@ -5,14 +5,14 @@ this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text(encoding="utf-8") if (this_directory / "README.md").exists() else ""
 
 setup(
-    name="landrop",
-    version="1.3.1",
-    description="High-Speed Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh",
+    name="nearbeam",
+    version="1.4.0",
+    description="Ultra-Fast Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Tanumay Goswami",
     author_email="tanumaygoswami2001@gmail.com",
-    url="https://github.com/tanumay-deb/LANDrop",
+    url="https://github.com/tanumay-deb/NearBeam",
     py_modules=["main", "gui"],
     packages=find_packages(),
     include_package_data=True,
@@ -34,9 +34,11 @@ setup(
     ],
     entry_points={
         "console_scripts": [
+            "nearbeam = main:main",
             "landrop = main:main",
         ],
         "gui_scripts": [
+            "nearbeam-gui = main:main",
             "landrop-gui = main:main",
         ],
     },

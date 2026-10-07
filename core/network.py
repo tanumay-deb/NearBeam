@@ -73,7 +73,7 @@ def find_available_port(start_port: int = 5000, max_attempts: int = 50) -> int:
 def get_connection_urls(port: int) -> dict:
     """
     Generates user-friendly connection URLs for the local network:
-    - Permanent mDNS URL (e.g. http://landrop.local:5000)
+    - Permanent mDNS URL (e.g. http://nearbeam.local:5000)
     - Hostname mDNS URL (e.g. http://DESKTOP-2SC4QS1.local:5000)
     - IP URL (e.g. http://192.168.1.101:5000)
     """
@@ -81,14 +81,15 @@ def get_connection_urls(port: int) -> dict:
     primary_ip = get_local_ip()
     all_ips = get_all_local_ips()
 
-    landrop_url = f"http://landrop.local:{port}"
+    nearbeam_url = f"http://nearbeam.local:{port}"
     mdns_url = f"http://{hostname}.local:{port}"
     primary_url = f"http://{primary_ip}:{port}"
     all_urls = [f"http://{ip}:{port}" for ip in all_ips]
 
     return {
         "hostname": hostname,
-        "landrop_url": landrop_url,
+        "nearbeam_url": nearbeam_url,
+        "landrop_url": nearbeam_url,  # Legacy alias
         "mdns_url": mdns_url,
         "primary_ip": primary_ip,
         "primary_url": primary_url,
@@ -99,10 +100,10 @@ def get_connection_urls(port: int) -> dict:
 
 class ZeroconfBroadcaster:
     """
-    Advertises mDNS service and hostnames (e.g. landrop.local) over the local Wi-Fi.
+    Advertises mDNS service and hostnames (e.g. nearbeam.local) over the local Wi-Fi.
     Allows devices to find and connect to this PC even if its IP address changes.
     """
-    def __init__(self, name: str = "landrop", port: int = 5000):
+    def __init__(self, name: str = "nearbeam", port: int = 5000):
         self.name = name
         self.port = port
         self.zc = None
@@ -121,7 +122,7 @@ class ZeroconfBroadcaster:
                 name=f"{self.name}._http._tcp.local.",
                 addresses=[socket.inet_aton(target_ip)],
                 port=self.port,
-                properties={"path": "/", "app": "LANDrop"},
+                properties={"path": "/", "app": "NearBeam"},
                 server=f"{self.name}.local.",
             )
             self.zc.register_service(self.info)
