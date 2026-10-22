@@ -6,7 +6,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8") if
 
 setup(
     name="nearbeam",
-    version="1.4.0",
+    version="1.5.0",
     description="Ultra-Fast Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh",
     long_description=long_description,
     long_description_content_type="text/markdown",

@@ -8,7 +8,7 @@ import re
 import urllib.error
 import urllib.request
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_NAME = "NearBeam"
 GITHUB_REPO = "tanumay-deb/NearBeam"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
