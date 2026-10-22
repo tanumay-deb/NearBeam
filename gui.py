@@ -522,6 +522,21 @@ class MainWindow(QMainWindow):
         """)
         header_layout.addWidget(self.status_badge)
 
+        self.connected_count_badge = QLabel("🌐 1 Node • 0 Devices")
+        self.connected_count_badge.setFixedHeight(30)
+        self.connected_count_badge.setAlignment(Qt.AlignCenter)
+        self.connected_count_badge.setToolTip("Live count of online LAN Host Nodes and connected Browser/Phone Devices")
+        self.connected_count_badge.setStyleSheet("""
+            background-color: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            color: #38bdf8;
+            padding: 0px 12px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 700;
+        """)
+        header_layout.addWidget(self.connected_count_badge)
+
         btn_header_web = QPushButton("Open Web App")
         btn_header_web.setObjectName("primaryBtn")
         btn_header_web.setFixedHeight(30)
@@ -565,6 +580,18 @@ class MainWindow(QMainWindow):
             font-weight: 700;
         """)
         mesh_header_row.addWidget(self.mesh_role_badge)
+
+        self.nearby_count_badge = QLabel("1 Host Node • 0 Connected Devices")
+        self.nearby_count_badge.setStyleSheet("""
+            background-color: rgba(99, 102, 241, 0.14);
+            border: 1px solid rgba(99, 102, 241, 0.38);
+            color: #a5b4fc;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 700;
+        """)
+        mesh_header_row.addWidget(self.nearby_count_badge)
         mesh_header_row.addStretch()
 
         drop_hint_badge = QLabel("✨ Drag & drop files anywhere on this window")
@@ -1065,6 +1092,8 @@ class MainWindow(QMainWindow):
             scrollbar = self.log_view.verticalScrollBar()
             if scrollbar:
                 scrollbar.setValue(scrollbar.maximum())
+        if "connected from" in msg.lower():
+            self._refresh_nearby_devices_ui()
 
     def _copy_url(self):
         clipboard = QApplication.clipboard()
@@ -1120,6 +1149,36 @@ class MainWindow(QMainWindow):
                 devices = self.server_instance.get_nearby_devices()
             except Exception:
                 devices = []
+
+        host_devs = [d for d in devices if d.get("kind") == "host"]
+        client_devs = [d for d in devices if d.get("kind") != "host"]
+
+        host_count = max(1, len(host_devs), len(getattr(self, "current_mesh_nodes", [])))
+        client_count = len(client_devs)
+        peer_hosts_count = max(0, host_count - 1)
+        total_connected_remotes = peer_hosts_count + client_count
+
+        node_word = "Node" if host_count == 1 else "Nodes"
+        dev_word = "Device" if client_count == 1 else "Devices"
+
+        if hasattr(self, "connected_count_badge") and self.connected_count_badge:
+            self.connected_count_badge.setText(f"🌐 {host_count} {node_word} • {client_count} {dev_word}")
+            self.connected_count_badge.setToolTip(
+                f"Active on Wi-Fi: {host_count} Host {node_word} (1 This PC + {peer_hosts_count} Peer PC) and {client_count} Browser/Phone {dev_word}"
+            )
+
+        if hasattr(self, "nearby_count_badge") and self.nearby_count_badge:
+            if total_connected_remotes > 0:
+                self.nearby_count_badge.setText(
+                    f"🟢 {host_count} Host {node_word} • {client_count} Connected {dev_word} ({host_count + client_count} Total)"
+                )
+            else:
+                self.nearby_count_badge.setText(f"{host_count} Host {node_word} • 0 Connected Devices")
+
+        if hasattr(self, "tray_icon") and self.tray_icon:
+            self.tray_icon.setToolTip(
+                f"NearBeam v{APP_VERSION} — {host_count} {node_word}, {client_count} {dev_word} Connected"
+            )
 
         if devices:
             parts = []
