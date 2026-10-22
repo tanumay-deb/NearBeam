@@ -10,7 +10,7 @@ echo.
 if %ERRORLEVEL% EQU 0 (
     echo ========================================================
     echo   BUILD SUCCESSFUL!
-    echo   Executable is ready at: dist\NearBeam.exe
+    echo   App folder is ready at: dist\NearBeam\ ^(run dist\NearBeam\NearBeam.exe^)
     echo ========================================================
 ) else (
     echo [ERROR] Build failed! Check the output above.

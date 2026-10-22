@@ -45,7 +45,7 @@ Type: files; Name: "{autoprograms}\LANDrop.lnk"
 Type: files; Name: "{autodesktop}\LANDrop.lnk"
 
 [Files]
-Source: "dist\NearBeam.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\NearBeam\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "assets\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "assets\icon.png"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "assets\checkmark.png"; DestDir: "{app}\assets"; Flags: ignoreversion
