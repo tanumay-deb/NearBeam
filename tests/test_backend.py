@@ -52,7 +52,14 @@ class TestLandrop(unittest.TestCase):
         self.orig_config = srv_mod.config
         srv_mod.config = self.cfg
 
-        self.server = LandropServer(port=5999)
+        self.server = LandropServer(port=5999, enable_mesh=False)
+        from core.mesh import MeshManager
+        self.server.mesh = MeshManager(
+            port=5999,
+            on_role_change=self.server._on_mesh_role_change,
+            on_nodes_change=self.server._on_mesh_nodes_change,
+            on_remote_clipboard=self.server._on_mesh_clipboard_received,
+        )
         self.app = self.server.app
         self.client = self.app.test_client()
 
@@ -340,8 +347,11 @@ class TestLandrop(unittest.TestCase):
                 "X-Total-Chunks": "3",
             },
         )
-        tmp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", "sess-cancel-99.tmp")
+        tmp_path = os.path.join(self.save_dir, ".sess-cancel-99.tmp")
         self.assertTrue(os.path.exists(tmp_path))
+
+        status_res = self.client.get("/api/upload/status/sess-cancel-99").get_json()
+        self.assertEqual(status_res["received_bytes"], len(b"partial_bytes"))
 
         cancel_res = self.client.post(
             "/api/upload/cancel",
@@ -434,6 +444,141 @@ class TestLandrop(unittest.TestCase):
         self.assertEqual(img_res2.status_code, 200)
         self.assertEqual(img_res2.data, peer_png)
         img_res2.close()
+
+    # 15. REST API: Guest Drop Zone End-to-End (Token, UI, Chunked Upload, Expiry)
+    def test_guest_drop_zone_end_to_end(self):
+        create_res = self.client.post("/api/drop/create")
+        self.assertEqual(create_res.status_code, 200)
+        drop_data = create_res.get_json()
+        self.assertTrue(drop_data["success"])
+        token = drop_data["token"]
+
+        # Valid drop page renders
+        page_res = self.client.get(f"/drop/{token}")
+        self.assertEqual(page_res.status_code, 200)
+        self.assertIn(b"Guest Drop Zone", page_res.data)
+        self.assertIn(b"globalDropOverlay", page_res.data)
+
+        # Invalid token returns 404
+        self.assertEqual(self.client.get("/drop/invalid-token-xyz").status_code, 404)
+
+        # Multi-chunk upload into Guest Drops with relative_dir
+        for idx, part in enumerate([b"guest_part_1_", b"guest_part_2"]):
+            up_res = self.client.post(
+                f"/api/drop/{token}/upload/chunk",
+                data=part,
+                content_type="application/octet-stream",
+                headers={
+                    "X-Session-Id": "guest-sess-42",
+                    "X-Filename": "guest_notes.txt",
+                    "X-Chunk-Index": str(idx),
+                    "X-Total-Chunks": "2",
+                    "X-Relative-Dir": "ProjectA/Docs",
+                },
+            )
+            self.assertEqual(up_res.status_code, 200)
+            if idx == 1:
+                self.assertTrue(up_res.get_json()["completed"])
+
+        expected_guest_file = os.path.join(self.save_dir, "Guest Drops", "ProjectA", "Docs", "guest_notes.txt")
+        self.assertTrue(os.path.exists(expected_guest_file))
+        with open(expected_guest_file, "rb") as f:
+            self.assertEqual(f.read(), b"guest_part_1_guest_part_2")
+
+    # 16. REST API: HTTP 206 Range Resume & Large File (>512 KB) Async ZIP Packaging
+    def test_http_206_range_resume_and_large_zip(self):
+        large_file = os.path.join(self.safe_share_dir, "large_dataset.txt")
+        large_payload = (b"NEARBEAM_HIGH_SPEED_LINE_0123456789\n" * 25000)  # ~900 KB (> 512 KB threshold)
+        with open(large_file, "wb") as f:
+            f.write(large_payload)
+
+        folder_id = self.safe_entry["id"]
+
+        # HTTP 206 Partial Content Range request
+        range_res = self.client.get(
+            f"/api/safelist/download?folder_id={folder_id}&subpath=large_dataset.txt",
+            headers={"Range": "bytes=100-199"},
+        )
+        self.assertEqual(range_res.status_code, 206)
+        self.assertEqual(len(range_res.data), 100)
+        self.assertEqual(range_res.data, large_payload[100:200])
+        range_res.close()
+
+        # Async ZIP packaging with file > 512 KB
+        prep_res = self.client.post(
+            "/api/safelist/prepare-zip",
+            json={"folder_id": folder_id, "subpath": ""},
+        )
+        self.assertEqual(prep_res.status_code, 200)
+        job_id = prep_res.get_json()["job_id"]
+
+        import time
+        import zipfile
+        for _ in range(60):
+            prog = self.client.get(f"/api/safelist/zip-progress?job_id={job_id}").get_json()
+            if prog["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        dl_res = self.client.get(f"/api/safelist/download-zip-file?job_id={job_id}")
+        self.assertEqual(dl_res.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(dl_res.data), "r") as zf:
+            self.assertIn("large_dataset.txt", zf.namelist())
+            self.assertEqual(zf.read("large_dataset.txt"), large_payload)
+        dl_res.close()
+
+    # 17. REST API: QR Code, Finder Page, and SSE Event Stream
+    def test_qr_finder_and_sse_events(self):
+        qr_res = self.client.get("/api/qr")
+        self.assertEqual(qr_res.status_code, 200)
+        self.assertEqual(qr_res.mimetype, "image/png")
+        self.assertTrue(qr_res.data.startswith(b"\x89PNG"))
+        qr_res.close()
+
+        finder_res = self.client.get("/finder")
+        self.assertEqual(finder_res.status_code, 200)
+        self.assertIn(b"NearBeam", finder_res.data)
+
+        # Verify SSE broadcast delivery
+        import json
+        import queue
+        q = queue.Queue()
+        self.server.event_subscribers.append(q)
+        try:
+            self.server.broadcast_event({"type": "unit_test_ping", "ok": True})
+            msg = json.loads(q.get(timeout=2.0))
+            self.assertEqual(msg["type"], "unit_test_ping")
+        finally:
+            if q in self.server.event_subscribers:
+                self.server.event_subscribers.remove(q)
+
+    # 18. Frontend DOM Integrity & Windows Shell Integration Command Builder
+    def test_frontend_dom_and_shell_integration(self):
+        index_html = self.client.get("/").data.decode("utf-8")
+        required_ids = [
+            "nearbyDashboardCard",
+            "nearbyDevicesList",
+            "nearbyDevicesCountBadge",
+            "globalDropOverlay",
+            "clipboardImageCard",
+            "clipboardImagePreview",
+            "btnDownloadClipboardImage",
+            "btnCopyClipboardImage",
+            "btnClearClipboardImage",
+            "transferManagerCard",
+            "activeTransfersList",
+            "failedTransfersCard",
+            "btnRetryAllFailed",
+            "btnClearHistory",
+        ]
+        for dom_id in required_ids:
+            self.assertIn(f'id="{dom_id}"', index_html, f"Missing DOM element #{dom_id} in index.html")
+
+        from core.shell_integration import _get_launch_command_and_icon
+        cmd, icon = _get_launch_command_and_icon()
+        self.assertIn("--send", cmd)
+        self.assertIn('"%1"', cmd)
+        self.assertTrue(len(icon) > 0)
 
 
 if __name__ == "__main__":

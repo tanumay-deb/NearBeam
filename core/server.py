@@ -27,6 +27,36 @@ from flask import (
     send_file,
 )
 from flask_cors import CORS
+from werkzeug.serving import WSGIRequestHandler
+from werkzeug.wsgi import FileWrapper
+import socket
+
+# Enable HTTP/1.1 Keep-Alive, 4 MB file wrapper blocks, and TCP_NODELAY for high-speed LAN transfers
+WSGIRequestHandler.protocol_version = "HTTP/1.1"
+WSGIRequestHandler.timeout = 60
+
+
+def _high_speed_file_wrapper(file_obj, buffer_size: int = 4 * 1024 * 1024):
+    return FileWrapper(file_obj, buffer_size=buffer_size)
+
+
+class NearBeamRequestHandler(WSGIRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 60
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
+
+    def make_environ(self):
+        env = super().make_environ()
+        env["wsgi.file_wrapper"] = _high_speed_file_wrapper
+        return env
 
 PRECOMPRESSED_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
@@ -289,7 +319,13 @@ class NearBeamServer:
     def _run_zip_worker(self, job_id: str, real_target: str, temp_zip_path: str, files_list: list):
         """Worker thread to compress files into temp_zip_path while tracking progress."""
         try:
-            with zipfile.ZipFile(temp_zip_path, "w", allowZip64=True) as zip_file:
+            with zipfile.ZipFile(
+                temp_zip_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+                compresslevel=1,
+            ) as zip_file:
                 for file_path, archive_name, f_size in files_list:
                     with self.zip_jobs_lock:
                         job = self.zip_jobs.get(job_id)
@@ -302,7 +338,12 @@ class NearBeamServer:
 
                     try:
                         if f_size <= 1024 * 512:
-                            zip_file.write(file_path, archive_name, compress_type=compress_type)
+                            zip_file.write(
+                                file_path,
+                                archive_name,
+                                compress_type=compress_type,
+                                compresslevel=1 if compress_type == zipfile.ZIP_DEFLATED else None,
+                            )
                             with self.zip_jobs_lock:
                                 job = self.zip_jobs.get(job_id)
                                 if job:
@@ -312,8 +353,12 @@ class NearBeamServer:
                                     elif job["total_files"] > 0:
                                         job["percent"] = min(99.0, round((job["processed_files"] / job["total_files"]) * 100, 1))
                         else:
-                            chunk_size = 1024 * 512
-                            with open(file_path, "rb") as src, zip_file.open(archive_name, "w", compress_type=compress_type) as dst:
+                            chunk_size = 4 * 1024 * 1024
+                            zinfo = zipfile.ZipInfo.from_file(file_path, archive_name)
+                            zinfo.compress_type = compress_type
+                            if compress_type == zipfile.ZIP_DEFLATED:
+                                zinfo._compresslevel = 1
+                            with open(file_path, "rb", buffering=chunk_size) as src, zip_file.open(zinfo, "w", force_zip64=(f_size > 0xFFFFFFFF)) as dst:
                                 while True:
                                     with self.zip_jobs_lock:
                                         job = self.zip_jobs.get(job_id)
@@ -911,7 +956,7 @@ class NearBeamServer:
             temp_zip.close()
 
             try:
-                with zipfile.ZipFile(temp_zip.name, "w", allowZip64=True) as zip_file:
+                with zipfile.ZipFile(temp_zip.name, "w", allowZip64=True, compresslevel=1) as zip_file:
                     for root, _, filenames in os.walk(real_target):
                         for filename in filenames:
                             file_path = os.path.join(root, filename)
@@ -919,7 +964,12 @@ class NearBeamServer:
                             ext = os.path.splitext(filename)[1].lower()
                             c_type = zipfile.ZIP_STORED if ext in PRECOMPRESSED_EXTENSIONS else zipfile.ZIP_DEFLATED
                             try:
-                                zip_file.write(file_path, archive_name, compress_type=c_type)
+                                zip_file.write(
+                                    file_path,
+                                    archive_name,
+                                    compress_type=c_type,
+                                    compresslevel=1 if c_type == zipfile.ZIP_DEFLATED else None,
+                                )
                             except (PermissionError, OSError):
                                 continue
 
@@ -990,27 +1040,29 @@ class NearBeamServer:
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
             relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
-            temp_dir = os.path.join(tempfile.gettempdir(), "nearbeam_uploads")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_path = os.path.join(temp_dir, f"{session_id}.tmp")
+            save_dir = os.path.join(config.save_directory, "Guest Drops")
+            os.makedirs(save_dir, exist_ok=True)
+            temp_path = os.path.join(save_dir, f".{session_id}.tmp")
+            legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
+            if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
+                temp_path = legacy_temp
 
             mode = "ab" if chunk_index > 0 else "wb"
-            with open(temp_path, mode) as f:
-                if request.content_type == "application/octet-stream":
-                    chunk_size = 1024 * 1024 * 4
+            buf_size = 8 * 1024 * 1024
+            with open(temp_path, mode, buffering=buf_size) as f:
+                if "file" in request.files and request.files["file"]:
+                    chunk_file = request.files["file"]
                     while True:
-                        data = request.stream.read(chunk_size)
+                        data = chunk_file.stream.read(buf_size)
                         if not data:
                             break
                         f.write(data)
                 else:
-                    chunk_file = request.files.get("file")
-                    if chunk_file:
-                        while True:
-                            data = chunk_file.stream.read(1024 * 1024)
-                            if not data:
-                                break
-                            f.write(data)
+                    while True:
+                        data = request.stream.read(buf_size)
+                        if not data:
+                            break
+                        f.write(data)
 
             # Broadcast live incoming progress so the host web app can show a
             # bar for large guest drops.
@@ -1032,9 +1084,6 @@ class NearBeamServer:
                 })
 
             if chunk_index == total_chunks - 1:
-                save_dir = os.path.join(config.save_directory, "Guest Drops")
-                os.makedirs(save_dir, exist_ok=True)
-                
                 if relative_dir and ".." not in relative_dir and not relative_dir.startswith("/"):
                     dest_dir = os.path.join(save_dir, relative_dir)
                     os.makedirs(dest_dir, exist_ok=True)
@@ -1054,8 +1103,11 @@ class NearBeamServer:
                         counter += 1
                     final_name = os.path.basename(final_path)
 
-                import shutil
-                shutil.move(temp_path, final_path)
+                try:
+                    os.replace(temp_path, final_path)
+                except OSError:
+                    import shutil
+                    shutil.move(temp_path, final_path)
                 total_bytes = os.path.getsize(final_path)
 
                 file_info = {
@@ -1111,11 +1163,12 @@ class NearBeamServer:
                 original_name = f.filename
                 dest_path, final_name = config.get_unique_filepath(original_name)
 
-                # Stream save to disk in chunks to avoid memory overflow
+                # Stream save to disk in 8 MB buffered chunks for maximum LAN throughput
                 total_bytes = 0
-                with open(dest_path, "wb") as out_file:
+                buf_size = 8 * 1024 * 1024
+                with open(dest_path, "wb", buffering=buf_size) as out_file:
                     while True:
-                        chunk = f.stream.read(1024 * 1024)
+                        chunk = f.stream.read(buf_size)
                         if not chunk:
                             break
                         out_file.write(chunk)
@@ -1173,27 +1226,29 @@ class NearBeamServer:
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
             relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
-            temp_dir = os.path.join(tempfile.gettempdir(), "nearbeam_uploads")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_path = os.path.join(temp_dir, f"{session_id}.tmp")
+            save_dir = config.save_directory
+            os.makedirs(save_dir, exist_ok=True)
+            temp_path = os.path.join(save_dir, f".{session_id}.tmp")
+            legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
+            if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
+                temp_path = legacy_temp
 
             mode = "ab" if chunk_index > 0 else "wb"
-            with open(temp_path, mode) as f:
-                if request.content_type == "application/octet-stream":
-                    chunk_size = 1024 * 1024 * 4
+            buf_size = 8 * 1024 * 1024
+            with open(temp_path, mode, buffering=buf_size) as f:
+                if "file" in request.files and request.files["file"]:
+                    chunk_file = request.files["file"]
                     while True:
-                        data = request.stream.read(chunk_size)
+                        data = chunk_file.stream.read(buf_size)
                         if not data:
                             break
                         f.write(data)
                 else:
-                    chunk_file = request.files.get("file")
-                    if chunk_file:
-                        while True:
-                            data = chunk_file.stream.read(1024 * 1024)
-                            if not data:
-                                break
-                            f.write(data)
+                    while True:
+                        data = request.stream.read(buf_size)
+                        if not data:
+                            break
+                        f.write(data)
 
             # Broadcast live incoming progress so the host web app (and any
             # other connected device) can show a bar for large transfers.
@@ -1215,7 +1270,6 @@ class NearBeamServer:
                 })
 
             if chunk_index == total_chunks - 1:
-                save_dir = config.save_directory
                 if relative_dir and ".." not in relative_dir and not relative_dir.startswith("/"):
                     dest_dir = os.path.join(save_dir, relative_dir)
                     os.makedirs(dest_dir, exist_ok=True)
@@ -1229,8 +1283,11 @@ class NearBeamServer:
                 else:
                     final_path, final_name = config.get_unique_filepath(filename)
 
-                import shutil
-                shutil.move(temp_path, final_path)
+                try:
+                    os.replace(temp_path, final_path)
+                except OSError:
+                    import shutil
+                    shutil.move(temp_path, final_path)
                 total_bytes = os.path.getsize(final_path)
 
                 file_info = {
@@ -1266,10 +1323,17 @@ class NearBeamServer:
 
         @app.route("/api/upload/status/<session_id>")
         def api_upload_status(session_id):
-            temp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
-            if os.path.exists(temp_path):
-                size = os.path.getsize(temp_path)
-                return jsonify({"received_bytes": size})
+            if ".." in session_id or "/" in session_id or "\\" in session_id:
+                return jsonify({"received_bytes": 0})
+            candidates = [
+                os.path.join(config.save_directory, f".{session_id}.tmp"),
+                os.path.join(config.save_directory, "Guest Drops", f".{session_id}.tmp"),
+                os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
+            ]
+            for temp_path in candidates:
+                if os.path.exists(temp_path):
+                    size = os.path.getsize(temp_path)
+                    return jsonify({"received_bytes": size})
             return jsonify({"received_bytes": 0})
 
         @app.route("/api/upload/cancel", methods=["POST"])
@@ -1279,8 +1343,9 @@ class NearBeamServer:
             removed_tmp = False
             if session_id and ".." not in session_id and "/" not in session_id and "\\" not in session_id:
                 candidates = [
-                    os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
                     os.path.join(config.save_directory, f".{session_id}.tmp"),
+                    os.path.join(config.save_directory, "Guest Drops", f".{session_id}.tmp"),
+                    os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
                 ]
                 for temp_path in candidates:
                     if os.path.exists(temp_path):

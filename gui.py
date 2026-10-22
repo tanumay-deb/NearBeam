@@ -64,7 +64,7 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
-from core.server import NearBeamServer, LandropServer
+from core.server import NearBeamServer, LandropServer, NearBeamRequestHandler
 from core.shell_integration import is_shell_integration_enabled, set_shell_integration
 from core.version import APP_VERSION, RELEASES_URL, check_for_updates
 
@@ -83,7 +83,13 @@ class ServerThread(threading.Thread):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
-        self.server = make_server(self.host, self.port, app, threaded=True)
+        self.server = make_server(
+            self.host,
+            self.port,
+            app,
+            threaded=True,
+            request_handler=NearBeamRequestHandler,
+        )
 
     def run(self):
         try:
@@ -1223,36 +1229,42 @@ class MainWindow(QMainWindow):
             self._handle_shared_paths(dropped_paths, source="Window Drag & Drop")
 
     def _send_files_async(self, upload_url: str, target_name: str, file_paths: list[str]):
-        """Pushes files directly to peer computer using pure Python standard library multipart HTTP."""
+        """Streams files directly to peer computer in 16 MB chunks over HTTP/1.1 with O(1) memory."""
+        import urllib.parse
         import urllib.request
         import uuid
 
-        boundary = f"----NearBeamBoundary{uuid.uuid4().hex}"
-        self._append_log(f"Sending {len(file_paths)} file(s) directly to {target_name} ({upload_url})...", "info")
+        chunk_url = upload_url.rstrip("/") + "/chunk" if not upload_url.endswith("/chunk") else upload_url
+        chunk_size = 16 * 1024 * 1024  # 16 MB streaming chunks
+        self._append_log(f"Sending {len(file_paths)} file(s) directly to {target_name}...", "info")
 
         try:
-            body = bytearray()
             for fp in file_paths:
                 fname = os.path.basename(fp)
-                body.extend(f"--{boundary}\r\n".encode("utf-8"))
-                body.extend(f'Content-Disposition: form-data; name="files"; filename="{fname}"\r\n'.encode("utf-8"))
-                body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
-                with open(fp, "rb") as f:
-                    body.extend(f.read())
-                body.extend(b"\r\n")
-            body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+                fsize = os.path.getsize(fp)
+                total_chunks = max(1, (fsize + chunk_size - 1) // chunk_size)
+                session_id = f"desk_{uuid.uuid4().hex[:12]}"
 
-            req = urllib.request.Request(
-                upload_url,
-                data=body,
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=60.0) as resp:
-                if resp.status == 200:
-                    self._append_log(f"✓ Successfully sent {len(file_paths)} file(s) to {target_name}!", "upload")
-                else:
-                    self._append_log(f"Send failed with HTTP status {resp.status}", "error")
+                with open(fp, "rb", buffering=chunk_size) as f:
+                    for idx in range(total_chunks):
+                        data = f.read(chunk_size)
+                        req = urllib.request.Request(
+                            chunk_url,
+                            data=data,
+                            headers={
+                                "Content-Type": "application/octet-stream",
+                                "X-Session-Id": session_id,
+                                "X-Filename": urllib.parse.quote(fname),
+                                "X-Chunk-Index": str(idx),
+                                "X-Total-Chunks": str(total_chunks),
+                            },
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=60.0) as resp:
+                            if resp.status != 200:
+                                raise RuntimeError(f"HTTP status {resp.status}")
+
+            self._append_log(f"✓ Successfully sent {len(file_paths)} file(s) to {target_name}!", "upload")
         except Exception as e:
             self._append_log(f"Failed sending files to {target_name}: {e}", "error")
 

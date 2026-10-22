@@ -28,7 +28,7 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
-from core.server import NearBeamServer, LandropServer
+from core.server import NearBeamServer, LandropServer, NearBeamRequestHandler
 
 
 def run_headless(port: int = 5000):
@@ -56,10 +56,12 @@ def run_headless(port: int = 5000):
     server.add_activity_callback(cli_logger)
 
     try:
-        from werkzeug.serving import WSGIRequestHandler
-        # Give large transfers time to recover from brief Wi-Fi stalls.
-        WSGIRequestHandler.timeout = 60
-        server.app.run(host="0.0.0.0", port=actual_port, threaded=True)
+        server.app.run(
+            host="0.0.0.0",
+            port=actual_port,
+            threaded=True,
+            request_handler=NearBeamRequestHandler,
+        )
     except KeyboardInterrupt:
         print("\n  Shutting down NearBeam server...")
     finally:
