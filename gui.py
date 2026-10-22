@@ -1316,6 +1316,7 @@ class MainWindow(QMainWindow):
                                 "X-Filename": urllib.parse.quote(fname),
                                 "X-Chunk-Index": str(idx),
                                 "X-Total-Chunks": str(total_chunks),
+                                "X-Chunk-Offset": str(idx * chunk_size),
                             },
                             method="POST",
                         )

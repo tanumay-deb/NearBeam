@@ -1583,6 +1583,7 @@ class TransferManager {
     t.xhr.setRequestHeader("X-Filename", encodeURIComponent(t.filename));
     t.xhr.setRequestHeader("X-Chunk-Index", t.currentChunk.toString());
     t.xhr.setRequestHeader("X-Total-Chunks", t.totalChunks.toString());
+    t.xhr.setRequestHeader("X-Chunk-Offset", start.toString());
     if (t.relativeDir) {
       t.xhr.setRequestHeader("X-Relative-Dir", encodeURIComponent(t.relativeDir));
     }

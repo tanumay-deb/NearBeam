@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -75,6 +76,8 @@ from core.network import (
     get_local_ip,
 )
 from core.version import APP_VERSION, check_for_updates
+
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def format_size(size_bytes: int) -> str:
@@ -557,6 +560,135 @@ class NearBeamServer:
                 if q in self.event_subscribers:
                     self.event_subscribers.remove(q)
 
+    def _receive_chunk(self, save_dir: str, peer: str, log_template: str):
+        """Shared chunk receiver for host uploads and guest drops."""
+        from urllib.parse import unquote
+        session_id = request.headers.get("X-Session-Id") or request.form.get("session_id")
+        filename_raw = request.headers.get("X-Filename") or request.form.get("filename")
+        if not session_id or not filename_raw:
+            return jsonify({"error": "Missing parameters"}), 400
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            return jsonify({"error": "Invalid session id"}), 400
+        try:
+            chunk_index = int(request.headers.get("X-Chunk-Index", request.form.get("chunk_index", 0)))
+            total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
+            offset_raw = request.headers.get("X-Chunk-Offset")
+            offset = int(offset_raw) if offset_raw is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid chunk headers"}), 400
+        if chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks or (offset is not None and offset < 0):
+            return jsonify({"error": "Invalid chunk headers"}), 400
+
+        # Drop any directory parts smuggled into the name; Windows accepts both separators.
+        filename = os.path.basename(unquote(filename_raw).replace("\\", "/")).strip()
+        if filename in ("", ".", ".."):
+            filename = f"unnamed_file_{uuid.uuid4().hex[:8]}"
+        relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
+
+        dest_dir = save_dir
+        if relative_dir:
+            dest_dir = os.path.normpath(os.path.join(save_dir, relative_dir))
+            root = os.path.realpath(save_dir)
+            try:
+                inside = os.path.commonpath([root, os.path.realpath(dest_dir)]) == root
+            except ValueError:  # different drive on Windows
+                inside = False
+            if not inside:
+                return jsonify({"error": "Invalid relative directory"}), 400
+
+        os.makedirs(save_dir, exist_ok=True)
+        temp_path = os.path.join(save_dir, f".{session_id}.tmp")
+        legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
+        if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
+            temp_path = legacy_temp
+
+        if offset is None:
+            # Legacy clients without X-Chunk-Offset: append-only.
+            mode = "ab" if chunk_index > 0 else "wb"
+        else:
+            have = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+            if offset > have:
+                return jsonify({"error": "Chunk offset beyond received data", "received_bytes": have}), 409
+            mode = "r+b" if have else "wb"
+
+        buf_size = 8 * 1024 * 1024
+        with open(temp_path, mode, buffering=buf_size) as f:
+            if offset is not None:
+                # A resent chunk overwrites its own range instead of being appended twice.
+                f.seek(offset)
+                f.truncate()
+            stream = request.files["file"].stream if request.files.get("file") else request.stream
+            while True:
+                data = stream.read(buf_size)
+                if not data:
+                    break
+                f.write(data)
+
+        # Broadcast live incoming progress so the host web app (and any
+        # other connected device) can show a bar for large transfers.
+        if total_chunks > 1:
+            try:
+                received_bytes = os.path.getsize(temp_path)
+            except OSError:
+                received_bytes = 0
+            self.broadcast_event({
+                "type": "upload_progress",
+                "session_id": session_id,
+                "filename": filename,
+                "relative_dir": relative_dir,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "percent": round(((chunk_index + 1) / total_chunks) * 100, 1),
+                "received_bytes": received_bytes,
+                "from_addr": request.remote_addr,
+            })
+
+        if chunk_index < total_chunks - 1:
+            return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+
+        os.makedirs(dest_dir, exist_ok=True)
+        final_path = os.path.join(dest_dir, filename)
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(final_path):
+            final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
+            counter += 1
+        final_name = os.path.basename(final_path)
+
+        try:
+            os.replace(temp_path, final_path)
+        except OSError:
+            import shutil
+            shutil.move(temp_path, final_path)
+        total_bytes = os.path.getsize(final_path)
+
+        file_info = {
+            "filename": final_name,
+            "original_name": filename,
+            "size": total_bytes,
+            "formatted_size": format_size(total_bytes),
+            "saved_path": final_path,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "category": get_file_type_category(final_name),
+        }
+        self.received_files_history.insert(0, file_info)
+        if len(self.received_files_history) > 100:
+            self.received_files_history.pop()
+        config.add_transfer_history({
+            **file_info,
+            "direction": "received",
+            "peer": peer,
+            "status": "completed",
+        })
+
+        self.log_activity(log_template.format(name=final_name, size=format_size(total_bytes)), event_type="upload")
+        self.broadcast_event({
+            "type": "file_received",
+            "file": file_info,
+            "session_id": session_id,
+        })
+        return jsonify({"success": True, "completed": True, "file": file_info})
+
     def _register_routes(self):
         app = self.app
 
@@ -1029,117 +1161,11 @@ class NearBeamServer:
         def api_drop_upload_chunk(token):
             if token not in self.active_drop_zones or time.time() > self.active_drop_zones[token]["expires_at"]:
                 return jsonify({"error": "Drop link expired"}), 403
-            from urllib.parse import unquote
-            session_id = request.headers.get("X-Session-Id") or request.form.get("session_id")
-            filename_raw = request.headers.get("X-Filename") or request.form.get("filename")
-            if not session_id or not filename_raw:
-                return jsonify({"error": "Missing parameters"}), 400
-                
-            filename = unquote(filename_raw)
-            chunk_index = int(request.headers.get("X-Chunk-Index", request.form.get("chunk_index", 0)))
-            total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
-            relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
-
-            save_dir = os.path.join(config.save_directory, "Guest Drops")
-            os.makedirs(save_dir, exist_ok=True)
-            temp_path = os.path.join(save_dir, f".{session_id}.tmp")
-            legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
-            if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
-                temp_path = legacy_temp
-
-            mode = "ab" if chunk_index > 0 else "wb"
-            buf_size = 8 * 1024 * 1024
-            with open(temp_path, mode, buffering=buf_size) as f:
-                if "file" in request.files and request.files["file"]:
-                    chunk_file = request.files["file"]
-                    while True:
-                        data = chunk_file.stream.read(buf_size)
-                        if not data:
-                            break
-                        f.write(data)
-                else:
-                    while True:
-                        data = request.stream.read(buf_size)
-                        if not data:
-                            break
-                        f.write(data)
-
-            # Broadcast live incoming progress so the host web app can show a
-            # bar for large guest drops.
-            if total_chunks > 1:
-                try:
-                    received_bytes = os.path.getsize(temp_path)
-                except OSError:
-                    received_bytes = 0
-                self.broadcast_event({
-                    "type": "upload_progress",
-                    "session_id": session_id,
-                    "filename": filename,
-                    "relative_dir": relative_dir,
-                    "chunk_index": chunk_index,
-                    "total_chunks": total_chunks,
-                    "percent": round(((chunk_index + 1) / total_chunks) * 100, 1),
-                    "received_bytes": received_bytes,
-                    "from_addr": request.remote_addr,
-                })
-
-            if chunk_index == total_chunks - 1:
-                if relative_dir and ".." not in relative_dir and not relative_dir.startswith("/"):
-                    dest_dir = os.path.join(save_dir, relative_dir)
-                    os.makedirs(dest_dir, exist_ok=True)
-                    final_path = os.path.join(dest_dir, filename)
-                    base, ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(final_path):
-                        final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
-                        counter += 1
-                    final_name = os.path.basename(final_path)
-                else:
-                    final_path = os.path.join(save_dir, filename)
-                    base, ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(final_path):
-                        final_path = os.path.join(save_dir, f"{base} ({counter}){ext}")
-                        counter += 1
-                    final_name = os.path.basename(final_path)
-
-                try:
-                    os.replace(temp_path, final_path)
-                except OSError:
-                    import shutil
-                    shutil.move(temp_path, final_path)
-                total_bytes = os.path.getsize(final_path)
-
-                file_info = {
-                    "filename": final_name,
-                    "original_name": filename,
-                    "size": total_bytes,
-                    "formatted_size": format_size(total_bytes),
-                    "saved_path": final_path,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "category": get_file_type_category(final_name),
-                }
-                self.received_files_history.insert(0, file_info)
-                if len(self.received_files_history) > 100:
-                    self.received_files_history.pop()
-                config.add_transfer_history({
-                    **file_info,
-                    "direction": "received",
-                    "peer": f"Guest Drop ({request.remote_addr})",
-                    "status": "completed",
-                })
-
-                msg = f"Guest dropped '{final_name}' ({format_size(total_bytes)})"
-                self.log_activity(msg, event_type="upload")
-                self.broadcast_event({
-                    "type": "file_received",
-                    "file": file_info,
-                    "session_id": session_id,
-                })
-
-                return jsonify({"success": True, "completed": True, "file": file_info})
-            
-            return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+            return self._receive_chunk(
+                os.path.join(config.save_directory, "Guest Drops"),
+                f"Guest Drop ({request.remote_addr})",
+                "Guest dropped '{name}' ({size})",
+            )
 
         @app.route("/api/upload", methods=["POST"])
         def api_upload():
@@ -1215,111 +1241,11 @@ class NearBeamServer:
         def api_upload_chunk():
             if not config.auto_save_enabled:
                 return jsonify({"error": "Auto-Save is disabled on host"}), 403
-            from urllib.parse import unquote
-            session_id = request.headers.get("X-Session-Id") or request.form.get("session_id")
-            filename_raw = request.headers.get("X-Filename") or request.form.get("filename")
-            if not session_id or not filename_raw:
-                return jsonify({"error": "Missing parameters"}), 400
-                
-            filename = unquote(filename_raw)
-            chunk_index = int(request.headers.get("X-Chunk-Index", request.form.get("chunk_index", 0)))
-            total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
-            relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
-
-            save_dir = config.save_directory
-            os.makedirs(save_dir, exist_ok=True)
-            temp_path = os.path.join(save_dir, f".{session_id}.tmp")
-            legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
-            if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
-                temp_path = legacy_temp
-
-            mode = "ab" if chunk_index > 0 else "wb"
-            buf_size = 8 * 1024 * 1024
-            with open(temp_path, mode, buffering=buf_size) as f:
-                if "file" in request.files and request.files["file"]:
-                    chunk_file = request.files["file"]
-                    while True:
-                        data = chunk_file.stream.read(buf_size)
-                        if not data:
-                            break
-                        f.write(data)
-                else:
-                    while True:
-                        data = request.stream.read(buf_size)
-                        if not data:
-                            break
-                        f.write(data)
-
-            # Broadcast live incoming progress so the host web app (and any
-            # other connected device) can show a bar for large transfers.
-            if total_chunks > 1:
-                try:
-                    received_bytes = os.path.getsize(temp_path)
-                except OSError:
-                    received_bytes = 0
-                self.broadcast_event({
-                    "type": "upload_progress",
-                    "session_id": session_id,
-                    "filename": filename,
-                    "relative_dir": relative_dir,
-                    "chunk_index": chunk_index,
-                    "total_chunks": total_chunks,
-                    "percent": round(((chunk_index + 1) / total_chunks) * 100, 1),
-                    "received_bytes": received_bytes,
-                    "from_addr": request.remote_addr,
-                })
-
-            if chunk_index == total_chunks - 1:
-                if relative_dir and ".." not in relative_dir and not relative_dir.startswith("/"):
-                    dest_dir = os.path.join(save_dir, relative_dir)
-                    os.makedirs(dest_dir, exist_ok=True)
-                    final_path = os.path.join(dest_dir, filename)
-                    base, ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(final_path):
-                        final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
-                        counter += 1
-                    final_name = os.path.basename(final_path)
-                else:
-                    final_path, final_name = config.get_unique_filepath(filename)
-
-                try:
-                    os.replace(temp_path, final_path)
-                except OSError:
-                    import shutil
-                    shutil.move(temp_path, final_path)
-                total_bytes = os.path.getsize(final_path)
-
-                file_info = {
-                    "filename": final_name,
-                    "original_name": filename,
-                    "size": total_bytes,
-                    "formatted_size": format_size(total_bytes),
-                    "saved_path": final_path,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "category": get_file_type_category(final_name),
-                }
-                self.received_files_history.insert(0, file_info)
-                if len(self.received_files_history) > 100:
-                    self.received_files_history.pop()
-                config.add_transfer_history({
-                    **file_info,
-                    "direction": "received",
-                    "peer": request.remote_addr or "Local Network",
-                    "status": "completed",
-                })
-
-                msg = f"Auto-saved '{final_name}' ({format_size(total_bytes)}) from {request.remote_addr}"
-                self.log_activity(msg, event_type="upload")
-                self.broadcast_event({
-                    "type": "file_received",
-                    "file": file_info,
-                    "session_id": session_id,
-                })
-
-                return jsonify({"success": True, "completed": True, "file": file_info})
-            
-            return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+            return self._receive_chunk(
+                config.save_directory,
+                request.remote_addr or "Local Network",
+                f"Auto-saved '{{name}}' ({{size}}) from {request.remote_addr}",
+            )
 
         @app.route("/api/upload/status/<session_id>")
         def api_upload_status(session_id):

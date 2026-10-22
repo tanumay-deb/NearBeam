@@ -6,6 +6,7 @@ Handles Safe List folders, Auto-Save preferences, and settings.
 import json
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -25,6 +26,8 @@ class ConfigManager:
         downloads_dir = Path.home() / "Downloads" / "NearBeam_Received"
         self.default_save_dir = str(downloads_dir)
 
+        # Upload threads write history concurrently; serialize mutation + save.
+        self._lock = threading.RLock()
         self.data = {
             "port": 5000,
             "auto_save": True,
@@ -59,8 +62,13 @@ class ConfigManager:
     def save(self):
         """Persists current configuration to JSON file."""
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            with self._lock:
+                text = json.dumps(self.data, indent=2, ensure_ascii=False)
+                # Write-then-rename so a crash mid-write never leaves a truncated config.
+                tmp_path = f"{self.config_path}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp_path, self.config_path)
         except Exception as e:
             print(f"Error saving config to {self.config_path}: {e}")
 
@@ -212,7 +220,6 @@ class ConfigManager:
 
     def add_transfer_history(self, entry: dict) -> dict:
         """Prepends a completed or failed transfer entry to persistent history (capped at 100)."""
-        history = self.data.setdefault("transfer_history", [])
         record = {
             "id": entry.get("id") or uuid.uuid4().hex[:12],
             "filename": entry.get("filename", "Unknown"),
@@ -224,10 +231,12 @@ class ConfigManager:
             "status": entry.get("status", "completed"),
             "category": entry.get("category", "file"),
         }
-        history.insert(0, record)
-        if len(history) > 100:
-            del history[100:]
-        self.save()
+        with self._lock:
+            history = self.data.setdefault("transfer_history", [])
+            history.insert(0, record)
+            if len(history) > 100:
+                del history[100:]
+            self.save()
         return record
 
     def clear_transfer_history(self):

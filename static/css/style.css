@@ -1662,7 +1662,32 @@ body.theme-light .logo-text {
     font-size: 1.15rem;
   }
 
+  /* Left side shrinks so the right-hand buttons never get pushed off-screen. */
+  .nav-left {
+    gap: 8px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .nav-right,
+  .logo,
+  .status-dot-pulse {
+    flex-shrink: 0;
+  }
+
+  .nav-right {
+    gap: 6px;
+  }
+
+  #hostNameDisplay {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .host-pill {
+    min-width: 0;
+    flex-shrink: 1;
     padding: 4px 8px;
     font-size: 0.74rem;
     max-width: 125px;

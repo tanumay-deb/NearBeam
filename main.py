@@ -152,6 +152,10 @@ def send_paths_to_running_instance(paths: list[str], port: int = 5000) -> bool:
 
 
 def main():
+    # Non-UTF-8 consoles (cp1252, redirected output) must not crash on the emoji banner.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     ensure_windows_start_menu_shortcut()
     if sys.platform == "win32" and config.data.get("shell_integration_enabled", True):
         try:
