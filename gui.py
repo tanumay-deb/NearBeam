@@ -15,13 +15,14 @@ from pathlib import Path
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
     QGuiApplication,
     QIcon,
+    QImage,
     QPainter,
     QPixmap,
 )
@@ -100,6 +101,7 @@ class ActivityBridge(QObject):
     new_activity = Signal(str, str)
     update_checked = Signal(dict)
     clipboard_received = Signal(str)
+    clipboard_image_received = Signal(bytes, str)
     mesh_updated = Signal(str, list)
 
 
@@ -415,12 +417,14 @@ class MainWindow(QMainWindow):
         self.bridge.new_activity.connect(self._append_log)
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.clipboard_received.connect(self._on_remote_clipboard_received)
+        self.bridge.clipboard_image_received.connect(self._on_remote_clipboard_image_received)
         self.bridge.mesh_updated.connect(self._on_mesh_updated)
         self.current_mesh_nodes = []
 
         # Clipboard auto-sync tracking state
         self._suppress_clipboard_echo = False
         self._last_synced_clipboard = ""
+        self._last_synced_image_hash = ""
         QApplication.clipboard().dataChanged.connect(self._on_local_clipboard_changed)
 
         # Server setup
@@ -894,6 +898,9 @@ class MainWindow(QMainWindow):
             self.server_instance.add_clipboard_callback(
                 lambda text: self.bridge.clipboard_received.emit(text)
             )
+            self.server_instance.add_clipboard_image_callback(
+                lambda img_bytes, mime: self.bridge.clipboard_image_received.emit(img_bytes, mime)
+            )
 
             # Register mesh cluster callback
             self.server_instance.add_mesh_callback(
@@ -1262,7 +1269,7 @@ class MainWindow(QMainWindow):
             self._on_local_clipboard_changed()
 
     def _on_local_clipboard_changed(self):
-        """Called whenever text is copied anywhere on Windows (Ctrl+C)."""
+        """Called whenever text or a screenshot/image is copied anywhere on Windows (Ctrl+C / Win+Shift+S)."""
         if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
             return
         if getattr(self, "_suppress_clipboard_echo", False):
@@ -1270,6 +1277,38 @@ class MainWindow(QMainWindow):
 
         try:
             clipboard = QApplication.clipboard()
+            mime_data = clipboard.mimeData()
+
+            # 1. Check for copied screenshot or image first (NB-07)
+            if mime_data and mime_data.hasImage():
+                qimg = clipboard.image()
+                if not qimg.isNull():
+                    byte_array = QByteArray()
+                    buffer = QBuffer(byte_array)
+                    buffer.open(QIODevice.WriteOnly)
+                    qimg.save(buffer, "PNG")
+                    buffer.close()
+                    png_bytes = bytes(byte_array)
+                    if png_bytes:
+                        import hashlib
+                        img_hash = hashlib.sha256(png_bytes).hexdigest()
+                        if img_hash != getattr(self, "_last_synced_image_hash", ""):
+                            self._last_synced_image_hash = img_hash
+                            if hasattr(self, "server_instance") and self.server_instance:
+                                self.server_instance.set_clipboard_image(
+                                    png_bytes,
+                                    mime_type="image/png",
+                                    notify_local_os=False,
+                                    propagate_mesh=True,
+                                )
+                                kb = len(png_bytes) / 1024.0
+                                self._append_log(
+                                    f"Auto-synced Windows screenshot/image ({kb:.1f} KB) to shared clipboard",
+                                    "upload",
+                                )
+                return
+
+            # 2. Check for copied text
             text = clipboard.text()
             if text and text != getattr(self, "_last_synced_clipboard", ""):
                 self._last_synced_clipboard = text
@@ -1279,16 +1318,17 @@ class MainWindow(QMainWindow):
                     self.server_instance.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
                     self.server_instance.broadcast_event({
                         "type": "clipboard_updated",
-                        "text": text,
-                        "updated_at": self.server_instance.clipboard_updated_at,
+                        **self.server_instance.get_clipboard_state(),
                     })
+                    if self.server_instance.mesh:
+                        self.server_instance.mesh.broadcast_clipboard_mesh(text)
                     snippet = (text[:30] + "...") if len(text) > 30 else text
                     self._append_log(f"Auto-synced Windows clipboard to network: '{snippet}'", "info")
         except Exception as e:
             print(f"Error in _on_local_clipboard_changed: {e}")
 
     def _on_remote_clipboard_received(self, text: str):
-        """Called when a mobile device or web client updates the shared clipboard."""
+        """Called when a mobile device or web client updates the shared text clipboard."""
         if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
             return
         if not text or text == getattr(self, "_last_synced_clipboard", ""):
@@ -1304,6 +1344,36 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_received: {e}")
+
+    def _on_remote_clipboard_image_received(self, img_bytes: bytes, mime_type: str):
+        """Called when a mobile device, browser, or peer PC shares an image into the clipboard (NB-07)."""
+        if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
+            return
+        if not img_bytes:
+            return
+
+        try:
+            import hashlib
+            img_hash = hashlib.sha256(img_bytes).hexdigest()
+            if img_hash == getattr(self, "_last_synced_image_hash", ""):
+                return
+
+            qimg = QImage.fromData(img_bytes)
+            if qimg.isNull():
+                return
+
+            self._suppress_clipboard_echo = True
+            self._last_synced_image_hash = img_hash
+            QApplication.clipboard().setImage(qimg)
+            self._suppress_clipboard_echo = False
+            kb = len(img_bytes) / 1024.0
+            self._append_log(
+                f"✓ Copied incoming image ({kb:.1f} KB) directly to Windows clipboard (Ready to Ctrl+V!)",
+                "upload",
+            )
+        except Exception as e:
+            self._suppress_clipboard_echo = False
+            print(f"Error in _on_remote_clipboard_image_received: {e}")
 
     def _toggle_shell_integration(self, checked: bool):
         success = set_shell_integration(checked)

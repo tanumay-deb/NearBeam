@@ -399,7 +399,7 @@
         <div class="section-header-flex">
           <div>
             <h2 class="section-title">Shared Clipboard</h2>
-            <p class="section-desc">Instantly share notes, links, and text across PC and phone</p>
+            <p class="section-desc">Instantly sync text, links, screenshots (`Win+Shift+S`), and copied images across PC & phone</p>
           </div>
           <span class="timestamp-badge" id="clipboardUpdatedTime">Never synced</span>
         </div>
@@ -409,12 +409,39 @@
           <label class="clipboard-checkbox-label" for="chkKeepSyncingClipboard">
             <input type="checkbox" id="chkKeepSyncingClipboard" checked />
             <span class="custom-checkbox-box"></span>
-            <span class="checkbox-text">Keep syncing clipboard automatically</span>
+            <span class="checkbox-text">Keep syncing clipboard automatically (Text & Screenshots)</span>
           </label>
           <span class="sync-live-status" id="syncLiveStatus">● Auto-Sync Active</span>
         </div>
 
-        <textarea class="clipboard-box" id="clipboardTextarea" placeholder="Type or paste text here to share across devices instantly..."></textarea>
+        <!-- Rich Image / Screenshot Clipboard Section (NB-07) -->
+        <div class="clipboard-image-section" id="clipboardImageSection">
+          <div class="clipboard-image-toolbar">
+            <div class="clipboard-image-hint">
+              <span>🖼️ <strong>Rich Image Clipboard:</strong> Press <kbd>Ctrl+V</kbd> to paste a screenshot, take a snip on PC (<kbd>Win+Shift+S</kbd>), or select an image:</span>
+            </div>
+            <input type="file" id="clipboardImageInput" accept="image/*" style="display: none;" />
+            <button type="button" class="secondary-btn btn-sm" id="btnUploadClipboardImage">
+              <span>📷 Share Image / Screenshot</span>
+            </button>
+          </div>
+
+          <div class="clipboard-image-card hidden" id="clipboardImageCard">
+            <div class="clipboard-image-header">
+              <span class="clipboard-image-badge" id="clipboardImageMeta">Copied Screenshot / Image</span>
+              <div class="clipboard-image-actions">
+                <button type="button" class="primary-btn btn-xs" id="btnCopyClipboardImage">📋 Copy Image</button>
+                <a class="secondary-btn btn-xs" id="btnDownloadClipboardImage" href="/api/clipboard/image?download=1" download>⬇ Save Image</a>
+                <button type="button" class="btn-cancel btn-xs" id="btnClearClipboardImage">✕ Clear</button>
+              </div>
+            </div>
+            <div class="clipboard-image-preview-wrap">
+              <img id="clipboardImagePreview" src="" alt="Shared Clipboard Image" />
+            </div>
+          </div>
+        </div>
+
+        <textarea class="clipboard-box" id="clipboardTextarea" placeholder="Type or paste text (or press Ctrl+V with a copied screenshot/image) to share across devices instantly..."></textarea>
 
         <div class="clipboard-actions">
           <button class="primary-btn" id="btnSendClipboard">
@@ -429,7 +456,7 @@
               <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
             </svg>
-            <span>Copy to My Clipboard</span>
+            <span>Copy Text to Clipboard</span>
           </button>
         </div>
       </div>

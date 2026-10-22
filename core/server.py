@@ -101,11 +101,15 @@ class NearBeamServer:
         # In-memory shared state
         self.clipboard_content = ""
         self.clipboard_updated_at = None
+        self.clipboard_image_bytes: Optional[bytes] = None
+        self.clipboard_image_mime: str = "image/png"
+        self.clipboard_image_id: str = ""
         self.received_files_history = []
         self.connected_clients: Dict[str, Dict[str, Any]] = {}
         self.event_subscribers: list[queue.Queue] = []
         self.activity_callbacks = []
         self.clipboard_callbacks = []
+        self.clipboard_image_callbacks = []
         self.mesh_callbacks = []
 
         # Mesh / Cluster management
@@ -426,8 +430,67 @@ class NearBeamServer:
         self.activity_callbacks.append(callback)
 
     def add_clipboard_callback(self, callback):
-        """Registers a callback for remote clipboard updates."""
+        """Registers a callback for remote clipboard text updates."""
         self.clipboard_callbacks.append(callback)
+
+    def add_clipboard_image_callback(self, callback):
+        """Registers a callback for remote clipboard image/screenshot updates."""
+        self.clipboard_image_callbacks.append(callback)
+
+    def get_clipboard_state(self) -> dict:
+        """Returns current text + image metadata for the shared clipboard."""
+        has_img = bool(self.clipboard_image_bytes)
+        img_size = len(self.clipboard_image_bytes) if self.clipboard_image_bytes else 0
+        return {
+            "text": self.clipboard_content,
+            "updated_at": self.clipboard_updated_at,
+            "has_image": has_img,
+            "image_id": self.clipboard_image_id if has_img else None,
+            "image_url": f"/api/clipboard/image?id={self.clipboard_image_id}" if has_img else None,
+            "image_mime": self.clipboard_image_mime if has_img else None,
+            "image_size": img_size,
+            "image_formatted_size": format_size(img_size) if has_img else None,
+        }
+
+    def set_clipboard_image(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        notify_local_os: bool = True,
+        propagate_mesh: bool = True,
+        source_node_id: Optional[str] = None,
+    ) -> dict:
+        """Updates the shared clipboard image, broadcasts via SSE, and syncs across mesh/OS."""
+        import base64
+
+        self.clipboard_image_bytes = image_bytes
+        self.clipboard_image_mime = mime_type or "image/png"
+        self.clipboard_image_id = uuid.uuid4().hex[:12]
+        self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+
+        state = self.get_clipboard_state()
+        self.broadcast_event({
+            "type": "clipboard_updated",
+            **state,
+        })
+
+        if notify_local_os:
+            for cb in self.clipboard_image_callbacks:
+                try:
+                    cb(image_bytes, self.clipboard_image_mime)
+                except Exception as e:
+                    print(f"Error in clipboard image callback: {e}")
+
+        if propagate_mesh and self.mesh and image_bytes:
+            b64_str = base64.b64encode(image_bytes).decode("ascii")
+            self.mesh.broadcast_clipboard_mesh(
+                text=self.clipboard_content,
+                source_node_id=source_node_id,
+                image_base64=b64_str,
+                image_mime=self.clipboard_image_mime,
+            )
+
+        return state
 
     def log_activity(self, message: str, event_type: str = "info"):
         """Logs an activity event and notifies desktop GUI callbacks."""
@@ -1359,39 +1422,140 @@ class NearBeamServer:
             mime_type, _ = mimetypes.guess_type(target)
             return send_file(target, mimetype=mime_type or "application/octet-stream", conditional=True)
 
-        # --- Shared Clipboard Endpoints ---
+        # --- Shared Clipboard Endpoints (Text + Rich Images / Screenshots NB-07) ---
 
         @app.route("/api/clipboard", methods=["GET", "POST"])
         def api_clipboard():
             if request.method == "POST":
                 data = request.get_json(silent=True) or {}
-                text = data.get("text", "")
-                self.clipboard_content = text
-                self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+                text = data.get("text")
+                image_b64 = data.get("image_base64")
+                image_mime = data.get("image_mime", "image/png")
 
-                snippet = (text[:35] + "...") if len(text) > 35 else text
-                self.log_activity(f"Clipboard updated from {request.remote_addr}: '{snippet}'")
-                self.broadcast_event({
-                    "type": "clipboard_updated",
-                    "text": self.clipboard_content,
-                    "updated_at": self.clipboard_updated_at,
-                })
-
-                if self.mesh:
-                    self.mesh.broadcast_clipboard_mesh(text)
-
-                for cb in self.clipboard_callbacks:
+                if image_b64:
+                    import base64
+                    if "," in image_b64 and image_b64.startswith("data:"):
+                        header, image_b64 = image_b64.split(",", 1)
+                        if ";" in header and ":" in header:
+                            image_mime = header.split(":", 1)[1].split(";", 1)[0] or "image/png"
                     try:
-                        cb(self.clipboard_content)
-                    except Exception as e:
-                        print(f"Error in clipboard callback: {e}")
+                        img_bytes = base64.b64decode(image_b64)
+                    except Exception:
+                        return jsonify({"error": "Invalid base64 image payload"}), 400
+                    state = self.set_clipboard_image(
+                        img_bytes,
+                        mime_type=image_mime,
+                        notify_local_os=True,
+                        propagate_mesh=True,
+                    )
+                    self.log_activity(
+                        f"Clipboard image ({format_size(len(img_bytes))}) synced from {request.remote_addr}",
+                        "upload",
+                    )
+                    return jsonify({"success": True, **state})
 
-                return jsonify({"success": True, "text": self.clipboard_content})
+                if text is not None:
+                    self.clipboard_content = text
+                    self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
 
-            return jsonify({
-                "text": self.clipboard_content,
-                "updated_at": self.clipboard_updated_at,
+                    snippet = (text[:35] + "...") if len(text) > 35 else text
+                    self.log_activity(f"Clipboard updated from {request.remote_addr}: '{snippet}'")
+                    state = self.get_clipboard_state()
+                    self.broadcast_event({
+                        "type": "clipboard_updated",
+                        **state,
+                    })
+
+                    if self.mesh:
+                        self.mesh.broadcast_clipboard_mesh(text)
+
+                    for cb in self.clipboard_callbacks:
+                        try:
+                            cb(self.clipboard_content)
+                        except Exception as e:
+                            print(f"Error in clipboard callback: {e}")
+
+                return jsonify({"success": True, **self.get_clipboard_state()})
+
+            return jsonify(self.get_clipboard_state())
+
+        @app.route("/api/clipboard/image", methods=["GET", "POST"])
+        def api_clipboard_image():
+            """GET streams the current clipboard image; POST uploads a screenshot/image to the shared clipboard."""
+            if request.method == "POST":
+                img_bytes = None
+                mime_type = "image/png"
+
+                if "image" in request.files or "file" in request.files:
+                    f = request.files.get("image") or request.files.get("file")
+                    if f:
+                        img_bytes = f.read()
+                        mime_type = f.mimetype or "image/png"
+                elif request.content_type and request.content_type.startswith("image/"):
+                    img_bytes = request.get_data()
+                    mime_type = request.content_type.split(";")[0].strip()
+                else:
+                    data = request.get_json(silent=True) or {}
+                    b64 = data.get("image_base64", "")
+                    mime_type = data.get("image_mime", "image/png")
+                    if b64:
+                        import base64
+                        if "," in b64 and b64.startswith("data:"):
+                            header, b64 = b64.split(",", 1)
+                            if ";" in header and ":" in header:
+                                mime_type = header.split(":", 1)[1].split(";", 1)[0] or "image/png"
+                        try:
+                            img_bytes = base64.b64decode(b64)
+                        except Exception:
+                            return jsonify({"error": "Invalid base64 image"}), 400
+
+                if not img_bytes:
+                    return jsonify({"error": "No image data provided"}), 400
+
+                state = self.set_clipboard_image(
+                    img_bytes,
+                    mime_type=mime_type,
+                    notify_local_os=True,
+                    propagate_mesh=True,
+                )
+                self.log_activity(
+                    f"Clipboard image ({format_size(len(img_bytes))}) synced from {request.remote_addr}",
+                    "upload",
+                )
+                return jsonify({"success": True, **state})
+
+            if not self.clipboard_image_bytes:
+                return jsonify({"error": "No image in clipboard"}), 404
+
+            import io
+            ext = "png"
+            if "jpeg" in (self.clipboard_image_mime or "") or "jpg" in (self.clipboard_image_mime or ""):
+                ext = "jpg"
+            elif "webp" in (self.clipboard_image_mime or ""):
+                ext = "webp"
+            elif "gif" in (self.clipboard_image_mime or ""):
+                ext = "gif"
+
+            as_download = request.args.get("download") == "1"
+            return send_file(
+                io.BytesIO(self.clipboard_image_bytes),
+                mimetype=self.clipboard_image_mime or "image/png",
+                as_attachment=as_download,
+                download_name=f"nearbeam_clipboard_{self.clipboard_image_id or 'image'}.{ext}",
+            )
+
+        @app.route("/api/clipboard/image/clear", methods=["POST"])
+        def api_clipboard_image_clear():
+            """Clears the current image from the shared clipboard."""
+            self.clipboard_image_bytes = None
+            self.clipboard_image_id = ""
+            self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+            state = self.get_clipboard_state()
+            self.broadcast_event({
+                "type": "clipboard_updated",
+                **state,
             })
+            return jsonify({"success": True, **state})
 
         # --- Mesh / Cluster Endpoints ---
 
@@ -1441,10 +1605,27 @@ class NearBeamServer:
 
         @app.route("/api/mesh/clipboard-sync", methods=["POST"])
         def api_mesh_clipboard_sync():
-            """Receives cross-node clipboard update."""
+            """Receives cross-node clipboard text or image update."""
             data = request.get_json(silent=True) or {}
             text = data.get("text", "")
+            image_b64 = data.get("image_base64")
+            image_mime = data.get("image_mime", "image/png")
             source_node_id = data.get("source_node_id")
+
+            if image_b64:
+                import base64
+                try:
+                    img_bytes = base64.b64decode(image_b64)
+                    self.set_clipboard_image(
+                        img_bytes,
+                        mime_type=image_mime,
+                        notify_local_os=True,
+                        propagate_mesh=(self.mesh is not None and self.mesh.role == "leader"),
+                        source_node_id=source_node_id,
+                    )
+                    self.log_activity(f"Clipboard image ({format_size(len(img_bytes))}) synced from peer host", "info")
+                except Exception:
+                    pass
 
             if text and text != self.clipboard_content:
                 self.clipboard_content = text
@@ -1454,8 +1635,7 @@ class NearBeamServer:
 
                 self.broadcast_event({
                     "type": "clipboard_updated",
-                    "text": text,
-                    "updated_at": self.clipboard_updated_at,
+                    **self.get_clipboard_state(),
                 })
 
                 for cb in self.clipboard_callbacks:

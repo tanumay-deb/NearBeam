@@ -396,15 +396,21 @@ class MeshManager:
 
             return nodes_list
 
-    def broadcast_clipboard_mesh(self, text: str, source_node_id: Optional[str] = None):
-        """Propagates clipboard text across all connected nodes in the cluster."""
-        if not text:
+    def broadcast_clipboard_mesh(
+        self,
+        text: str = "",
+        source_node_id: Optional[str] = None,
+        image_base64: Optional[str] = None,
+        image_mime: str = "image/png",
+    ):
+        """Propagates clipboard text or image across all connected nodes in the cluster."""
+        if not text and not image_base64:
             return
 
-        text_hash = hash(text)
-        if text_hash == self._last_synced_clipboard_hash:
+        payload_hash = hash((text or "", image_base64 or ""))
+        if payload_hash == self._last_synced_clipboard_hash:
             return
-        self._last_synced_clipboard_hash = text_hash
+        self._last_synced_clipboard_hash = payload_hash
 
         def _send_to_url(url: str, payload_dict: dict):
             try:
@@ -415,9 +421,17 @@ class MeshManager:
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                urllib.request.urlopen(req, timeout=2.0)
+                urllib.request.urlopen(req, timeout=4.0)
             except Exception:
                 pass
+
+        payload_body = {
+            "text": text or "",
+            "source_node_id": self.node_id,
+        }
+        if image_base64:
+            payload_body["image_base64"] = image_base64
+            payload_body["image_mime"] = image_mime
 
         if self.role == "leader":
             # Propagate to all registered secondary nodes
@@ -428,7 +442,7 @@ class MeshManager:
                 endpoint = f"http://{node.ip}:{node.port}/api/mesh/clipboard-sync"
                 threading.Thread(
                     target=_send_to_url,
-                    args=(endpoint, {"text": text, "source_node_id": self.node_id}),
+                    args=(endpoint, payload_body),
                     daemon=True,
                 ).start()
 
@@ -437,7 +451,7 @@ class MeshManager:
             endpoint = f"http://{self.leader_info['ip']}:{self.leader_info['port']}/api/mesh/clipboard-sync"
             threading.Thread(
                 target=_send_to_url,
-                args=(endpoint, {"text": text, "source_node_id": self.node_id}),
+                args=(endpoint, payload_body),
                 daemon=True,
             ).start()
 

@@ -1888,7 +1888,7 @@ function renderReceivedFiles(files) {
   });
 }
 
-// --- Shared Clipboard ---
+// --- Shared Clipboard (Text + Rich Images / Screenshots NB-07) ---
 
 let clipboardDebounceTimer = null;
 let isUpdatingFromSSE = false;
@@ -1909,7 +1909,7 @@ function setupClipboardSync() {
 
     if (active) {
       // Sync current text immediately on turning on
-      if (clipboardTextarea.value.trim()) {
+      if (clipboardTextarea && clipboardTextarea.value.trim()) {
         sendClipboardData(clipboardTextarea.value, false);
       }
       showToast("✓ Live clipboard auto-sync enabled", "info");
@@ -1919,18 +1919,61 @@ function setupClipboardSync() {
   });
 
   // Continuous auto-sync on typing or pasting (no button click needed)
-  clipboardTextarea.addEventListener("input", () => {
-    if (!chkKeepSyncingClipboard.checked || isUpdatingFromSSE) return;
+  if (clipboardTextarea) {
+    clipboardTextarea.addEventListener("input", () => {
+      if (!chkKeepSyncingClipboard.checked || isUpdatingFromSSE) return;
 
-    if (syncLiveStatus) {
-      syncLiveStatus.className = "sync-live-status syncing";
-      syncLiveStatus.innerText = "● Syncing...";
+      if (syncLiveStatus) {
+        syncLiveStatus.className = "sync-live-status syncing";
+        syncLiveStatus.innerText = "● Syncing...";
+      }
+
+      clearTimeout(clipboardDebounceTimer);
+      clipboardDebounceTimer = setTimeout(() => {
+        sendClipboardData(clipboardTextarea.value, false);
+      }, 350);
+    });
+  }
+
+  // Rich Image / Screenshot Clipboard controls (NB-07)
+  const btnUploadClipboardImage = document.getElementById("btnUploadClipboardImage");
+  const clipboardImageInput = document.getElementById("clipboardImageInput");
+  const btnCopyClipboardImage = document.getElementById("btnCopyClipboardImage");
+  const btnClearClipboardImage = document.getElementById("btnClearClipboardImage");
+
+  if (btnUploadClipboardImage && clipboardImageInput) {
+    btnUploadClipboardImage.addEventListener("click", () => clipboardImageInput.click());
+    clipboardImageInput.addEventListener("change", () => {
+      if (clipboardImageInput.files && clipboardImageInput.files.length > 0) {
+        uploadClipboardImageBlob(clipboardImageInput.files[0]);
+        clipboardImageInput.value = "";
+      }
+    });
+  }
+
+  if (btnCopyClipboardImage) {
+    btnCopyClipboardImage.addEventListener("click", copySharedClipboardImageToDevice);
+  }
+
+  if (btnClearClipboardImage) {
+    btnClearClipboardImage.addEventListener("click", clearSharedClipboardImage);
+  }
+
+  // Global Ctrl+V / Cmd+V paste listener for screenshots and copied images
+  window.addEventListener("paste", (e) => {
+    if (!e.clipboardData || !e.clipboardData.items) return;
+    for (let i = 0; i < e.clipboardData.items.length; i++) {
+      const item = e.clipboardData.items[i];
+      if (item.type && item.type.startsWith("image/")) {
+        const blob = item.getAsFile();
+        if (blob) {
+          e.preventDefault();
+          activateTab("tab-clipboard", false);
+          uploadClipboardImageBlob(blob);
+          return;
+        }
+      }
     }
-
-    clearTimeout(clipboardDebounceTimer);
-    clipboardDebounceTimer = setTimeout(() => {
-      sendClipboardData(clipboardTextarea.value, false);
-    }, 350);
   });
 
   // Re-sync whenever user switches back to this browser tab
@@ -1939,6 +1982,92 @@ function setupClipboardSync() {
       fetchClipboard();
     }
   });
+}
+
+async function uploadClipboardImageBlob(blob) {
+  if (!blob) return;
+  try {
+    if (syncLiveStatus) {
+      syncLiveStatus.className = "sync-live-status syncing";
+      syncLiveStatus.innerText = "● Syncing image...";
+    }
+    const formData = new FormData();
+    formData.append("image", blob, blob.name || "clipboard.png");
+    const res = await fetch("/api/clipboard/image", {
+      method: "POST",
+      body: formData,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      renderClipboardImageState(data);
+      if (data.updated_at && clipboardUpdatedTime) {
+        clipboardUpdatedTime.innerText = `Last synced: ${data.updated_at}`;
+      }
+      if (syncLiveStatus && chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked) {
+        syncLiveStatus.className = "sync-live-status";
+        syncLiveStatus.innerText = "● Auto-Sync Active";
+      }
+      showToast("✓ Screenshot / image synced to PC & all devices!", "success");
+    } else {
+      showToast("Failed to sync clipboard image", "error");
+    }
+  } catch (err) {
+    showToast("Error syncing clipboard image", "error");
+  }
+}
+
+function renderClipboardImageState(data) {
+  const card = document.getElementById("clipboardImageCard");
+  const previewImg = document.getElementById("clipboardImagePreview");
+  const metaEl = document.getElementById("clipboardImageMeta");
+  const dlBtn = document.getElementById("btnDownloadClipboardImage");
+  if (!card || !previewImg) return;
+
+  if (data && data.has_image && data.image_url) {
+    card.classList.remove("hidden");
+    previewImg.src = data.image_url;
+    if (dlBtn) {
+      dlBtn.href = `${data.image_url}&download=1`;
+    }
+    if (metaEl) {
+      const fmtMime = (data.image_mime || "image/png").replace("image/", "").toUpperCase();
+      const fmtSize = data.image_formatted_size || formatBytes(data.image_size || 0);
+      metaEl.innerText = `🖼️ Shared Clipboard Image (${fmtMime} • ${fmtSize})`;
+    }
+  } else {
+    card.classList.add("hidden");
+    previewImg.removeAttribute("src");
+  }
+}
+
+async function copySharedClipboardImageToDevice() {
+  const previewImg = document.getElementById("clipboardImagePreview");
+  if (!previewImg || !previewImg.src) return;
+  try {
+    const res = await fetch(previewImg.src);
+    const blob = await res.blob();
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+      showToast("✓ Copied image to your device clipboard!", "success");
+    } else {
+      window.open(previewImg.src, "_blank");
+      showToast("Opened image — long-press or right-click to copy", "info");
+    }
+  } catch (e) {
+    window.open(previewImg.src, "_blank");
+    showToast("Opened image — long-press or right-click to copy", "info");
+  }
+}
+
+async function clearSharedClipboardImage() {
+  try {
+    const res = await fetch("/api/clipboard/image/clear", { method: "POST" });
+    if (res.ok) {
+      const data = await res.json();
+      renderClipboardImageState(data);
+      showToast("Cleared image from shared clipboard", "info");
+    }
+  } catch (e) {}
 }
 
 function updateClipboardSyncUI(active) {
@@ -1986,12 +2115,13 @@ async function fetchClipboard() {
     const res = await fetch("/api/clipboard");
     if (!res.ok) return;
     const data = await res.json();
-    if (data.text !== undefined && data.text !== clipboardTextarea.value) {
+    if (clipboardTextarea && data.text !== undefined && data.text !== clipboardTextarea.value) {
       isUpdatingFromSSE = true;
       clipboardTextarea.value = data.text;
       isUpdatingFromSSE = false;
     }
-    if (data.updated_at) {
+    renderClipboardImageState(data);
+    if (data.updated_at && clipboardUpdatedTime) {
       clipboardUpdatedTime.innerText = `Last synced: ${data.updated_at}`;
     }
   } catch (e) {
@@ -2059,15 +2189,18 @@ function setupSSE() {
           fetchNearbyDevices();
         }
       } else if (data.type === "clipboard_updated") {
-        if (data.text !== clipboardTextarea.value) {
+        if (clipboardTextarea && data.text !== undefined && data.text !== clipboardTextarea.value) {
           isUpdatingFromSSE = true;
           clipboardTextarea.value = data.text;
           isUpdatingFromSSE = false;
         }
-        clipboardUpdatedTime.innerText = `Synced just now (${data.updated_at})`;
+        renderClipboardImageState(data);
+        if (clipboardUpdatedTime && data.updated_at) {
+          clipboardUpdatedTime.innerText = `Synced just now (${data.updated_at})`;
+        }
 
         // Auto-copy to device clipboard if keep syncing is enabled and window has focus
-        if (chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked) {
+        if (chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked && data.text) {
           if (navigator.clipboard && document.hasFocus()) {
             navigator.clipboard.writeText(data.text).catch(() => {});
           }

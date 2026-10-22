@@ -386,6 +386,55 @@ class TestLandrop(unittest.TestCase):
         self.assertEqual(dl_res.data, b"Shared from Windows Explorer right-click!")
         dl_res.close()
 
+    # 14. REST API: Rich Clipboard Sync (Screenshots & Copied Images NB-07)
+    def test_rich_clipboard_image_sync(self):
+        fake_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR_FAKE_SCREENSHOT_BYTES"
+        up_res = self.client.post(
+            "/api/clipboard/image",
+            data={"image": (io.BytesIO(fake_png), "screenshot.png", "image/png")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(up_res.status_code, 200)
+        up_data = up_res.get_json()
+        self.assertTrue(up_data["success"])
+        self.assertTrue(up_data["has_image"])
+        self.assertEqual(up_data["image_size"], len(fake_png))
+
+        # Verify GET /api/clipboard reports the image metadata
+        clip_meta = self.client.get("/api/clipboard").get_json()
+        self.assertTrue(clip_meta["has_image"])
+        self.assertIsNotNone(clip_meta["image_url"])
+
+        # Verify GET /api/clipboard/image returns exact bytes
+        img_res = self.client.get("/api/clipboard/image")
+        self.assertEqual(img_res.status_code, 200)
+        self.assertEqual(img_res.data, fake_png)
+        img_res.close()
+
+        # Verify clear endpoint removes the image
+        clr_res = self.client.post("/api/clipboard/image/clear")
+        self.assertEqual(clr_res.status_code, 200)
+        self.assertFalse(clr_res.get_json()["has_image"])
+        self.assertEqual(self.client.get("/api/clipboard/image").status_code, 404)
+
+        # Verify mesh clipboard-sync propagates base64 images
+        import base64
+        peer_png = b"\x89PNG\r\n\x1a\n_PEER_HOST_SNIP"
+        mesh_res = self.client.post(
+            "/api/mesh/clipboard-sync",
+            json={
+                "text": "",
+                "image_base64": base64.b64encode(peer_png).decode("ascii"),
+                "image_mime": "image/png",
+                "source_node_id": "peer_laptop_1",
+            },
+        )
+        self.assertEqual(mesh_res.status_code, 200)
+        img_res2 = self.client.get("/api/clipboard/image")
+        self.assertEqual(img_res2.status_code, 200)
+        self.assertEqual(img_res2.data, peer_png)
+        img_res2.close()
+
 
 if __name__ == "__main__":
     unittest.main()
