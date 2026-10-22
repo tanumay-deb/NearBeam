@@ -35,6 +35,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "contextmenu"; Description: "Add ""Send with NearBeam"" to Windows Explorer right-click menu"; GroupDescription: "Windows Explorer Integration:"
 Name: "autostart"; Description: "Automatically launch NearBeam on Windows startup"; GroupDescription: "Startup Options:"
 
 [InstallDelete]
@@ -54,10 +55,17 @@ Source: "README.md"; DestDir: "{app}"; Flags: isreadme ignoreversion
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\icon.ico"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
+Name: "{userappdata}\Microsoft\Windows\SendTo\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--send"; IconFilename: "{app}\assets\icon.ico"; Tasks: contextmenu
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LANDrop"; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\*\shell\NearBeam"; ValueType: string; ValueName: ""; ValueData: "Send with NearBeam"; Tasks: contextmenu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\NearBeam"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\assets\icon.ico"""; Tasks: contextmenu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\NearBeam\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" --send ""%1"""; Tasks: contextmenu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam"; ValueType: string; ValueName: ""; ValueData: "Send with NearBeam"; Tasks: contextmenu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\assets\icon.ico"""; Tasks: contextmenu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" --send ""%1"""; Tasks: contextmenu; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

@@ -292,6 +292,100 @@ class TestLandrop(unittest.TestCase):
         self.assertEqual(clip_res.status_code, 200)
         self.assertEqual(clip_res.get_json()["text"], "Cross-device synced text via mesh")
 
+    # 11. REST API: Nearby Devices Dashboard & Client Heartbeat (NB-02)
+    def test_nearby_devices_and_heartbeat(self):
+        hb_res = self.client.post(
+            "/api/nearby/heartbeat",
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"},
+        )
+        self.assertEqual(hb_res.status_code, 200)
+        hb_data = hb_res.get_json()
+        self.assertTrue(hb_data["success"])
+        self.assertGreaterEqual(len(hb_data["devices"]), 1)
+
+        nearby_res = self.client.get("/api/nearby")
+        self.assertEqual(nearby_res.status_code, 200)
+        devices = nearby_res.get_json()["devices"]
+        self.assertTrue(any(d.get("kind") == "host" for d in devices))
+
+    # 12. REST API: Transfer History & Upload Cancel Cleanup (NB-03)
+    def test_transfer_history_and_cancel(self):
+        # Perform a chunked upload and verify it is recorded in persistent history
+        chunk_res = self.client.post(
+            "/api/upload/chunk",
+            data=b"chunked_payload_bytes",
+            headers={
+                "X-Session-Id": "sess-hist-1",
+                "X-Filename": "report.pdf",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "1",
+            },
+        )
+        self.assertEqual(chunk_res.status_code, 200)
+        self.assertTrue(chunk_res.get_json()["completed"])
+
+        hist_res = self.client.get("/api/history")
+        self.assertEqual(hist_res.status_code, 200)
+        history = hist_res.get_json()["history"]
+        self.assertTrue(any(h["filename"] == "report.pdf" for h in history))
+
+        # Start a multi-chunk upload then cancel it, verifying .tmp cleanup
+        self.client.post(
+            "/api/upload/chunk",
+            data=b"partial_bytes",
+            headers={
+                "X-Session-Id": "sess-cancel-99",
+                "X-Filename": "partial_video.mp4",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "3",
+            },
+        )
+        tmp_path = os.path.join(self.save_dir, ".sess-cancel-99.tmp")
+        self.assertTrue(os.path.exists(tmp_path))
+
+        cancel_res = self.client.post(
+            "/api/upload/cancel",
+            json={"session_id": "sess-cancel-99"},
+        )
+        self.assertEqual(cancel_res.status_code, 200)
+        self.assertTrue(cancel_res.get_json()["removed_tmp"])
+        self.assertFalse(os.path.exists(tmp_path))
+
+        # Clear history
+        clr_res = self.client.post("/api/history/clear")
+        self.assertEqual(clr_res.status_code, 200)
+        self.assertEqual(len(self.client.get("/api/history").get_json()["history"]), 0)
+
+    # 13. REST API: Windows Shell Send & Single-File Safe List (NB-04 & NB-05)
+    def test_shell_send_file_and_folder(self):
+        single_file = os.path.join(self.test_dir, "direct_share.txt")
+        with open(single_file, "w") as f:
+            f.write("Shared from Windows Explorer right-click!")
+
+        shell_res = self.client.post(
+            "/api/shell-send",
+            json={"paths": [single_file]},
+        )
+        self.assertEqual(shell_res.status_code, 200)
+        shell_data = shell_res.get_json()
+        self.assertTrue(shell_data["success"])
+        self.assertEqual(shell_data["added_count"], 1)
+
+        # Verify single file is browsable and downloadable via Safe List
+        sl_res = self.client.get("/api/safelist").get_json()
+        file_entry = next((x for x in sl_res["folders"] if x["name"] == "direct_share.txt"), None)
+        self.assertIsNotNone(file_entry)
+        self.assertTrue(file_entry["is_file"])
+
+        browse_res = self.client.get(f"/api/safelist/browse?folder_id={file_entry['id']}").get_json()
+        self.assertEqual(len(browse_res["items"]), 1)
+        self.assertEqual(browse_res["items"][0]["name"], "direct_share.txt")
+
+        dl_res = self.client.get(f"/api/safelist/download?folder_id={file_entry['id']}&subpath=direct_share.txt")
+        self.assertEqual(dl_res.status_code, 200)
+        self.assertEqual(dl_res.data, b"Shared from Windows Explorer right-click!")
+        dl_res.close()
+
 
 if __name__ == "__main__":
     unittest.main()

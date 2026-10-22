@@ -2122,105 +2122,372 @@ body.theme-light .zip-circle-wrap .progress-ring-track {
 }
 
 
-/* --- Transfer Manager --- */
-.transfer-manager {
-  background: var(--surface);
-  border: 1px solid var(--border);
+/* ==========================================================================
+   Global Drag-and-Drop Overlay (NB-04)
+   ========================================================================== */
+
+.global-drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(8, 12, 20, 0.82);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  pointer-events: none;
+  animation: modalFadeIn 0.16s ease-out;
+}
+
+.global-drop-overlay.hidden {
+  display: none;
+}
+
+.global-drop-box {
+  border: 2.5px dashed var(--accent-cyan);
+  background: radial-gradient(circle at 50% 30%, rgba(56, 189, 248, 0.16), rgba(15, 23, 42, 0.92));
+  border-radius: var(--radius-lg);
+  padding: 48px 56px;
+  text-align: center;
+  box-shadow: 0 0 50px rgba(56, 189, 248, 0.3);
+  max-width: 540px;
+  width: 100%;
+}
+
+.global-drop-icon {
+  font-size: 3.2rem;
+  margin-bottom: 12px;
+}
+
+.global-drop-box h2 {
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin-bottom: 6px;
+}
+
+.global-drop-box p {
+  font-size: 0.95rem;
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   Nearby Devices & Hero Dashboard (NB-01 & NB-02)
+   ========================================================================== */
+
+.nearby-dashboard-card {
+  background: var(--surface-1);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 24px 28px;
+  margin-bottom: 20px;
+  box-shadow: var(--glow-card);
+  position: relative;
+  overflow: hidden;
+}
+
+.nearby-dashboard-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent-cyan), var(--accent-indigo), transparent);
+}
+
+.nearby-hero-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.nearby-hero-text {
+  flex: 1 1 340px;
+}
+
+.hero-kicker {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  margin-bottom: 8px;
+}
+
+.hero-headline {
+  font-size: 1.35rem;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  color: var(--text-main);
+  line-height: 1.25;
+}
+
+.hero-subline {
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+.nearby-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.nearby-devices-section {
+  margin-top: 16px;
+}
+
+.nearby-devices-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.nearby-devices-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.86rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-main);
+}
+
+.nearby-devices-hint {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+.nearby-devices-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.nearby-device-card {
+  background: var(--surface-input);
+  border: 1.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  transition: var(--transition-fast);
+  position: relative;
+  user-select: none;
+}
+
+.nearby-device-card:hover {
+  border-color: var(--border-hover);
+  background: var(--surface-2);
+  transform: translateY(-2px);
+}
+
+.nearby-device-card.active {
+  border-color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.11);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.18);
+}
+
+.nearby-device-card.drag-over {
+  border-color: var(--accent-emerald);
+  background: rgba(16, 185, 129, 0.18);
+  transform: scale(1.02);
+  box-shadow: var(--glow-emerald);
+}
+
+.nearby-device-icon {
+  width: 40px;
+  height: 40px;
   border-radius: 12px;
-  padding: 1rem;
-  margin-bottom: 1.5rem;
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(99, 102, 241, 0.22));
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
+
+.nearby-device-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.nearby-device-name {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nearby-device-meta {
+  font-size: 0.75rem;
+  color: var(--accent-emerald);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==========================================================================
+   Production-Grade Transfer Manager & Persistent History (NB-03)
+   ========================================================================== */
+
+.transfer-manager {
+  background: var(--surface-input);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  padding: 18px;
+  margin-top: 22px;
 }
 
 .transfer-manager.hidden {
   display: none;
 }
 
+.failed-transfers-card {
+  border-color: rgba(244, 63, 94, 0.35);
+  background: rgba(244, 63, 94, 0.05);
+}
+
 .transfer-manager-header {
-  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.transfer-manager-header .subheading {
+  margin-bottom: 0;
 }
 
 .transfers-list {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 10px;
   max-height: 400px;
   overflow-y: auto;
 }
 
 .transfer-item {
-  background: var(--surface-hover);
-  border-radius: 8px;
-  padding: 0.75rem 1rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 8px;
 }
 
 .transfer-info {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
 }
 
 .transfer-name {
-  font-weight: 500;
-  font-size: 0.95rem;
+  font-weight: 700;
+  font-size: 0.92rem;
   color: var(--text-main);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 60%;
+  max-width: 58%;
 }
 
 .transfer-stats {
-  font-size: 0.8rem;
-  color: var(--text-dim);
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
   display: flex;
-  gap: 0.75rem;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .transfer-progress {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 12px;
 }
 
 .transfer-bar-bg {
   flex: 1;
-  height: 6px;
-  background: var(--border);
-  border-radius: 4px;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-full);
   overflow: hidden;
 }
 
 .transfer-bar-fill {
   height: 100%;
   width: 0%;
-  background: var(--accent-cyan);
-  transition: width 0.3s ease;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-indigo));
+  border-radius: var(--radius-full);
+  transition: width 0.2s ease;
 }
 
 .transfer-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: 6px;
 }
 
 .transfer-actions button {
-  background: var(--border);
-  border: none;
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
   color: var(--text-main);
-  font-size: 0.75rem;
-  padding: 0.25rem 0.5rem;
-  border-radius: 4px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  font-family: inherit;
+  padding: 4px 10px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
-  transition: background 0.2s;
+  transition: var(--transition-fast);
 }
 
 .transfer-actions button:hover {
   background: var(--accent-cyan);
-  color: #fff;
+  border-color: var(--accent-cyan);
+  color: #080c14;
 }
 
 .transfer-actions .btn-cancel:hover {
   background: var(--accent-rose);
+  border-color: var(--accent-rose);
+  color: #ffffff;
+}
+
+.empty-sent {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  padding: 14px;
+  text-align: center;
+  background: var(--surface-input);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
 }

@@ -114,16 +114,68 @@ const categoryIcons = {
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
   setupTabs();
+  setupHeroDashboardActions();
+  setupGlobalDragAndDrop();
   fetchServerInfo();
   fetchSafeFolders();
   fetchClipboard();
   fetchMeshNodes();
+  fetchNearbyDevices();
+  loadTransferHistory();
   setupClipboardSync();
   setupUploadEvents();
   setupSSE();
   setupModalEvents();
   setupFaqEvents();
 });
+
+// Helper to switch active tab programmatically
+function activateTab(targetId) {
+  const tabBtns = document.querySelectorAll(".tab-btn");
+  const tabPanes = document.querySelectorAll(".tab-pane");
+  tabBtns.forEach((b) => {
+    if (b.getAttribute("data-tab") === targetId) b.classList.add("active");
+    else b.classList.remove("active");
+  });
+  tabPanes.forEach((p) => {
+    if (p.id === targetId) p.classList.add("active");
+    else p.classList.remove("active");
+  });
+  if (targetId === "tab-received") fetchReceivedFiles();
+  else if (targetId === "tab-clipboard") fetchClipboard();
+}
+
+function setupHeroDashboardActions() {
+  const btnSend = document.getElementById("btnHeroSendFiles");
+  const btnSafe = document.getElementById("btnHeroSharedFolders");
+  const btnClip = document.getElementById("btnHeroClipboard");
+  const btnClearHist = document.getElementById("btnClearHistory");
+  const btnRetryAll = document.getElementById("btnRetryAllFailed");
+
+  if (btnSend) {
+    btnSend.addEventListener("click", () => {
+      activateTab("tab-upload");
+      const dz = document.getElementById("dropzone");
+      if (dz) dz.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }
+  if (btnSafe) {
+    btnSafe.addEventListener("click", () => {
+      activateTab("tab-safelist");
+    });
+  }
+  if (btnClip) {
+    btnClip.addEventListener("click", () => {
+      activateTab("tab-clipboard");
+    });
+  }
+  if (btnClearHist) {
+    btnClearHist.addEventListener("click", clearTransferHistory);
+  }
+  if (btnRetryAll) {
+    btnRetryAll.addEventListener("click", () => transferManager.retryAllFailed());
+  }
+}
 
 // --- Theme Toggle ---
 
@@ -150,23 +202,10 @@ function initTheme() {
 
 function setupTabs() {
   const tabBtns = document.querySelectorAll(".tab-btn");
-  const tabPanes = document.querySelectorAll(".tab-pane");
-
   tabBtns.forEach((btn) => {
     btn.addEventListener("click", () => {
       const targetId = btn.getAttribute("data-tab");
-      tabBtns.forEach((b) => b.classList.remove("active"));
-      tabPanes.forEach((p) => p.classList.remove("active"));
-
-      btn.classList.add("active");
-      const targetPane = document.getElementById(targetId);
-      if (targetPane) targetPane.classList.add("active");
-
-      if (targetId === "tab-received") {
-        fetchReceivedFiles();
-      } else if (targetId === "tab-clipboard") {
-        fetchClipboard();
-      }
+      activateTab(targetId);
     });
   });
 }
@@ -200,9 +239,18 @@ async function fetchServerInfo() {
     hostNameDisplay.innerText = hostLabel;
     qrUrlText.innerText = serverInfo.nearbeam_url || serverInfo.landrop_url || serverInfo.primary_url;
 
+    const heroLocalUrl = document.getElementById("heroLocalUrl");
+    if (heroLocalUrl && hostLabel) {
+      heroLocalUrl.innerText = hostLabel.replace(/^https?:\/\//, "");
+    }
+
     const faqDirectIp = document.getElementById("faqDirectIpDisplay");
     if (faqDirectIp && serverInfo.primary_url) {
       faqDirectIp.innerText = serverInfo.primary_url;
+    }
+
+    if (serverInfo.nearby_devices) {
+      renderNearbyDevicesDashboard(serverInfo.nearby_devices);
     }
   } catch (e) {
     hostNameDisplay.innerText = "Offline / Connection Error";
@@ -821,6 +869,74 @@ safeSearchInput.addEventListener("input", (e) => {
   renderSafeItems(filtered);
 });
 
+// --- Drag & Drop Tree Traversal Helper ---
+
+async function extractDroppedFilesAndDirs(dt) {
+  let files = [];
+  let dirs = [];
+  if (!dt) return { files, dirs };
+
+  if (dt.items && dt.items.length > 0) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const item = dt.items[i];
+      if (item.kind === "file") {
+        if (typeof item.webkitGetAsEntry === "function") {
+          const entry = item.webkitGetAsEntry();
+          if (entry) {
+            await traverseFileTree(entry, "", files, dirs);
+          } else {
+            const f = item.getAsFile();
+            if (f) {
+              files.push(f);
+              dirs.push("");
+            }
+          }
+        } else {
+          const f = item.getAsFile();
+          if (f) {
+            files.push(f);
+            dirs.push("");
+          }
+        }
+      }
+    }
+  } else if (dt.files && dt.files.length > 0) {
+    files = Array.from(dt.files);
+    dirs = new Array(files.length).fill("");
+  }
+  return { files, dirs };
+}
+
+function traverseFileTree(item, path, fileArr, dirArr) {
+  return new Promise((resolve) => {
+    if (item.isFile) {
+      item.file((file) => {
+        fileArr.push(file);
+        dirArr.push(path);
+        resolve();
+      }, () => resolve());
+    } else if (item.isDirectory) {
+      const dirReader = item.createReader();
+      const promises = [];
+      const readEntries = () => {
+        dirReader.readEntries((entries) => {
+          if (entries.length === 0) {
+            Promise.all(promises).then(resolve);
+          } else {
+            for (let i = 0; i < entries.length; i++) {
+              promises.push(traverseFileTree(entries[i], path + item.name + "/", fileArr, dirArr));
+            }
+            readEntries();
+          }
+        }, () => Promise.all(promises).then(resolve));
+      };
+      readEntries();
+    } else {
+      resolve();
+    }
+  });
+}
+
 // --- Send to PC (Auto-Save Upload) ---
 
 function setupUploadEvents() {
@@ -837,33 +953,47 @@ function setupUploadEvents() {
     });
   }
 
-  btnSelectFiles.addEventListener("click", () => fileInput.click());
-  if (btnSelectFolder) {
-    btnSelectFolder.addEventListener("click", () => folderInput.click());
+  if (btnSelectFiles && fileInput) {
+    btnSelectFiles.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      if (fileInput.files.length > 0) {
+        uploadFiles(Array.from(fileInput.files));
+        fileInput.value = "";
+      }
+    });
   }
 
-  fileInput.addEventListener("change", () => {
-    if (fileInput.files.length > 0) {
-      uploadFiles(Array.from(fileInput.files));
-      fileInput.value = "";
-    }
-  });
+  if (btnSelectFolder && folderInput) {
+    btnSelectFolder.addEventListener("click", () => folderInput.click());
+    folderInput.addEventListener("change", () => {
+      if (folderInput.files.length > 0) {
+        const files = Array.from(folderInput.files);
+        const dirs = files.map((f) => {
+          const rel = f.webkitRelativePath || "";
+          const slash = rel.lastIndexOf("/");
+          return slash > 0 ? rel.slice(0, slash) : "";
+        });
+        uploadFiles(files, dirs);
+        folderInput.value = "";
+      }
+    });
+  }
 
-  folderInput.addEventListener("change", () => {
-    if (folderInput.files.length > 0) {
-      const files = Array.from(folderInput.files);
-      // Preserve the picked folder's structure using each file's relative path.
-      const dirs = files.map((f) => {
-        const rel = f.webkitRelativePath || "";
-        const slash = rel.lastIndexOf("/");
-        return slash > 0 ? rel.slice(0, slash) : "";
-      });
-      uploadFiles(files, dirs);
-      folderInput.value = "";
-    }
-  });
+  if (btnRetryAllFailed) {
+    btnRetryAllFailed.addEventListener("click", () => {
+      transferManager.retryAllFailed();
+    });
+  }
 
-  // Drag & Drop
+  if (btnClearHistory) {
+    btnClearHistory.addEventListener("click", () => {
+      clearTransferHistory();
+    });
+  }
+
+  if (!dropzone) return;
+
+  // Dropzone-specific Drag & Drop
   ["dragenter", "dragover"].forEach((eventName) => {
     dropzone.addEventListener(eventName, (e) => {
       e.preventDefault();
@@ -880,75 +1010,200 @@ function setupUploadEvents() {
     });
   });
 
-  
-    dropzone.addEventListener("drop", async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      dropzone.classList.remove("drag-over");
-      const dt = e.dataTransfer;
-      if (dt && dt.items && dt.items.length > 0) {
-        let files = [];
-        let dirs = [];
-        for (let i = 0; i < dt.items.length; i++) {
-          const item = dt.items[i];
-          if (item.kind === 'file') {
-            if (typeof item.webkitGetAsEntry === 'function') {
-              const entry = item.webkitGetAsEntry();
-              if (entry) {
-                await traverseFileTree(entry, "", files, dirs);
-              }
-            } else {
-              files.push(item.getAsFile());
-              dirs.push("");
-            }
-          }
-        }
-        if (files.length > 0) {
-          uploadFiles(files, dirs);
-        }
-      } else if (dt && dt.files && dt.files.length > 0) {
-        uploadFiles(Array.from(dt.files), new Array(dt.files.length).fill(""));
-      }
-    });
+  dropzone.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove("drag-over");
+    if (globalDropOverlay) globalDropOverlay.classList.add("hidden");
+    const { files, dirs } = await extractDroppedFilesAndDirs(e.dataTransfer);
+    if (files.length > 0) {
+      uploadFiles(files, dirs);
+    }
+  });
+}
 
-  function traverseFileTree(item, path, fileArr, dirArr) {
-    return new Promise((resolve) => {
-      if (item.isFile) {
-        item.file((file) => {
-          fileArr.push(file);
-          dirArr.push(path);
-          resolve();
-        });
-      } else if (item.isDirectory) {
-        const dirReader = item.createReader();
-        const promises = [];
-        const readEntries = () => {
-          dirReader.readEntries((entries) => {
-            if (entries.length === 0) {
-              Promise.all(promises).then(resolve);
-            } else {
-              for (let i = 0; i < entries.length; i++) {
-                promises.push(traverseFileTree(entries[i], path + item.name + "/", fileArr, dirArr));
-              }
-              readEntries();
-            }
-          });
-        };
-        readEntries();
-      }
-    });
-  }
+// --- Global Drag-and-Drop Everywhere (NB-04) ---
 
+function setupGlobalDragAndDrop() {
+  let dragDepth = 0;
+
+  const hasFiles = (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types) return false;
+    return Array.from(e.dataTransfer.types).includes("Files");
+  };
+
+  window.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth++;
+    if (globalDropOverlay) {
+      globalDropOverlay.classList.remove("hidden");
+    }
+  });
+
+  window.addEventListener("dragover", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+  });
+
+  window.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0 && globalDropOverlay) {
+      globalDropOverlay.classList.add("hidden");
+    }
+  });
+
+  window.addEventListener("drop", async (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    if (globalDropOverlay) {
+      globalDropOverlay.classList.add("hidden");
+    }
+
+    const { files, dirs } = await extractDroppedFilesAndDirs(e.dataTransfer);
+    if (files.length > 0) {
+      activateTab("tab-upload", false);
+      uploadFiles(files, dirs);
+    }
+  });
 }
 
 function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " B";
+  if (!bytes || bytes < 0) return "0 B";
+  if (bytes < 1024) return Math.round(bytes) + " B";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
-// --- Multi-Host Mesh Node Management ---
+// --- Nearby Devices Dashboard (NB-02) & Multi-Host Mesh ---
+
+async function fetchNearbyDevices() {
+  try {
+    const res = await fetch("/api/nearby");
+    if (!res.ok) return;
+    const data = await res.json();
+    nearbyDevices = data.devices || [];
+    renderNearbyDevicesDashboard(nearbyDevices);
+  } catch (e) {
+    // Ignore transient network errors
+  }
+}
+
+function renderNearbyDevicesDashboard(devices) {
+  if (!nearbyDevicesList) return;
+
+  const list = Array.isArray(devices) ? devices : [];
+  if (nearbyDevicesCountBadge) {
+    nearbyDevicesCountBadge.innerText = `${list.length} Online`;
+  }
+
+  if (list.length === 0) {
+    nearbyDevicesList.innerHTML = `
+      <div class="nearby-device-card active-target">
+        <div class="nearby-device-icon">💻</div>
+        <div class="nearby-device-info">
+          <div class="nearby-device-name">${escapeHtml(serverInfo ? serverInfo.hostname : "This PC")} <span class="nearby-role-tag">Host PC</span></div>
+          <div class="nearby-device-meta">
+            <span class="nearby-online-dot"></span>
+            <span>Online • Ready for transfers</span>
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  nearbyDevicesList.innerHTML = "";
+
+  list.forEach((dev) => {
+    const card = document.createElement("div");
+    const isHost = dev.kind === "host";
+    const isSelected =
+      isHost &&
+      (selectedTargetNodeId === dev.id ||
+        (selectedTargetNodeId === "self" && dev.is_self));
+
+    card.className =
+      "nearby-device-card" +
+      (isSelected ? " active-target" : "") +
+      (!isHost ? " client-device" : "");
+
+    let icon = "💻";
+    if (dev.device_type === "phone") icon = "📱";
+    else if (dev.device_type === "tablet") icon = "📲";
+    else if (dev.device_type === "desktop") icon = "🖥️";
+
+    const roleLabel = isHost
+      ? dev.is_self
+        ? "Host PC"
+        : "LAN Host"
+      : "Browser";
+
+    card.innerHTML = `
+      <div class="nearby-device-icon">${icon}</div>
+      <div class="nearby-device-info">
+        <div class="nearby-device-name">
+          <span>${escapeHtml(dev.name || "Device")}</span>
+          <span class="nearby-role-tag">${roleLabel}</span>
+        </div>
+        <div class="nearby-device-meta">
+          <span class="nearby-online-dot"></span>
+          <span>${escapeHtml(dev.status || "Online")} • ${escapeHtml(dev.connection || "LAN")}</span>
+        </div>
+      </div>
+    `;
+
+    if (isHost) {
+      card.title = `Click to target ${dev.name} or drop files here to send`;
+      card.addEventListener("click", () => {
+        selectedTargetNodeId = dev.is_self ? "self" : dev.id;
+        renderNearbyDevicesDashboard(nearbyDevices);
+        renderMeshNodesUI(serverInfo ? serverInfo.mesh_role : "leader", meshNodes);
+        showToast(`Send destination set to: ${dev.name}`, "info");
+      });
+
+      // Direct Drag-and-Drop onto a specific Nearby Host Card
+      ["dragenter", "dragover"].forEach((ev) => {
+        card.addEventListener(ev, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          card.classList.add("drag-target");
+        });
+      });
+      ["dragleave", "drop"].forEach((ev) => {
+        card.addEventListener(ev, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          card.classList.remove("drag-target");
+        });
+      });
+      card.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        card.classList.remove("drag-target");
+        if (globalDropOverlay) globalDropOverlay.classList.add("hidden");
+        const { files, dirs } = await extractDroppedFilesAndDirs(e.dataTransfer);
+        if (files.length > 0) {
+          selectedTargetNodeId = dev.is_self ? "self" : dev.id;
+          renderNearbyDevicesDashboard(nearbyDevices);
+          activateTab("tab-upload", false);
+          const targetUrl = dev.is_self ? "/api/upload" : `${dev.url}/api/upload`;
+          uploadFiles(files, dirs, [{ url: targetUrl, name: dev.name }]);
+          showToast(`Sending ${files.length} file(s) to ${dev.name}`, "info");
+        }
+      });
+    } else {
+      card.title = `${dev.name} (${dev.ip || "LAN"}) — Connected via browser`;
+      card.addEventListener("click", () => {
+        activateTab("tab-upload", true);
+      });
+    }
+
+    nearbyDevicesList.appendChild(card);
+  });
+}
 
 async function fetchMeshNodes() {
   try {
@@ -957,6 +1212,7 @@ async function fetchMeshNodes() {
     const data = await res.json();
     meshNodes = data.nodes || [];
     renderMeshNodesUI(data.role, meshNodes);
+    fetchNearbyDevices();
   } catch (e) {
     console.error("Error fetching mesh nodes:", e);
   }
@@ -996,6 +1252,7 @@ function renderMeshNodesUI(role, nodes) {
           .querySelectorAll(".dest-pill")
           .forEach((p) => p.classList.remove("active"));
         btn.classList.add("active");
+        renderNearbyDevicesDashboard(nearbyDevices);
         showToast(`Send destination set to: ${node.name}`, "info");
       });
       destinationPills.appendChild(btn);
@@ -1013,6 +1270,7 @@ function renderMeshNodesUI(role, nodes) {
         .querySelectorAll(".dest-pill")
         .forEach((p) => p.classList.remove("active"));
       allBtn.classList.add("active");
+      renderNearbyDevicesDashboard(nearbyDevices);
       showToast("Send destination set to: ALL connected hosts", "info");
     });
     destinationPills.appendChild(allBtn);
@@ -1024,20 +1282,22 @@ function renderMeshNodesUI(role, nodes) {
 }
 
 
-// --- Transfer Manager ---
+// --- Production-Grade Transfer Manager (NB-03) ---
 class TransferManager {
   constructor() {
     this.queue = [];
     this.activeTransfers = new Map();
+    this.failedTransfers = new Map();
     this.container = document.getElementById("transferManagerCard");
     this.list = document.getElementById("activeTransfersList");
-    // Adaptive concurrency: small files (photos) ride a wide parallel lane,
+    this.failedCard = document.getElementById("failedTransfersCard");
+    this.failedList = document.getElementById("failedTransfersList");
+    // Adaptive concurrency: small files ride a wide parallel lane,
     // large files get a narrow lane so they don't clog the Wi-Fi pipe.
-    // There is no cap on how many files may be queued.
     this.smallFileThreshold = 8 * 1024 * 1024; // 8 MB
     this.maxSmallConcurrent = 8;
     this.maxLargeConcurrent = 2;
-    
+
     this.queueHeader = document.createElement("div");
     this.queueHeader.className = "queue-header";
     this.queueHeader.style.marginBottom = "10px";
@@ -1049,16 +1309,22 @@ class TransferManager {
     }
   }
 
-  addTransfer(sessionId, filename, file, uploadUrl, targetName, relativeDir) {
+  addTransfer(sessionId, filename, file, uploadUrl, targetName, relativeDir, startChunk = 0) {
     if (this.container && this.container.classList.contains("hidden")) {
       this.container.classList.remove("hidden");
     }
 
+    const chunkSize = 50 * 1024 * 1024;
     const transfer = {
-      sessionId, filename, file, uploadUrl, targetName, relativeDir,
-      chunkSize: 50 * 1024 * 1024,
-      totalChunks: Math.ceil(file.size / (50 * 1024 * 1024)) || 1,
-      currentChunk: 0,
+      sessionId,
+      filename,
+      file,
+      uploadUrl,
+      targetName,
+      relativeDir,
+      chunkSize,
+      totalChunks: Math.ceil(file.size / chunkSize) || 1,
+      currentChunk: startChunk,
       paused: false,
       cancelled: false,
       startTime: 0,
@@ -1066,7 +1332,8 @@ class TransferManager {
       card: null,
       lastUpdate: 0,
       lastSpeedUpdate: 0,
-      lastLoaded: 0
+      lastLoaded: startChunk * chunkSize,
+      emaBps: 0,
     };
     transfer.isSmall = file.size < this.smallFileThreshold;
     myUploadSessions.add(sessionId);
@@ -1098,8 +1365,6 @@ class TransferManager {
       const largeRoom = activeLarge < this.maxLargeConcurrent;
       if (!smallRoom && !largeRoom) break;
 
-      // Start the next queued file whose lane has room (small files may
-      // jump ahead of blocked large ones, and vice versa).
       let idx = -1;
       for (let i = 0; i < this.queue.length; i++) {
         if ((this.queue[i].isSmall && smallRoom) || (!this.queue[i].isSmall && largeRoom)) {
@@ -1117,22 +1382,27 @@ class TransferManager {
 
   startTransfer(t) {
     this.activeTransfers.set(t.sessionId, t);
-    
+    if (this.container) this.container.classList.remove("hidden");
+
     const card = document.createElement("div");
     card.className = "transfer-item";
     card.id = `transfer-${t.sessionId}`;
-    
+
+    const displayPath = t.relativeDir ? `${t.filename} (${t.relativeDir})` : t.filename;
+    const initialPct = t.file.size > 0 ? Math.round(((t.currentChunk * t.chunkSize) / t.file.size) * 100) : 0;
+
     card.innerHTML = `
       <div class="transfer-info">
-        <div class="transfer-name">${t.filename} ${t.relativeDir ? '('+t.relativeDir+')' : ''}</div>
+        <div class="transfer-name"></div>
         <div class="transfer-stats">
-          <span id="speed-${t.sessionId}">0 MB/s</span>
-          <span id="eta-${t.sessionId}">ETA: ...</span>
+          <span id="bytes-${t.sessionId}">${formatBytes(t.currentChunk * t.chunkSize)} / ${formatBytes(t.file.size)}</span>
+          <span id="speed-${t.sessionId}">Starting…</span>
+          <span id="eta-${t.sessionId}">ETA: --</span>
         </div>
       </div>
       <div class="transfer-progress">
         <div class="transfer-bar-bg">
-          <div class="transfer-bar-fill" id="bar-${t.sessionId}"></div>
+          <div class="transfer-bar-fill" id="bar-${t.sessionId}" style="width: ${initialPct}%"></div>
         </div>
         <div class="transfer-actions">
           <button id="pause-${t.sessionId}" class="btn-pause">Pause</button>
@@ -1140,19 +1410,22 @@ class TransferManager {
         </div>
       </div>
     `;
+    card.querySelector(".transfer-name").textContent = displayPath;
     this.list.appendChild(card);
-    
+
     t.card = card;
+    t.bytesEl = card.querySelector(`#bytes-${t.sessionId}`);
     t.speedEl = card.querySelector(`#speed-${t.sessionId}`);
     t.etaEl = card.querySelector(`#eta-${t.sessionId}`);
     t.barEl = card.querySelector(`#bar-${t.sessionId}`);
     t.pauseBtn = card.querySelector(`#pause-${t.sessionId}`);
     t.cancelBtn = card.querySelector(`#cancel-${t.sessionId}`);
-    
+
     t.pauseBtn.addEventListener("click", () => this.togglePause(t.sessionId));
     t.cancelBtn.addEventListener("click", () => this.cancelTransfer(t.sessionId));
-    
+
     t.startTime = Date.now();
+    t.lastSpeedUpdate = Date.now();
     this.uploadNextChunk(t.sessionId);
   }
 
@@ -1161,9 +1434,14 @@ class TransferManager {
     if (!t) return;
     t.paused = !t.paused;
     t.pauseBtn.innerText = t.paused ? "Resume" : "Pause";
-    if (t.paused && t.xhr) {
-      t.xhr.abort();
-    } else if (!t.paused) {
+    if (t.paused) {
+      if (t.speedEl) t.speedEl.innerText = "Paused";
+      if (t.etaEl) t.etaEl.innerText = "ETA: --";
+      if (t.xhr) t.xhr.abort();
+    } else {
+      t.lastSpeedUpdate = Date.now();
+      t.lastLoaded = t.currentChunk * t.chunkSize;
+      if (t.speedEl) t.speedEl.innerText = "Resuming…";
       this.uploadNextChunk(sessionId);
     }
   }
@@ -1171,16 +1449,112 @@ class TransferManager {
   cancelTransfer(sessionId) {
     myUploadSessions.delete(sessionId);
     const t = this.activeTransfers.get(sessionId);
+    let cancelBaseUrl = "";
     if (t) {
       t.cancelled = true;
+      cancelBaseUrl = t.uploadUrl.replace(/\/api\/upload$/, "");
       if (t.xhr) t.xhr.abort();
       if (t.card) t.card.remove();
       this.activeTransfers.delete(sessionId);
     } else {
-      this.queue = this.queue.filter(x => x.sessionId !== sessionId);
+      this.queue = this.queue.filter((x) => x.sessionId !== sessionId);
       this.updateQueueHeader();
     }
+
+    // Notify server to remove partial .tmp file
+    fetch(`${cancelBaseUrl}/api/upload/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    }).catch(() => {});
+
     this.checkIfDone();
+  }
+
+  markTransferFailed(t, reason) {
+    if (t.cancelled) return;
+    if (t.card) t.card.remove();
+    this.activeTransfers.delete(t.sessionId);
+    this.failedTransfers.set(t.sessionId, {
+      ...t,
+      reason: reason || "Network interrupted",
+    });
+    this.renderFailedTransfers();
+    this.checkIfDone();
+    showToast(`Transfer failed: ${t.filename} (Click Retry to resume)`, "error");
+  }
+
+  renderFailedTransfers() {
+    if (!this.failedCard || !this.failedList) return;
+    if (this.failedTransfers.size === 0) {
+      this.failedCard.classList.add("hidden");
+      this.failedList.innerHTML = "";
+      return;
+    }
+
+    this.failedCard.classList.remove("hidden");
+    this.failedList.innerHTML = "";
+
+    for (const [sessionId, item] of this.failedTransfers.entries()) {
+      const row = document.createElement("div");
+      row.className = "failed-item";
+      const pct = item.file.size > 0 ? Math.round(((item.currentChunk * item.chunkSize) / item.file.size) * 100) : 0;
+      row.innerHTML = `
+        <div class="failed-item-info">
+          <div class="failed-item-name"></div>
+          <div class="failed-item-meta">${formatBytes(item.file.size)} • Stopped at ${pct}% • ${escapeHtml(item.reason || "Failed")}</div>
+        </div>
+        <div class="failed-item-actions">
+          <button type="button" class="btn-retry-single">↻ Retry</button>
+          <button type="button" class="btn-dismiss-failed">✕</button>
+        </div>
+      `;
+      row.querySelector(".failed-item-name").textContent = item.filename;
+      row.querySelector(".btn-retry-single").addEventListener("click", () => {
+        this.retryFailedTransfer(sessionId);
+      });
+      row.querySelector(".btn-dismiss-failed").addEventListener("click", () => {
+        this.dismissFailedTransfer(sessionId);
+      });
+      this.failedList.appendChild(row);
+    }
+  }
+
+  retryFailedTransfer(sessionId) {
+    const item = this.failedTransfers.get(sessionId);
+    if (!item) return;
+    this.failedTransfers.delete(sessionId);
+    this.renderFailedTransfers();
+    // Resume from the last uncommitted chunk
+    this.addTransfer(
+      item.sessionId,
+      item.filename,
+      item.file,
+      item.uploadUrl,
+      item.targetName,
+      item.relativeDir,
+      item.currentChunk
+    );
+  }
+
+  retryAllFailed() {
+    const ids = Array.from(this.failedTransfers.keys());
+    ids.forEach((id) => this.retryFailedTransfer(id));
+  }
+
+  dismissFailedTransfer(sessionId) {
+    const item = this.failedTransfers.get(sessionId);
+    this.failedTransfers.delete(sessionId);
+    myUploadSessions.delete(sessionId);
+    if (item) {
+      const cancelBaseUrl = item.uploadUrl.replace(/\/api\/upload$/, "");
+      fetch(`${cancelBaseUrl}/api/upload/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      }).catch(() => {});
+    }
+    this.renderFailedTransfers();
   }
 
   checkIfDone() {
@@ -1210,30 +1584,36 @@ class TransferManager {
     if (t.relativeDir) {
       t.xhr.setRequestHeader("X-Relative-Dir", encodeURIComponent(t.relativeDir));
     }
-    
+
     if (!t.lastSpeedUpdate) t.lastSpeedUpdate = Date.now();
-    if (!t.lastLoaded) t.lastLoaded = start;
+    if (t.lastLoaded === undefined) t.lastLoaded = start;
 
     t.xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) {
+      if (e.lengthComputable && !t.paused && !t.cancelled) {
         const now = Date.now();
-        const totalLoaded = start + e.loaded;
-        
-        if (now - t.lastUpdate > 200) {
+        const totalLoaded = Math.min(t.file.size, start + e.loaded);
+
+        if (now - t.lastUpdate > 150 || totalLoaded === t.file.size) {
           t.lastUpdate = now;
-          const pct = Math.round((totalLoaded / t.file.size) * 100);
-          t.barEl.style.width = pct + "%";
-          
+          const pct = t.file.size > 0 ? Math.round((totalLoaded / t.file.size) * 100) : 100;
+          if (t.barEl) t.barEl.style.width = pct + "%";
+          if (t.bytesEl) t.bytesEl.innerText = `${formatBytes(totalLoaded)} / ${formatBytes(t.file.size)}`;
+
           const elapsedSec = (now - t.lastSpeedUpdate) / 1000;
-          if (elapsedSec >= 0.5) {
-            const bytesSinceLast = totalLoaded - t.lastLoaded;
-            const bps = bytesSinceLast / elapsedSec;
-            t.speedEl.innerText = `${formatBytes(bps)}/s`;
-            
-            const remaining = t.file.size - totalLoaded;
-            const etaSec = bps > 0 ? Math.round(remaining / bps) : 0;
-            t.etaEl.innerText = `ETA: ${etaSec}s`;
-            
+          if (elapsedSec >= 0.35) {
+            const bytesSinceLast = Math.max(0, totalLoaded - t.lastLoaded);
+            const instantBps = bytesSinceLast / elapsedSec;
+            t.emaBps = t.emaBps > 0 ? t.emaBps * 0.65 + instantBps * 0.35 : instantBps;
+            if (t.speedEl) t.speedEl.innerText = `${formatBytes(t.emaBps)}/s`;
+
+            const remaining = Math.max(0, t.file.size - totalLoaded);
+            const etaSec = t.emaBps > 0 ? Math.ceil(remaining / t.emaBps) : 0;
+            if (t.etaEl) {
+              t.etaEl.innerText = etaSec > 60
+                ? `ETA: ${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
+                : `ETA: ${etaSec}s`;
+            }
+
             t.lastSpeedUpdate = now;
             t.lastLoaded = totalLoaded;
           }
@@ -1242,18 +1622,20 @@ class TransferManager {
     });
 
     t.xhr.addEventListener("load", () => {
+      if (t.cancelled || t.paused) return;
       if (t.xhr.status >= 200 && t.xhr.status < 300) {
-        const resp = JSON.parse(t.xhr.responseText);
+        let resp = {};
+        try {
+          resp = JSON.parse(t.xhr.responseText);
+        } catch (err) {}
         if (resp.completed) {
           if (t.card) t.card.remove();
           this.activeTransfers.delete(sessionId);
           myUploadSessions.delete(sessionId);
-          // Keep the queue draining first; UI updates below must never
-          // be able to stall the next transfer if one of them throws.
           this.checkIfDone();
           try {
             showToast(`Uploaded ${t.filename}`, "success");
-            if (resp.file) addSentHistoryItem(resp.file);
+            if (resp.file) addSentHistoryItem(resp.file, true);
             if (typeof fetchReceivedFiles === "function") fetchReceivedFiles();
           } catch (e) {
             console.error("Post-upload UI update failed:", e);
@@ -1263,18 +1645,13 @@ class TransferManager {
           this.uploadNextChunk(sessionId);
         }
       } else {
-        if (t.speedEl) t.speedEl.innerText = "Error";
-        if (t.speedEl) t.speedEl.style.color = "red";
-        t.paused = true;
-        if (t.pauseBtn) t.pauseBtn.innerText = "Retry";
+        this.markTransferFailed(t, `Server status ${t.xhr.status}`);
       }
     });
 
     t.xhr.addEventListener("error", () => {
-      if (t.speedEl) t.speedEl.innerText = "Error";
-      if (t.speedEl) t.speedEl.style.color = "red";
-      t.paused = true;
-      if (t.pauseBtn) t.pauseBtn.innerText = "Retry";
+      if (t.cancelled || t.paused) return;
+      this.markTransferFailed(t, "Connection error");
     });
 
     t.xhr.send(chunk);
@@ -1283,28 +1660,30 @@ class TransferManager {
 const transferManager = new TransferManager();
 
 function uuidv4() {
-  return "10000000-1000-4000-8000-100000000000".replace(/[018]/g, c =>
-    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+  return "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) =>
+    (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)
   );
 }
 
 // --- Send Files (Auto-Save Upload) ---
 
-function uploadFiles(files, relativeDirs = []) {
+function uploadFiles(files, relativeDirs = [], explicitTargets = null) {
   if (!files || files.length === 0) return;
 
-  let targets = [];
-  if (selectedTargetNodeId === "all" && meshNodes.length > 0) {
-    targets = meshNodes.map((n) => ({ url: `${n.url}/api/upload`, name: n.name }));
-  } else if (selectedTargetNodeId !== "self" && meshNodes.length > 0) {
-    const targetNode = meshNodes.find((n) => n.id === selectedTargetNodeId);
-    if (targetNode) {
-      targets = [{ url: `${targetNode.url}/api/upload`, name: targetNode.name }];
+  let targets = explicitTargets;
+  if (!targets) {
+    if (selectedTargetNodeId === "all" && meshNodes.length > 0) {
+      targets = meshNodes.map((n) => ({ url: `${n.url}/api/upload`, name: n.name }));
+    } else if (selectedTargetNodeId !== "self" && meshNodes.length > 0) {
+      const targetNode = meshNodes.find((n) => n.id === selectedTargetNodeId);
+      if (targetNode) {
+        targets = [{ url: `${targetNode.url}/api/upload`, name: targetNode.name }];
+      } else {
+        targets = [{ url: "/api/upload", name: "host PC" }];
+      }
     } else {
       targets = [{ url: "/api/upload", name: "host PC" }];
     }
-  } else {
-    targets = [{ url: "/api/upload", name: "host PC" }];
   }
 
   targets.forEach((target) => {
@@ -1316,9 +1695,49 @@ function uploadFiles(files, relativeDirs = []) {
   });
 }
 
+// --- Persistent Completed Transfer History (NB-03) ---
 
-function addSentHistoryItem(fileInfo) {
+const LOCAL_HISTORY_KEY = "nearbeam_transfer_history_v1";
+
+async function loadTransferHistory() {
+  let items = [];
+  try {
+    const res = await fetch("/api/history");
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.history)) {
+        items = data.history;
+      }
+    }
+  } catch (e) {}
+
+  if (items.length === 0) {
+    try {
+      const cached = localStorage.getItem(LOCAL_HISTORY_KEY);
+      if (cached) items = JSON.parse(cached);
+    } catch (e) {}
+  } else {
+    saveLocalHistoryCache(items);
+  }
+
   if (!sentList) return;
+  if (items.length === 0) return;
+
+  sentList.innerHTML = "";
+  // Server returns newest-first; append in order
+  items.slice(0, 50).forEach((entry) => {
+    renderHistoryItemDOM(entry, false);
+  });
+}
+
+function saveLocalHistoryCache(items) {
+  try {
+    localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(items.slice(0, 50)));
+  } catch (e) {}
+}
+
+function renderHistoryItemDOM(fileInfo, prepend = true) {
+  if (!sentList || !fileInfo) return;
   const emptySent = sentList.querySelector(".empty-sent");
   if (emptySent) emptySent.remove();
 
@@ -1327,12 +1746,45 @@ function addSentHistoryItem(fileInfo) {
   item.innerHTML = `
     <div class="sent-item-left">
       <span class="sent-check">✓</span>
-      <strong>${fileInfo.filename}</strong>
-      <span class="file-meta">(${fileInfo.formatted_size})</span>
+      <strong class="sent-filename"></strong>
+      <span class="file-meta">(${escapeHtml(fileInfo.formatted_size || formatBytes(fileInfo.size || 0))})</span>
     </div>
-    <span class="file-meta">${fileInfo.timestamp}</span>
+    <span class="file-meta">${escapeHtml(fileInfo.timestamp || "Just now")}</span>
   `;
-  sentList.prepend(item);
+  item.querySelector(".sent-filename").textContent = fileInfo.filename || "File";
+  if (prepend) {
+    sentList.prepend(item);
+  } else {
+    sentList.appendChild(item);
+  }
+}
+
+function addSentHistoryItem(fileInfo, persistToLocal = true) {
+  renderHistoryItemDOM(fileInfo, true);
+  if (persistToLocal) {
+    try {
+      const existing = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || "[]");
+      existing.unshift({
+        filename: fileInfo.filename,
+        formatted_size: fileInfo.formatted_size,
+        timestamp: fileInfo.timestamp || new Date().toLocaleTimeString(),
+      });
+      saveLocalHistoryCache(existing);
+    } catch (e) {}
+  }
+}
+
+async function clearTransferHistory() {
+  try {
+    await fetch("/api/history/clear", { method: "POST" });
+  } catch (e) {}
+  try {
+    localStorage.removeItem(LOCAL_HISTORY_KEY);
+  } catch (e) {}
+  if (sentList) {
+    sentList.innerHTML = `<p class="empty-sent">No transfers recorded yet.</p>`;
+  }
+  showToast("Transfer history cleared", "info");
 }
 
 // --- Received Files Tab ---
@@ -1576,12 +2028,27 @@ function setupSSE() {
       const data = JSON.parse(e.data);
       if (data.type === "file_received") {
         removeIncomingProgress(data.session_id);
+        if (!myUploadSessions.has(data.session_id) && data.file) {
+          addSentHistoryItem(data.file, true);
+        }
         showToast(`Incoming file auto-saved: ${data.file.filename}`, "info");
         fetchReceivedFiles();
       } else if (data.type === "upload_progress") {
         // Live progress for a transfer arriving from another device.
         if (!myUploadSessions.has(data.session_id)) {
           renderIncomingProgress(data);
+        }
+      } else if (data.type === "upload_cancelled") {
+        removeIncomingProgress(data.session_id);
+      } else if (data.type === "safelist_updated") {
+        fetchSafelist();
+        showToast(data.message || "Shared items updated on PC", "info");
+      } else if (data.type === "nearby_devices_changed") {
+        if (Array.isArray(data.devices)) {
+          nearbyDevices = data.devices;
+          renderNearbyDevicesDashboard(nearbyDevices);
+        } else {
+          fetchNearbyDevices();
         }
       } else if (data.type === "clipboard_updated") {
         if (data.text !== clipboardTextarea.value) {
@@ -1604,6 +2071,7 @@ function setupSSE() {
         } else {
           fetchMeshNodes();
         }
+        fetchNearbyDevices();
       } else if (data.type === "mesh_role_changed") {
         fetchMeshNodes();
       }

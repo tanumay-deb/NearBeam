@@ -8,11 +8,11 @@ A prioritized roadmap of strategic enhancements, UX refinements, and native OS i
 
 | ID | Feature / Enhancement | Story Points | Effort | Impact | Priority | Status |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|
-| **NB-01** | **Hero Positioning: "Zero QR, Zero Accounts, Zero Cables"** | 1 | Low | High | P1 | Ready |
-| **NB-02** | **"Nearby Devices" First-Class Dashboard** | 8 | Med-High | Very High | P1 | Ready |
-| **NB-03** | **Production-Grade Transfer Manager (Retry & History)** | 5 | Medium | High | P1 | In Progress |
-| **NB-04** | **Global Drag-and-Drop Everywhere** | 3 | Low-Med | High | P2 | Ready |
-| **NB-05** | **Windows Shell & Share Menu Integration** | 5 | Medium | High | P2 | Ready |
+| **NB-01** | **Hero Positioning: "Zero QR, Zero Accounts, Zero Cables"** | 1 | Low | High | P1 | ✅ Completed |
+| **NB-02** | **"Nearby Devices" First-Class Dashboard** | 8 | Med-High | Very High | P1 | ✅ Completed |
+| **NB-03** | **Production-Grade Transfer Manager (Retry & History)** | 5 | Medium | High | P1 | ✅ Completed |
+| **NB-04** | **Global Drag-and-Drop Everywhere** | 3 | Low-Med | High | P2 | ✅ Completed |
+| **NB-05** | **Windows Shell & Share Menu Integration** | 5 | Medium | High | P2 | ✅ Completed |
 
 ---
 

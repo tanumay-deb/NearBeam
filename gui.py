@@ -15,7 +15,7 @@ from pathlib import Path
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
-from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -64,6 +64,7 @@ from core.network import (
     get_local_ip,
 )
 from core.server import NearBeamServer, LandropServer
+from core.shell_integration import is_shell_integration_enabled, set_shell_integration
 from core.version import APP_VERSION, RELEASES_URL, check_for_updates
 
 
@@ -251,11 +252,13 @@ class QRDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, send_paths: list[str] = None):
         super().__init__()
-        self.setWindowTitle("NearBeam - Local Wi-Fi File Sharing & Explorer")
-        self.resize(860, 740)
+        self.initial_send_paths = send_paths or []
+        self.setWindowTitle("NearBeam — Transfer files without QR codes, accounts, or cables")
+        self.resize(880, 760)
         self.setMinimumSize(780, 620)
+        self.setAcceptDrops(True)
 
         # Apply clean, properly-scaled dark theme
         qss = """
@@ -429,6 +432,14 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self.start_server()
 
+        # Periodic refresh for connected browser/mobile clients in Nearby Devices
+        self.nearby_timer = QTimer(self)
+        self.nearby_timer.timeout.connect(self._refresh_nearby_devices_ui)
+        self.nearby_timer.start(4000)
+
+        if self.initial_send_paths:
+            QTimer.singleShot(400, lambda: self._handle_shared_paths(self.initial_send_paths, source="Explorer"))
+
     def _build_ui(self):
         # Scroll area container to guarantee responsive scaling on any display DPI
         scroll_area = QScrollArea(self)
@@ -453,7 +464,7 @@ class MainWindow(QMainWindow):
 
         if self.icon_path.exists():
             icon_lbl = QLabel()
-            icon_pix = QPixmap(str(self.icon_path)).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            icon_pix = QPixmap(str(self.icon_path)).scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             icon_lbl.setPixmap(icon_pix)
             header_layout.addWidget(icon_lbl)
 
@@ -464,8 +475,8 @@ class MainWindow(QMainWindow):
         app_title.setStyleSheet("font-size: 20px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px;")
         title_col.addWidget(app_title)
 
-        app_desc = QLabel("High-Speed Local Wi-Fi File Sharing & Safe List Explorer")
-        app_desc.setStyleSheet("font-size: 11px; color: #94a3b8; font-weight: 500;")
+        app_desc = QLabel("Transfer files without QR codes, accounts, or cables • Open your PC at nearbeam.local:5000")
+        app_desc.setStyleSheet("font-size: 11px; color: #38bdf8; font-weight: 600;")
         title_col.addWidget(app_desc)
         header_layout.addLayout(title_col)
 
@@ -520,7 +531,72 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(header_layout)
 
         # ==========================================
-        # 1. Connection Card (Hero)
+        # 1. Nearby Devices & Quick Actions Dashboard (NB-02 Hero)
+        # ==========================================
+        mesh_card = QFrame()
+        mesh_card.setProperty("class", "card")
+        mesh_layout = QVBoxLayout(mesh_card)
+        mesh_layout.setContentsMargins(18, 15, 18, 15)
+        mesh_layout.setSpacing(10)
+
+        mesh_header_row = QHBoxLayout()
+        mesh_title = QLabel("🌐 Nearby Devices")
+        mesh_title.setProperty("class", "card-title")
+        mesh_header_row.addWidget(mesh_title)
+
+        self.mesh_role_badge = QLabel("🟢 Primary Leader")
+        self.mesh_role_badge.setStyleSheet("""
+            background-color: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            color: #34d399;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 700;
+        """)
+        mesh_header_row.addWidget(self.mesh_role_badge)
+        mesh_header_row.addStretch()
+
+        drop_hint_badge = QLabel("✨ Drag & drop files anywhere on this window")
+        drop_hint_badge.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        mesh_header_row.addWidget(drop_hint_badge)
+        mesh_layout.addLayout(mesh_header_row)
+
+        self.mesh_nodes_summary = QLabel("Scanning Wi-Fi for nearby computers and connected phones...")
+        self.mesh_nodes_summary.setWordWrap(True)
+        self.mesh_nodes_summary.setStyleSheet("""
+            background-color: #131d31;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: #e2e8f0;
+            font-size: 12px;
+        """)
+        mesh_layout.addWidget(self.mesh_nodes_summary)
+
+        quick_actions_row = QHBoxLayout()
+        quick_actions_row.setSpacing(8)
+
+        self.btn_send_to_node = QPushButton("📤 Send Files to Device...")
+        self.btn_send_to_node.setObjectName("primaryBtn")
+        self.btn_send_to_node.clicked.connect(self._send_file_to_node_dialog)
+        quick_actions_row.addWidget(self.btn_send_to_node)
+
+        btn_quick_share = QPushButton("📁 Share Folder")
+        btn_quick_share.clicked.connect(self._add_safe_folder)
+        quick_actions_row.addWidget(btn_quick_share)
+
+        btn_quick_received = QPushButton("📥 Open Received Folder")
+        btn_quick_received.clicked.connect(self._open_save_folder)
+        quick_actions_row.addWidget(btn_quick_received)
+
+        quick_actions_row.addStretch()
+        mesh_layout.addLayout(quick_actions_row)
+
+        root_layout.addWidget(mesh_card)
+
+        # ==========================================
+        # 1.5 Connection Address Card (No QR / No IP Hero)
         # ==========================================
         conn_card = QFrame()
         conn_card.setProperty("class", "card")
@@ -529,17 +605,17 @@ class MainWindow(QMainWindow):
         conn_layout.setSpacing(10)
 
         card_title_row = QHBoxLayout()
-        card_title = QLabel("📡 Connection Address")
+        card_title = QLabel("📡 Open Your PC From Your Phone")
         card_title.setProperty("class", "card-title")
         card_title_row.addWidget(card_title)
 
-        perm_badge = QLabel("Permanent mDNS + Direct IP")
+        perm_badge = QLabel("No QR Codes • No Accounts • No Cables")
         perm_badge.setStyleSheet("background-color: rgba(56, 189, 248, 0.15); color: #38bdf8; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 8px;")
         card_title_row.addWidget(perm_badge)
         card_title_row.addStretch()
         conn_layout.addLayout(card_title_row)
 
-        card_subtitle = QLabel("Open the link or scan the QR code on your phone/tablet to transfer files immediately:")
+        card_subtitle = QLabel("Type this permanent address once on your phone or laptop browser — bookmark it forever:")
         card_subtitle.setProperty("class", "card-subtitle")
         conn_layout.addWidget(card_subtitle)
 
@@ -611,52 +687,7 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(conn_card)
 
         # ==========================================
-        # 1.5 LAN Mesh & Connected Hosts Card
-        # ==========================================
-        mesh_card = QFrame()
-        mesh_card.setProperty("class", "card")
-        mesh_layout = QVBoxLayout(mesh_card)
-        mesh_layout.setContentsMargins(18, 14, 18, 14)
-        mesh_layout.setSpacing(8)
-
-        mesh_header_row = QHBoxLayout()
-        mesh_title = QLabel("🌐 LAN Mesh & Connected Hosts")
-        mesh_title.setProperty("class", "card-title")
-        mesh_header_row.addWidget(mesh_title)
-
-        self.mesh_role_badge = QLabel("🟢 Primary Leader")
-        self.mesh_role_badge.setStyleSheet("""
-            background-color: rgba(16, 185, 129, 0.12);
-            border: 1px solid rgba(16, 185, 129, 0.35);
-            color: #34d399;
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        mesh_header_row.addWidget(self.mesh_role_badge)
-        mesh_header_row.addStretch()
-
-        self.btn_send_to_node = QPushButton("📤 Send to Peer Host...")
-        self.btn_send_to_node.setStyleSheet("""
-            background-color: rgba(56, 189, 248, 0.12);
-            border: 1px solid rgba(56, 189, 248, 0.35);
-            color: #38bdf8;
-            font-weight: 700;
-            padding: 5px 12px;
-        """)
-        self.btn_send_to_node.clicked.connect(self._send_file_to_node_dialog)
-        mesh_header_row.addWidget(self.btn_send_to_node)
-        mesh_layout.addLayout(mesh_header_row)
-
-        self.mesh_nodes_summary = QLabel("Searching for other NearBeam computers on Wi-Fi...")
-        self.mesh_nodes_summary.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        mesh_layout.addWidget(self.mesh_nodes_summary)
-
-        root_layout.addWidget(mesh_card)
-
-        # ==========================================
-        # 2. Auto-Save Settings Card
+        # 2. Auto-Save & Windows Shell Settings Card
         # ==========================================
         autosave_card = QFrame()
         autosave_card.setProperty("class", "card")
@@ -664,22 +695,27 @@ class MainWindow(QMainWindow):
         autosave_layout.setContentsMargins(18, 16, 18, 16)
         autosave_layout.setSpacing(10)
 
-        autosave_title = QLabel("📥 Auto-Save & App Settings")
+        autosave_title = QLabel("📥 Auto-Save & Windows Integration")
         autosave_title.setProperty("class", "card-title")
         autosave_layout.addWidget(autosave_title)
 
         options_row = QHBoxLayout()
-        options_row.setSpacing(24)
+        options_row.setSpacing(20)
 
-        self.chk_autosave = QCheckBox("Auto-Save incoming files without prompts")
+        self.chk_autosave = QCheckBox("Auto-Save incoming files")
         self.chk_autosave.setChecked(config.auto_save_enabled)
         self.chk_autosave.toggled.connect(self._toggle_autosave)
         options_row.addWidget(self.chk_autosave)
 
-        self.chk_clipboard_sync = QCheckBox("Keep syncing clipboard automatically")
+        self.chk_clipboard_sync = QCheckBox("Live clipboard sync")
         self.chk_clipboard_sync.setChecked(config.clipboard_sync_enabled)
         self.chk_clipboard_sync.toggled.connect(self._toggle_clipboard_sync)
         options_row.addWidget(self.chk_clipboard_sync)
+
+        self.chk_shell_menu = QCheckBox("Explorer right-click ('Send with NearBeam')")
+        self.chk_shell_menu.setChecked(is_shell_integration_enabled())
+        self.chk_shell_menu.toggled.connect(self._toggle_shell_integration)
+        options_row.addWidget(self.chk_shell_menu)
 
         self.chk_autostart = QCheckBox("Start with Windows")
         self.chk_autostart.setChecked(is_autostart_enabled())
@@ -1060,57 +1096,124 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
             """)
 
-        peers = [n for n in self.current_mesh_nodes if not n.get("is_self")]
-        if peers:
+        self._refresh_nearby_devices_ui()
+
+    def _refresh_nearby_devices_ui(self):
+        """Updates the Nearby Devices dashboard with active LAN hosts and connected browser clients."""
+        peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
+        devices = []
+        if hasattr(self, "server_instance") and self.server_instance:
+            try:
+                devices = self.server_instance.get_nearby_devices()
+            except Exception:
+                devices = []
+
+        if devices:
+            parts = []
+            for dev in devices:
+                dtype = dev.get("device_type", "laptop")
+                icon = "📱" if dtype == "phone" else ("📲" if dtype == "tablet" else ("🖥️" if dtype == "desktop" else "💻"))
+                name = dev.get("name", "Device")
+                status = dev.get("status", "Online")
+                conn = dev.get("connection", "LAN")
+                parts.append(f"{icon} {name} ({status} • {conn})")
+            self.mesh_nodes_summary.setText("   •   ".join(parts))
+        elif peers:
             peer_descs = [f"💻 {p.get('name', 'Peer')} ({p.get('ip')})" for p in peers]
             self.mesh_nodes_summary.setText(f"Active Cluster ({len(self.current_mesh_nodes)} Hosts Online):  " + "  •  ".join(peer_descs))
-            self.btn_send_to_node.setEnabled(True)
-            self.btn_send_to_node.setText(f"📤 Send to Peer ({len(peers)} Online)...")
         else:
-            self.mesh_nodes_summary.setText("No other NearBeam computers detected on Wi-Fi yet. (Waiting for peer beacons)")
-            self.btn_send_to_node.setEnabled(False)
-            self.btn_send_to_node.setText("📤 Send to Peer Host (None Online)")
+            self.mesh_nodes_summary.setText(
+                f"💻 {get_hostname()} (Online • Wi-Fi / LAN)  •  Open nearbeam.local:{self.port} on your phone or drop files here"
+            )
+
+        if peers:
+            self.btn_send_to_node.setText(f"📤 Send Files to Peer ({len(peers)} Online)...")
+        else:
+            self.btn_send_to_node.setText("📤 Stage / Share Files...")
+        self.btn_send_to_node.setEnabled(True)
 
     def _send_file_to_node_dialog(self):
-        """Allows 1-click native file sending from desktop to another running NearBeam computer."""
-        peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
-        if not peers:
-            QMessageBox.information(
-                self,
-                "No Peer Hosts Online",
-                "No secondary NearBeam laptops or PCs are currently detected on your Wi-Fi.\n\n"
-                "Launch NearBeam on another computer and it will appear here automatically!",
-            )
-            return
-
-        target_node = peers[0]
-        if len(peers) > 1:
-            menu = QMenu(self)
-            selected_box = [None]
-            for p in peers:
-                action = menu.addAction(f"💻 {p['name']} ({p['ip']})")
-                action.triggered.connect(lambda checked=False, node=p: selected_box.__setitem__(0, node))
-            menu.exec(self.btn_send_to_node.mapToGlobal(self.btn_send_to_node.rect().bottomLeft()))
-            if not selected_box[0]:
-                return
-            target_node = selected_box[0]
-
+        """Allows 1-click file sending to a peer computer or staging for connected mobile devices."""
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            f"Select File(s) to Send to {target_node['name']}",
+            "Select File(s) to Send or Share via NearBeam",
             "",
             "All Files (*.*)",
         )
         if not file_paths:
             return
+        self._handle_shared_paths(file_paths, source="Send button")
 
-        target_url = f"{target_node['url']}/api/upload"
-        t = threading.Thread(
-            target=self._send_files_async,
-            args=(target_url, target_node['name'], file_paths),
-            daemon=True,
+    def _handle_shared_paths(self, paths: list[str], source: str = "Drag & Drop"):
+        """Stages dropped/shared files & folders in Safe List and optionally beams to online peer computers."""
+        valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
+        if not valid_paths:
+            return
+
+        added_items = []
+        file_only_paths = []
+        for p in valid_paths:
+            try:
+                entry = config.add_safe_folder(p)
+                added_items.append(entry["name"])
+            except Exception:
+                pass
+            if os.path.isfile(p):
+                file_only_paths.append(p)
+
+        self._refresh_safe_table()
+        if hasattr(self, "server_instance") and self.server_instance:
+            self.server_instance.broadcast_event({
+                "type": "safelist_updated",
+                "items": added_items,
+                "message": f"Shared via {source}: {', '.join(added_items)}",
+            })
+
+        self._append_log(
+            f"✓ Shared {len(valid_paths)} item(s) via {source}: {', '.join(added_items)}",
+            "upload",
         )
-        t.start()
+
+        # If a peer NearBeam computer is online and files were selected, offer/send directly
+        peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
+        if peers and file_only_paths:
+            target_node = peers[0]
+            if len(peers) > 1:
+                menu = QMenu(self)
+                selected_box = [None]
+                for p in peers:
+                    action = menu.addAction(f"💻 Send to {p['name']} ({p['ip']})")
+                    action.triggered.connect(lambda checked=False, node=p: selected_box.__setitem__(0, node))
+                menu.exec(self.mapToGlobal(self.rect().center()))
+                if selected_box[0]:
+                    target_node = selected_box[0]
+            target_url = f"{target_node['url']}/api/upload"
+            t = threading.Thread(
+                target=self._send_files_async,
+                args=(target_url, target_node["name"], file_only_paths),
+                daemon=True,
+            )
+            t.start()
+
+    def dragEnterEvent(self, event):
+        """Accept files and folders dragged anywhere onto the NearBeam desktop window (NB-04)."""
+        if event.mimeData() and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """Handle files and folders dropped anywhere onto the NearBeam desktop window (NB-04)."""
+        if not event.mimeData() or not event.mimeData().hasUrls():
+            return
+        dropped_paths = []
+        for url in event.mimeData().urls():
+            local_path = url.toLocalFile()
+            if local_path and os.path.exists(local_path):
+                dropped_paths.append(local_path)
+        if dropped_paths:
+            event.acceptProposedAction()
+            self._handle_shared_paths(dropped_paths, source="Window Drag & Drop")
 
     def _send_files_async(self, upload_url: str, target_name: str, file_paths: list[str]):
         """Pushes files directly to peer computer using pure Python standard library multipart HTTP."""
@@ -1202,6 +1305,19 @@ class MainWindow(QMainWindow):
             self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_received: {e}")
 
+    def _toggle_shell_integration(self, checked: bool):
+        success = set_shell_integration(checked)
+        config.data["shell_integration_enabled"] = bool(checked)
+        config.save()
+        if success:
+            state_str = "ENABLED" if checked else "DISABLED"
+            self._append_log(f"Windows Explorer 'Send with NearBeam' context menu: {state_str}", "info")
+        else:
+            self.chk_shell_menu.blockSignals(True)
+            self.chk_shell_menu.setChecked(not checked)
+            self.chk_shell_menu.blockSignals(False)
+            QMessageBox.warning(self, "Explorer Menu Error", "Could not update Windows Explorer context menu registry.")
+
     def _toggle_autostart(self, checked: bool):
         success = set_autostart(checked)
         if success:
@@ -1229,8 +1345,10 @@ class MainWindow(QMainWindow):
         folders = config.get_safe_folders()
         self.safe_table.setRowCount(len(folders))
         for row, folder in enumerate(folders):
-            name_item = QTableWidgetItem(f"📁  {folder.get('name', 'Unnamed')}")
-            path_item = QTableWidgetItem(folder.get("path", ""))
+            p = folder.get("path", "")
+            prefix = "📄" if (p and os.path.isfile(p)) else "📁"
+            name_item = QTableWidgetItem(f"{prefix}  {folder.get('name', 'Unnamed')}")
+            path_item = QTableWidgetItem(p)
             name_item.setFlags(name_item.flags() ^ Qt.ItemIsEditable)
             path_item.setFlags(path_item.flags() ^ Qt.ItemIsEditable)
             self.safe_table.setItem(row, 0, name_item)
@@ -1300,10 +1418,10 @@ class MainWindow(QMainWindow):
             event.ignore()
 
 
-def run_gui(start_minimized: bool = False):
+def run_gui(start_minimized: bool = False, send_paths: list[str] = None):
     app = QApplication(sys.argv)
     app.setApplicationName("NearBeam")
-    window = MainWindow()
+    window = MainWindow(send_paths=send_paths)
     if not start_minimized:
         window.show()
         window.raise_()

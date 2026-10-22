@@ -102,6 +102,7 @@ class NearBeamServer:
         self.clipboard_content = ""
         self.clipboard_updated_at = None
         self.received_files_history = []
+        self.connected_clients: Dict[str, Dict[str, Any]] = {}
         self.event_subscribers: list[queue.Queue] = []
         self.activity_callbacks = []
         self.clipboard_callbacks = []
@@ -130,6 +131,111 @@ class NearBeamServer:
         self.zip_jobs_lock = threading.Lock()
 
         self._register_routes()
+
+    def _parse_client_info(self, ip: str, ua: str, custom_name: str = "") -> Dict[str, Any]:
+        """Classifies a connected browser client by User-Agent and IP."""
+        ua_lower = (ua or "").lower()
+        if custom_name:
+            name = custom_name
+            icon = "📱" if any(k in custom_name.lower() for k in ("iphone", "ipad", "android", "phone")) else "💻"
+        elif "iphone" in ua_lower:
+            name, icon = "iPhone", "📱"
+        elif "ipad" in ua_lower:
+            name, icon = "iPad", "📱"
+        elif "android" in ua_lower:
+            name, icon = "Android Phone", "📱"
+        elif "macintosh" in ua_lower or "mac os" in ua_lower:
+            name, icon = "Mac Browser", "💻"
+        elif "windows" in ua_lower:
+            name, icon = "Windows Browser", "💻"
+        elif "linux" in ua_lower:
+            name, icon = "Linux Browser", "💻"
+        else:
+            name, icon = f"Browser ({ip})", "📱"
+
+        return {
+            "id": f"client_{ip}",
+            "name": name,
+            "ip": ip,
+            "icon": icon,
+            "device_type": "browser",
+            "connection": "Browser connected • Wi-Fi",
+            "online": True,
+            "is_self": False,
+            "can_beam_direct": False,
+            "last_seen": time.time(),
+        }
+
+    def record_client_seen(self, ip: str, ua: str = "", custom_name: str = ""):
+        """Records an active browser client and broadcasts updates when a new client joins."""
+        if not ip or ip in ("127.0.0.1", "::1"):
+            return
+        now = time.time()
+        existing = self.connected_clients.get(ip)
+        is_new = existing is None or (now - existing.get("last_seen", 0) > 60)
+        info = self._parse_client_info(ip, ua, custom_name)
+        self.connected_clients[ip] = info
+        if is_new:
+            self.broadcast_event({
+                "type": "nearby_devices_changed",
+                "devices": self.get_nearby_devices(),
+            })
+
+    def get_nearby_devices(self) -> list[dict]:
+        """Returns unified list of nearby Mesh Hosts and active Browser Clients."""
+        devices = []
+        mesh_ips = set()
+
+        if self.mesh:
+            nodes = self.mesh.get_nodes_list()
+        else:
+            local_ip = get_local_ip()
+            hostname = get_hostname()
+            nodes = [{
+                "id": "self",
+                "name": hostname,
+                "ip": local_ip,
+                "port": self.port,
+                "url": f"http://{local_ip}:{self.port}",
+                "is_self": True,
+                "is_leader": True,
+                "online": True,
+            }]
+
+        for n in nodes:
+            ip = n.get("ip", "")
+            mesh_ips.add(ip)
+            n_name = n.get("name", "PC")
+            icon = "💻" if "laptop" in n_name.lower() else "🖥️"
+            conn_label = "Primary Host • nearbeam.local" if n.get("is_leader") else "Online • High-Speed LAN"
+            devices.append({
+                "id": n.get("id", "self"),
+                "name": n_name,
+                "ip": ip,
+                "port": n.get("port", self.port),
+                "url": n.get("url", f"http://{ip}:{self.port}"),
+                "icon": icon,
+                "device_type": "host",
+                "connection": conn_label,
+                "online": True,
+                "is_self": bool(n.get("is_self")),
+                "is_leader": bool(n.get("is_leader")),
+                "can_beam_direct": True,
+            })
+
+        now = time.time()
+        stale_ips = []
+        for ip, c in list(self.connected_clients.items()):
+            if now - c.get("last_seen", 0) > 900:
+                stale_ips.append(ip)
+                continue
+            if ip not in mesh_ips:
+                devices.append(c)
+
+        for ip in stale_ips:
+            self.connected_clients.pop(ip, None)
+
+        return devices
 
     def shutdown(self):
         """Stops background workers and unregisters mDNS services."""
@@ -342,6 +448,7 @@ class NearBeamServer:
 
         @app.route("/")
         def index():
+            self.record_client_seen(request.remote_addr, request.headers.get("User-Agent", ""))
             self.log_activity(f"Device connected from {request.remote_addr}", "info")
             return render_template("index.html")
 
@@ -352,6 +459,7 @@ class NearBeamServer:
 
         @app.route("/api/info")
         def api_info():
+            self.record_client_seen(request.remote_addr, request.headers.get("User-Agent", ""))
             urls = get_connection_urls(self.port)
             safe_folders = config.get_safe_folders()
             return jsonify({
@@ -371,7 +479,27 @@ class NearBeamServer:
                 "version": APP_VERSION,
                 "mesh_role": self.mesh.role if self.mesh else "standalone",
                 "mesh_nodes": self.mesh.get_nodes_list() if self.mesh else [],
+                "nearby_devices": self.get_nearby_devices(),
             })
+
+        @app.route("/api/nearby")
+        def api_nearby():
+            self.record_client_seen(request.remote_addr, request.headers.get("User-Agent", ""))
+            return jsonify({
+                "role": self.mesh.role if self.mesh else "standalone",
+                "devices": self.get_nearby_devices(),
+            })
+
+        @app.route("/api/nearby/heartbeat", methods=["POST"])
+        def api_nearby_heartbeat():
+            data = request.get_json(silent=True) or {}
+            device_name = data.get("device_name", "")
+            self.record_client_seen(
+                request.remote_addr,
+                request.headers.get("User-Agent", ""),
+                custom_name=device_name,
+            )
+            return jsonify({"success": True, "devices": self.get_nearby_devices()})
 
         @app.route("/api/version")
         def api_version():
@@ -852,6 +980,12 @@ class NearBeamServer:
                 self.received_files_history.insert(0, file_info)
                 if len(self.received_files_history) > 100:
                     self.received_files_history.pop()
+                config.add_transfer_history({
+                    **file_info,
+                    "direction": "received",
+                    "peer": f"Guest Drop ({request.remote_addr})",
+                    "status": "completed",
+                })
 
                 msg = f"Guest dropped '{final_name}' ({format_size(total_bytes)})"
                 self.log_activity(msg, event_type="upload")
@@ -912,6 +1046,12 @@ class NearBeamServer:
                 # Keep history reasonable
                 if len(self.received_files_history) > 100:
                     self.received_files_history.pop()
+                config.add_transfer_history({
+                    **file_info,
+                    "direction": "received",
+                    "peer": request.remote_addr or "Local Network",
+                    "status": "completed",
+                })
 
                 # Notify GUI and SSE
                 msg = f"Auto-saved '{final_name}' ({format_size(total_bytes)}) from {request.remote_addr}"
@@ -1015,6 +1155,12 @@ class NearBeamServer:
                 self.received_files_history.insert(0, file_info)
                 if len(self.received_files_history) > 100:
                     self.received_files_history.pop()
+                config.add_transfer_history({
+                    **file_info,
+                    "direction": "received",
+                    "peer": request.remote_addr or "Local Network",
+                    "status": "completed",
+                })
 
                 msg = f"Auto-saved '{final_name}' ({format_size(total_bytes)}) from {request.remote_addr}"
                 self.log_activity(msg, event_type="upload")
@@ -1035,6 +1181,101 @@ class NearBeamServer:
                 size = os.path.getsize(temp_path)
                 return jsonify({"received_bytes": size})
             return jsonify({"received_bytes": 0})
+
+        @app.route("/api/upload/cancel", methods=["POST"])
+        def api_upload_cancel():
+            data = request.get_json(silent=True) or {}
+            session_id = data.get("session_id", "")
+            if session_id and ".." not in session_id and "/" not in session_id and "\\" not in session_id:
+                temp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                self.broadcast_event({
+                    "type": "upload_cancelled",
+                    "session_id": session_id,
+                })
+            return jsonify({"success": True})
+
+        @app.route("/api/history")
+        def api_history():
+            """Returns persistent transfer history."""
+            return jsonify({"history": config.get_transfer_history()})
+
+        @app.route("/api/history/clear", methods=["POST"])
+        def api_history_clear():
+            """Clears persistent transfer history."""
+            config.clear_transfer_history()
+            self.received_files_history.clear()
+            return jsonify({"success": True})
+
+        @app.route("/api/shell-send", methods=["POST"])
+        def api_shell_send():
+            """
+            Handles files or folders sent from Windows Explorer right-click ('Send with NearBeam')
+            or desktop drag-and-drop.
+            """
+            import shutil
+            data = request.get_json(silent=True) or {}
+            paths = data.get("paths", [])
+            if not paths:
+                return jsonify({"error": "No paths provided"}), 400
+
+            staged_files = []
+            added_folders = []
+
+            for raw_path in paths:
+                if not raw_path or not os.path.exists(raw_path):
+                    continue
+                real_p = os.path.realpath(raw_path)
+                if os.path.isdir(real_p):
+                    entry = config.add_safe_folder(real_p)
+                    added_folders.append(entry)
+                    self.log_activity(f"Shared folder via Windows Shell: '{entry['name']}'", "info")
+                elif os.path.isfile(real_p):
+                    fname = os.path.basename(real_p)
+                    save_dir_real = os.path.realpath(config.save_directory)
+                    if os.path.dirname(real_p) == save_dir_real:
+                        dest_path, final_name = real_p, fname
+                    else:
+                        dest_path, final_name = config.get_unique_filepath(fname)
+                        shutil.copy2(real_p, dest_path)
+
+                    total_bytes = os.path.getsize(dest_path)
+                    file_info = {
+                        "filename": final_name,
+                        "original_name": fname,
+                        "size": total_bytes,
+                        "formatted_size": format_size(total_bytes),
+                        "saved_path": dest_path,
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "category": get_file_type_category(final_name),
+                    }
+                    staged_files.append(file_info)
+                    self.received_files_history.insert(0, file_info)
+                    config.add_transfer_history({
+                        **file_info,
+                        "direction": "sent",
+                        "peer": "Shared from PC",
+                        "status": "completed",
+                    })
+                    self.log_activity(f"Shared '{final_name}' ({format_size(total_bytes)}) via NearBeam Shell", "upload")
+                    self.broadcast_event({
+                        "type": "file_received",
+                        "file": file_info,
+                        "source": "shell_send",
+                    })
+
+            if added_folders:
+                self.broadcast_event({"type": "safelist_updated"})
+
+            return jsonify({
+                "success": True,
+                "staged_files": staged_files,
+                "added_folders": added_folders,
+            })
 
         @app.route("/api/received")
         def api_received():

@@ -5,7 +5,8 @@
 </p>
 
 <p align="center">
-  <strong>Ultra-fast, zero-cloud Wi-Fi file transfers & shared folder explorer across Windows, iOS, Android, macOS & Linux.</strong>
+  <strong>Transfer files without QR codes, accounts, or cables.</strong><br/>
+  <em>Open your PC from your phone at <code>nearbeam.local:5000</code> — ultra-fast, zero-cloud Wi-Fi file transfers & shared folder explorer across Windows, iOS, Android, macOS & Linux.</em>
 </p>
 
 <p align="center">
@@ -30,14 +31,15 @@ Tired of emailing files to yourself, uploading GBs to cloud drives just to downl
 
 | Feature | Description |
 |:---|:---|
-| ⚡ **Socket-Stream Speed** | Direct socket-to-disk TCP streaming with parallel 50MB chunks. Zero double-buffering disk penalties—saturates your gigabit Wi-Fi. |
-| 🏷️ **Permanent Address** | Bookmark **`http://nearbeam.local:5000`** on Safari, Chrome, or Firefox. mDNS automatically tracks your PC even when your router DHCP assigns a new IP! |
+| 🏷️ **No QR / No IP Permanent URL** | Bookmark **`http://nearbeam.local:5000`** on Safari, Chrome, or Firefox. mDNS automatically tracks your PC even when your router DHCP assigns a new IP! |
+| 🌐 **Nearby Devices Dashboard** | Device-first home screen showing all online LAN computers and connected mobile browsers (`💻 Gaming-PC`, `💻 Laptop`, `📱 iPhone`) with 1-click targeting and direct card drag-and-drop. |
+| ⚡ **Production Transfer Manager** | Live sliding-window transfer speed, ETA, Pause/Resume, Cancel with `.tmp` cleanup, Failed Transfers queue with 1-click Retry, and Persistent Completed History across refreshes. |
+| ✨ **Drag-and-Drop Everywhere** | Drop files or nested folders anywhere onto the Web App window (across any tab) or directly onto the Windows Desktop Control Panel. |
+| 🖱️ **Windows Explorer Share Menu** | Right-click any file or folder in Windows Explorer and choose **"Send with NearBeam"** (or use the Windows `Send to` menu) to stage or beam it immediately. |
 | 🛸 **Multi-Host Mesh Cluster** | Run NearBeam on your PC and Laptop simultaneously. They auto-discover each other; mobile clients pick the destination computer with one tap (`[ Desktop ] [ Laptop ] [ All Hosts ]`). |
 | 🔒 **Safe List Sandboxed Explorer** | Share specific folders or external drives. Browsers can navigate subfolders, stream media, and download whole directories as auto-packaged ZIPs. |
 | 🎁 **Guest Drop Zones** | Generate temporary, expiring drop links. Guests can securely drop files to you without seeing your computer's files or Safe List. |
-| 📥 **Zero-Click Auto-Save** | Received files automatically save to your designated folder (`Downloads/NearBeam_Received`) with smart numbered duplicate protection (`photo (1).jpg`). |
-| 📁 **Folder Drag-and-Drop** | Drag nested folders directly from your browser. NearBeam recursively reconstructs the exact folder hierarchy on your disk. |
-| 📋 **Universal Shared Clipboard** | 1-tap clipboard synchronization between Windows, Mac, Linux, iPhone, iPad, and Android. |
+| 📋 **Universal Shared Clipboard** | Instant 2-way clipboard synchronization between Windows, Mac, Linux, iPhone, iPad, and Android. |
 | 🖥️ **Dual Mode** | Sleek PySide6 Desktop GUI with system tray minimization, or headless CLI server (`--headless`) for remote servers and Raspberry Pi. |
 
 ---

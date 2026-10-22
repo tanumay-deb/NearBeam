@@ -121,8 +121,67 @@
     </nav>
   </div>
 
+  <!-- Global Window-Wide Drag-and-Drop Overlay (NB-04) -->
+  <div class="global-drop-overlay hidden" id="globalDropOverlay">
+    <div class="global-drop-box">
+      <div class="global-drop-icon">⚡</div>
+      <h2>Drop files or folders anywhere to beam</h2>
+      <p id="globalDropTargetHint">Instant local Wi-Fi transfer • Zero cloud, zero cables</p>
+    </div>
+  </div>
+
   <!-- Main Content Container -->
   <main class="main-container">
+
+    <!-- NEARBY DEVICES & HERO DASHBOARD (NB-01 & NB-02) -->
+    <section class="nearby-dashboard-card" id="nearbyDashboardCard">
+      <div class="nearby-hero-row">
+        <div class="nearby-hero-text">
+          <div class="hero-kicker">⚡ ZERO QR • ZERO ACCOUNTS • ZERO CABLES</div>
+          <h1 class="hero-headline">Transfer files without QR codes, accounts, or cables.</h1>
+          <p class="hero-subline">Open your PC from your phone at <code class="code-pill" id="heroLocalUrl">nearbeam.local:5000</code> — or drop files onto any nearby device below.</p>
+        </div>
+        <div class="nearby-quick-actions">
+          <button class="primary-btn" id="btnHeroSendFiles" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="17 8 12 3 7 8"></polyline>
+              <line x1="12" y1="3" x2="12" y2="15"></line>
+            </svg>
+            <span>Send Files</span>
+          </button>
+          <button class="secondary-btn" id="btnHeroSharedFolders" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span>Shared Folders</span>
+          </button>
+          <button class="secondary-btn" id="btnHeroClipboard" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+              <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+            </svg>
+            <span>Clipboard</span>
+          </button>
+          <button class="secondary-btn" id="btnCreateDropZone" type="button" title="Create temporary 24h Guest Drop Link">
+            <span>🎁 Guest Link</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="nearby-devices-section">
+        <div class="nearby-devices-header">
+          <span class="nearby-devices-title">
+            <span class="mesh-dot"></span>
+            Nearby Devices
+          </span>
+          <span class="nearby-devices-hint">Click a device to select target, or drag &amp; drop files directly onto a device card</span>
+        </div>
+        <div class="nearby-devices-grid" id="nearbyDevicesList">
+          <!-- Dynamically populated by app.js -->
+        </div>
+      </div>
+    </section>
 
     <!-- TAB 1: BROWSE SAFE LIST FOLDERS -->
     <section class="tab-pane active" id="tab-safelist">
@@ -266,12 +325,32 @@
           </div>
         </div>
 
-                <!-- Transfer Manager Container -->
+        <!-- Active Transfer Manager Container (NB-03) -->
         <div class="transfer-manager hidden" id="transferManagerCard">
           <div class="transfer-manager-header">
-             <h4 class="subheading">Active Transfers</h4>
+            <h4 class="subheading">⚡ Active Transfers</h4>
           </div>
           <div id="activeTransfersList" class="transfers-list"></div>
+        </div>
+
+        <!-- Failed Transfers Queue (NB-03) -->
+        <div class="transfer-manager failed-transfers-card hidden" id="failedTransfersCard">
+          <div class="transfer-manager-header">
+            <h4 class="subheading" style="color: var(--accent-rose);">⚠️ Failed Transfers</h4>
+            <button class="card-action-btn" id="btnRetryAllFailed" type="button">↻ Retry All</button>
+          </div>
+          <div id="failedTransfersList" class="transfers-list"></div>
+        </div>
+
+        <!-- Persistent Completed Transfer History (NB-03) -->
+        <div class="sent-history" id="completedHistoryCard">
+          <div class="transfer-manager-header">
+            <h4 class="subheading">✓ Completed Transfer History</h4>
+            <button class="card-action-btn" id="btnClearHistory" type="button">Clear History</button>
+          </div>
+          <div id="sentList" class="sent-list">
+            <div class="empty-sent">No transfers in history yet.</div>
+          </div>
         </div>
       </div>
     </section>

@@ -127,9 +127,39 @@ def ensure_windows_start_menu_shortcut():
         pass
 
 
+def send_paths_to_running_instance(paths: list[str], port: int = 5000) -> bool:
+    """If NearBeam is already running locally, hand off shared paths via HTTP API."""
+    import json
+    import urllib.request
+
+    for candidate_port in (port, 5000, 5001, 5002):
+        try:
+             payload = json.dumps({"paths": paths}).encode("utf-8")
+             req = urllib.request.Request(
+                 f"http://127.0.0.1:{candidate_port}/api/shell-send",
+                 data=payload,
+                 headers={"Content-Type": "application/json"},
+                 method="POST",
+             )
+             with urllib.request.urlopen(req, timeout=2.0) as resp:
+                 if resp.status == 200:
+                     return True
+        except Exception:
+            continue
+    return False
+
+
 def main():
     ensure_windows_start_menu_shortcut()
-    parser = argparse.ArgumentParser(description="NearBeam - Wi-Fi File Sharing & Explorer")
+    if sys.platform == "win32" and config.data.get("shell_integration_enabled", True):
+        try:
+            from core.shell_integration import is_shell_integration_enabled, set_shell_integration
+            if not is_shell_integration_enabled():
+                set_shell_integration(True)
+        except Exception:
+            pass
+
+    parser = argparse.ArgumentParser(description="NearBeam - Transfer files without QR codes, accounts, or cables")
     parser.add_argument(
         "--headless",
         "--cli",
@@ -147,14 +177,31 @@ def main():
         action="store_true",
         help="Start NearBeam minimized directly to the Windows system tray",
     )
+    parser.add_argument(
+        "--send",
+        nargs="*",
+        default=[],
+        help="Share or send file(s)/folder(s) via NearBeam from Windows Explorer",
+    )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        default=[],
+        help="Optional file or folder paths passed via Windows SendTo or drag-and-drop onto executable",
+    )
     args = parser.parse_args()
+
+    send_paths = [os.path.abspath(p) for p in (args.send + args.paths) if p and os.path.exists(p)]
+
+    if send_paths and send_paths_to_running_instance(send_paths, args.port):
+        return
 
     if args.headless:
         run_headless(args.port)
     else:
         try:
             from gui import run_gui
-            run_gui(start_minimized=args.minimized)
+            run_gui(start_minimized=args.minimized, send_paths=send_paths)
         except Exception as e:
             import traceback
             err_msg = traceback.format_exc()
@@ -179,3 +226,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

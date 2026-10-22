@@ -30,6 +30,7 @@ class ConfigManager:
             "auto_save": True,
             "save_directory": self.default_save_dir,
             "safe_folders": [],
+            "transfer_history": [],
             "pin_enabled": False,
             "pin": "",
         }
@@ -198,6 +199,37 @@ class ConfigManager:
             raise PermissionError("Access denied: Directory traversal detected.")
 
         return target_real
+
+    # --- Persistent Transfer History ---
+
+    def get_transfer_history(self) -> list[dict]:
+        """Returns persistent transfer history records."""
+        return list(self.data.get("transfer_history", []))
+
+    def add_transfer_history(self, entry: dict) -> dict:
+        """Prepends a completed or failed transfer entry to persistent history (capped at 100)."""
+        history = self.data.setdefault("transfer_history", [])
+        record = {
+            "id": entry.get("id") or uuid.uuid4().hex[:12],
+            "filename": entry.get("filename", "Unknown"),
+            "size": entry.get("size", 0),
+            "formatted_size": entry.get("formatted_size", "0 B"),
+            "timestamp": entry.get("timestamp", ""),
+            "direction": entry.get("direction", "received"),
+            "peer": entry.get("peer", "Local Network"),
+            "status": entry.get("status", "completed"),
+            "category": entry.get("category", "file"),
+        }
+        history.insert(0, record)
+        if len(history) > 100:
+            del history[100:]
+        self.save()
+        return record
+
+    def clear_transfer_history(self):
+        """Clears all saved transfer history records."""
+        self.data["transfer_history"] = []
+        self.save()
 
 
 # Global default instance
