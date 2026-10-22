@@ -340,7 +340,7 @@ class TestLandrop(unittest.TestCase):
                 "X-Total-Chunks": "3",
             },
         )
-        tmp_path = os.path.join(self.save_dir, ".sess-cancel-99.tmp")
+        tmp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", "sess-cancel-99.tmp")
         self.assertTrue(os.path.exists(tmp_path))
 
         cancel_res = self.client.post(

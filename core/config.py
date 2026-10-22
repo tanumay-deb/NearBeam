@@ -128,12 +128,12 @@ class ConfigManager:
 
     def add_safe_folder(self, folder_path: str, display_name: str = None) -> dict:
         """
-        Adds a directory to the Safe List.
-        Returns the created folder entry.
+        Adds a directory or file to the Safe List.
+        Returns the created entry.
         """
         abs_path = os.path.realpath(folder_path)
-        if not os.path.isdir(abs_path):
-            raise ValueError(f"Path is not a valid directory: {folder_path}")
+        if not os.path.exists(abs_path):
+            raise ValueError(f"Path does not exist: {folder_path}")
 
         # Check if already in safe list
         for item in self.get_safe_folders():
@@ -169,7 +169,7 @@ class ConfigManager:
 
     def resolve_safe_path(self, folder_id: str, subpath: str = "") -> str:
         """
-        Securely resolves a subpath inside a Safe List folder.
+        Securely resolves a subpath inside a Safe List folder (or single shared file).
         Validates that the target path is strictly within the safe folder's boundary
         to prevent directory traversal attacks (e.g. '../').
         """
@@ -181,8 +181,12 @@ class ConfigManager:
         if not os.path.exists(base_real):
             raise FileNotFoundError(f"Safe folder path does not exist: {base_real}")
 
-        # Normalize subpath
         clean_subpath = subpath.replace("\\", "/").strip("/")
+        if os.path.isfile(base_real):
+            if not clean_subpath or clean_subpath == os.path.basename(base_real):
+                return base_real
+            raise PermissionError("Access denied: Invalid subpath for single file.")
+
         if clean_subpath:
             target_real = os.path.realpath(os.path.join(base_real, clean_subpath))
         else:

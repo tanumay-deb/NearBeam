@@ -136,30 +136,33 @@ class NearBeamServer:
         """Classifies a connected browser client by User-Agent and IP."""
         ua_lower = (ua or "").lower()
         if custom_name:
-            name = custom_name
-            icon = "📱" if any(k in custom_name.lower() for k in ("iphone", "ipad", "android", "phone")) else "💻"
+            name = custom_name.strip()[:40]
+            dtype = "phone" if any(k in custom_name.lower() for k in ("iphone", "ipad", "android", "phone")) else "laptop"
+            icon = "📱" if dtype == "phone" else "💻"
         elif "iphone" in ua_lower:
-            name, icon = "iPhone", "📱"
+            name, icon, dtype = "iPhone", "📱", "phone"
         elif "ipad" in ua_lower:
-            name, icon = "iPad", "📱"
+            name, icon, dtype = "iPad", "📲", "tablet"
         elif "android" in ua_lower:
-            name, icon = "Android Phone", "📱"
+            name, icon, dtype = "Android Phone", "📱", "phone"
         elif "macintosh" in ua_lower or "mac os" in ua_lower:
-            name, icon = "Mac Browser", "💻"
+            name, icon, dtype = "Mac Browser", "💻", "laptop"
         elif "windows" in ua_lower:
-            name, icon = "Windows Browser", "💻"
+            name, icon, dtype = "Windows Browser", "💻", "laptop"
         elif "linux" in ua_lower:
-            name, icon = "Linux Browser", "💻"
+            name, icon, dtype = "Linux Browser", "💻", "laptop"
         else:
-            name, icon = f"Browser ({ip})", "📱"
+            name, icon, dtype = f"Browser ({ip})", "📱", "phone"
 
         return {
             "id": f"client_{ip}",
+            "kind": "client",
             "name": name,
             "ip": ip,
             "icon": icon,
-            "device_type": "browser",
-            "connection": "Browser connected • Wi-Fi",
+            "device_type": dtype,
+            "status": "Browser connected",
+            "connection": "Wi-Fi",
             "online": True,
             "is_self": False,
             "can_beam_direct": False,
@@ -168,7 +171,7 @@ class NearBeamServer:
 
     def record_client_seen(self, ip: str, ua: str = "", custom_name: str = ""):
         """Records an active browser client and broadcasts updates when a new client joins."""
-        if not ip or ip in ("127.0.0.1", "::1"):
+        if not ip:
             return
         now = time.time()
         existing = self.connected_clients.get(ip)
@@ -206,16 +209,19 @@ class NearBeamServer:
             ip = n.get("ip", "")
             mesh_ips.add(ip)
             n_name = n.get("name", "PC")
-            icon = "💻" if "laptop" in n_name.lower() else "🖥️"
-            conn_label = "Primary Host • nearbeam.local" if n.get("is_leader") else "Online • High-Speed LAN"
+            is_laptop = "laptop" in n_name.lower()
+            icon = "💻" if is_laptop else "🖥️"
+            conn_label = "nearbeam.local • LAN" if n.get("is_leader") else "Wi-Fi / High-Speed LAN"
             devices.append({
                 "id": n.get("id", "self"),
+                "kind": "host",
                 "name": n_name,
                 "ip": ip,
                 "port": n.get("port", self.port),
                 "url": n.get("url", f"http://{ip}:{self.port}"),
                 "icon": icon,
-                "device_type": "host",
+                "device_type": "laptop" if is_laptop else "desktop",
+                "status": "Online",
                 "connection": conn_label,
                 "online": True,
                 "is_self": bool(n.get("is_self")),
@@ -509,13 +515,14 @@ class NearBeamServer:
 
         @app.route("/api/safelist")
         def api_safelist():
-            """Returns list of all exposed Safe List folders."""
+            """Returns list of all exposed Safe List folders and shared files."""
             result = []
             for folder in config.get_safe_folders():
                 folder_path = folder["path"]
-                exists = os.path.exists(folder_path) and os.path.isdir(folder_path)
-                item_count = 0
-                if exists:
+                is_file = os.path.isfile(folder_path)
+                exists = os.path.exists(folder_path)
+                item_count = 1 if is_file else 0
+                if exists and not is_file:
                     try:
                         item_count = len(os.listdir(folder_path))
                     except Exception:
@@ -526,6 +533,7 @@ class NearBeamServer:
                     "name": folder["name"],
                     "path": folder_path,
                     "exists": exists,
+                    "is_file": is_file,
                     "item_count": item_count,
                 })
             return jsonify({"folders": result})
@@ -533,7 +541,7 @@ class NearBeamServer:
         @app.route("/api/safelist/browse")
         def api_safelist_browse():
             """
-            Browses files and subdirectories inside a safe folder.
+            Browses files and subdirectories inside a safe folder (or single shared file).
             Query params: folder_id (required), subpath (optional relative path)
             """
             folder_id = request.args.get("folder_id", "")
@@ -552,6 +560,25 @@ class NearBeamServer:
                 return jsonify({"error": str(pe)}), 403
             except (FileNotFoundError, KeyError) as fe:
                 return jsonify({"error": str(fe)}), 404
+
+            if os.path.isfile(real_target):
+                stat = os.stat(real_target)
+                fname = os.path.basename(real_target)
+                return jsonify({
+                    "folder_id": folder_id,
+                    "folder_name": safe_folder["name"],
+                    "subpath": "",
+                    "breadcrumbs": [{"name": safe_folder["name"], "subpath": ""}],
+                    "items": [{
+                        "name": fname,
+                        "is_dir": False,
+                        "size": stat.st_size,
+                        "formatted_size": format_size(stat.st_size),
+                        "subpath": fname,
+                        "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        "category": get_file_type_category(fname),
+                    }],
+                })
 
             if not os.path.isdir(real_target):
                 return jsonify({"error": "Path is not a directory"}), 400
@@ -1186,18 +1213,24 @@ class NearBeamServer:
         def api_upload_cancel():
             data = request.get_json(silent=True) or {}
             session_id = data.get("session_id", "")
+            removed_tmp = False
             if session_id and ".." not in session_id and "/" not in session_id and "\\" not in session_id:
-                temp_path = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
+                candidates = [
+                    os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
+                    os.path.join(config.save_directory, f".{session_id}.tmp"),
+                ]
+                for temp_path in candidates:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                            removed_tmp = True
+                        except OSError:
+                            pass
                 self.broadcast_event({
                     "type": "upload_cancelled",
                     "session_id": session_id,
                 })
-            return jsonify({"success": True})
+            return jsonify({"success": True, "removed_tmp": removed_tmp})
 
         @app.route("/api/history")
         def api_history():
@@ -1235,6 +1268,8 @@ class NearBeamServer:
                     added_folders.append(entry)
                     self.log_activity(f"Shared folder via Windows Shell: '{entry['name']}'", "info")
                 elif os.path.isfile(real_p):
+                    entry = config.add_safe_folder(real_p)
+                    added_folders.append(entry)
                     fname = os.path.basename(real_p)
                     save_dir_real = os.path.realpath(config.save_directory)
                     if os.path.dirname(real_p) == save_dir_real:
@@ -1273,6 +1308,7 @@ class NearBeamServer:
 
             return jsonify({
                 "success": True,
+                "added_count": len(added_folders),
                 "staged_files": staged_files,
                 "added_folders": added_folders,
             })
