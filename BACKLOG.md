@@ -104,3 +104,15 @@ A prioritized roadmap of strategic enhancements, UX refinements, and native OS i
 - **Acceptance Criteria:**
   - Clicking "Send with NearBeam" launches the app (or opens tray instance) with the target file queued for sending.
 
+---
+
+## 🚀 Future Roadmap Candidates (v1.5+)
+
+| ID | Feature / Enhancement | Story Points | Effort | Impact | Priority | Status |
+|:---|:---|:---:|:---:|:---:|:---:|:---:|
+| **NB-06** | **PIN / Passcode Pairing for Untrusted Public Wi-Fi** | 3 | Low-Med | High | P2 | Backlog |
+| **NB-07** | **Rich Clipboard Sync (Screenshots & Copied Images)** | 5 | Medium | High | P2 | Backlog |
+| **NB-08** | **System Tray Native Toast Actions ("Open File" / "Show in Folder")** | 2 | Low | Medium | P3 | Backlog |
+| **NB-09** | **PWA Offline Shell & Install-to-Home-Screen Prompt on Mobile** | 3 | Low-Med | Medium | P3 | Backlog |
+
+

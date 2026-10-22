@@ -859,15 +859,17 @@ function renderSafeEmptyState(msg) {
 }
 
 // Search Filter
-safeSearchInput.addEventListener("input", (e) => {
-  const query = e.target.value.toLowerCase().trim();
-  if (!query) {
-    renderSafeItems(safeItemsCache);
-    return;
-  }
-  const filtered = safeItemsCache.filter((item) => item.name.toLowerCase().includes(query));
-  renderSafeItems(filtered);
-});
+if (safeSearchInput) {
+  safeSearchInput.addEventListener("input", (e) => {
+    const query = e.target.value.toLowerCase().trim();
+    if (!query) {
+      renderSafeItems(safeItemsCache);
+      return;
+    }
+    const filtered = safeItemsCache.filter((item) => item.name.toLowerCase().includes(query));
+    renderSafeItems(filtered);
+  });
+}
 
 // --- Drag & Drop Tree Traversal Helper ---
 
@@ -1801,7 +1803,9 @@ async function fetchReceivedFiles() {
   }
 }
 
-btnRefreshReceived.addEventListener("click", fetchReceivedFiles);
+if (btnRefreshReceived) {
+  btnRefreshReceived.addEventListener("click", fetchReceivedFiles);
+}
 
 function renderReceivedFiles(files) {
   receivedFilesContainer.innerHTML = "";
@@ -1995,26 +1999,30 @@ async function fetchClipboard() {
   }
 }
 
-btnSendClipboard.addEventListener("click", () => {
-  sendClipboardData(clipboardTextarea.value, true);
-});
+if (btnSendClipboard) {
+  btnSendClipboard.addEventListener("click", () => {
+    sendClipboardData(clipboardTextarea.value, true);
+  });
+}
 
-btnCopyClipboard.addEventListener("click", async () => {
-  const text = clipboardTextarea.value;
-  if (!text) {
-    showToast("Clipboard is empty", "info");
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(text);
-    showToast("✓ Copied to your device's clipboard!", "success");
-  } catch (e) {
-    // Fallback for older browsers
-    clipboardTextarea.select();
-    document.execCommand("copy");
-    showToast("✓ Copied to clipboard!", "success");
-  }
-});
+if (btnCopyClipboard) {
+  btnCopyClipboard.addEventListener("click", async () => {
+    const text = clipboardTextarea.value;
+    if (!text) {
+      showToast("Clipboard is empty", "info");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("✓ Copied to your device's clipboard!", "success");
+    } catch (e) {
+      // Fallback for older browsers
+      clipboardTextarea.select();
+      document.execCommand("copy");
+      showToast("✓ Copied to clipboard!", "success");
+    }
+  });
+}
 
 // --- Real-Time SSE Setup ---
 
@@ -2134,17 +2142,23 @@ function removeIncomingProgress(sessionId) {
 
 function setupModalEvents() {
   // Preview Modal
-  btnClosePreview.addEventListener("click", () => previewModal.classList.add("hidden"));
-  previewModal.addEventListener("click", (e) => {
-    if (e.target === previewModal) previewModal.classList.add("hidden");
-  });
+  if (btnClosePreview && previewModal) {
+    btnClosePreview.addEventListener("click", () => previewModal.classList.add("hidden"));
+    previewModal.addEventListener("click", (e) => {
+      if (e.target === previewModal) previewModal.classList.add("hidden");
+    });
+  }
 
   // QR Modal
-  btnQrModal.addEventListener("click", () => qrModal.classList.remove("hidden"));
-  btnCloseQr.addEventListener("click", () => qrModal.classList.add("hidden"));
-  qrModal.addEventListener("click", (e) => {
-    if (e.target === qrModal) qrModal.classList.add("hidden");
-  });
+  if (btnQrModal && qrModal) {
+    btnQrModal.addEventListener("click", () => qrModal.classList.remove("hidden"));
+  }
+  if (btnCloseQr && qrModal) {
+    btnCloseQr.addEventListener("click", () => qrModal.classList.add("hidden"));
+    qrModal.addEventListener("click", (e) => {
+      if (e.target === qrModal) qrModal.classList.add("hidden");
+    });
+  }
 
   // ZIP Progress Modal
   if (btnCloseZipModal) btnCloseZipModal.addEventListener("click", cancelZipDownload);
@@ -2158,8 +2172,8 @@ function setupModalEvents() {
   // ESC key closes modals
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      previewModal.classList.add("hidden");
-      qrModal.classList.add("hidden");
+      if (previewModal) previewModal.classList.add("hidden");
+      if (qrModal) qrModal.classList.add("hidden");
       if (zipProgressModal && !zipProgressModal.classList.contains("hidden")) {
         cancelZipDownload();
       }

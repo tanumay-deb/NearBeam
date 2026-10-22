@@ -51,9 +51,21 @@
   </style>
 </head>
 <body class="theme-dark">
+  <div id="globalDropOverlay" class="global-drop-overlay hidden">
+    <div class="global-drop-overlay-inner">
+      <div class="global-drop-icon">⚡</div>
+      <h2>Drop files or folders anywhere to beam</h2>
+      <p>Folder structure is preserved automatically • Zero cloud</p>
+    </div>
+  </div>
+  <div id="toastContainer" class="toast-container"></div>
+
   <div class="drop-container">
-    <h2>Guest Drop Zone</h2>
-    <p>Drop files here to securely send them to the host.</p>
+    <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:0.5rem;">
+      <img src="/static/favicon.png" width="32" height="32" alt="NearBeam" style="border-radius:8px;" />
+      <h2 style="margin:0;">NearBeam Guest Drop Zone</h2>
+    </div>
+    <p>Transfer files without QR codes, accounts, or cables — directly to the host PC.</p>
     
     <div id="dropzone" class="dropzone">
       <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" style="margin-bottom:1rem;color:var(--text-dim);">
@@ -61,14 +73,31 @@
         <polyline points="17 8 12 3 7 8"></polyline>
         <line x1="12" y1="3" x2="12" y2="15"></line>
       </svg>
-      <h3>Drag & Drop Files or Folders Here</h3>
+      <h3>Drag & Drop Files or Folders Anywhere</h3>
       <input type="file" id="fileInput" multiple style="display:none;">
       <button class="btn-select" id="btnSelect">Select Files</button>
     </div>
 
     <div class="transfer-manager hidden" id="transferManagerCard" style="text-align:left;">
-      <h4 class="subheading">Active Transfers</h4>
+      <h4 class="subheading">⚡ Active Transfers</h4>
       <div id="activeTransfersList" class="transfers-list"></div>
+    </div>
+
+    <div class="transfer-manager failed-transfers-card hidden" id="failedTransfersCard" style="text-align:left;">
+      <div class="transfer-section-header">
+        <h4 class="subheading failed-heading">⚠️ Failed Transfers</h4>
+        <button id="btnRetryAllFailed" class="btn-secondary btn-xs" type="button">↻ Retry All</button>
+      </div>
+      <div id="failedTransfersList" class="transfers-list"></div>
+    </div>
+
+    <div class="sent-history" id="completedHistoryCard" style="text-align:left;margin-top:1rem;">
+      <div class="transfer-section-header">
+        <h4 class="subheading">✓ Completed Transfers</h4>
+      </div>
+      <div id="sentList" class="sent-list">
+        <p class="empty-sent">No transfers recorded yet.</p>
+      </div>
     </div>
   </div>
 
