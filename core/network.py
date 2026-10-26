@@ -4,6 +4,7 @@ Network utilities for local IP detection, mDNS hostname resolution, and port man
 
 import io
 import socket
+import sys
 
 
 def get_hostname() -> str:
@@ -55,7 +56,11 @@ def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
     """Checks if a given port is available for binding."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # On Windows SO_REUSEADDR lets a bind succeed on a port another server is
+            # listening on, so two NearBeams would silently share it. Elsewhere it only
+            # skips TIME_WAIT, which keeps quick restarts on the same port.
+            if sys.platform != "win32":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
             return True
         except OSError:

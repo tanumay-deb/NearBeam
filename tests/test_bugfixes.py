@@ -7,8 +7,10 @@ Regression tests for upload hardening and stability fixes:
 - Concurrent transfer-history saves keep config.json valid
 """
 
+import io
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -138,6 +140,118 @@ class TestUploadHardening(unittest.TestCase):
         self._chunk(b"A" * 5, sid="leg1", name="l.bin", idx=0, total=2)
         info = self._chunk(b"B" * 5, sid="leg1", name="l.bin", idx=1, total=2).get_json()["file"]
         self.assertEqual(info["size"], 10)
+
+
+class _SlowBody(io.RawIOBase):
+    """Request body that trickles in, like a phone on weak Wi-Fi."""
+
+    def __init__(self, total: int, piece: int, delay: float):
+        self.total, self.piece, self.delay, self.pos = total, piece, delay, 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True  # werkzeug's test client measures the body by seeking to its end
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, offset, whence=0):
+        self.pos = self.total + offset if whence == 2 else offset
+        return self.pos
+
+    def readinto(self, b):
+        left = self.total - self.pos
+        if left <= 0:
+            return 0
+        time.sleep(self.delay)
+        n = min(len(b), self.piece, left)
+        b[:n] = b"x" * n
+        self.pos += n
+        return n
+
+
+class TestLiveUploadProgress(unittest.TestCase):
+    """The desktop Transfers page needs progress while a chunk is still arriving."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="landrop_prog_")
+        self.cfg = ConfigManager(os.path.join(self.test_dir, "cfg.json"))
+        self.cfg.set_save_directory(os.path.join(self.test_dir, "received"))
+        self.cfg.set_auto_save(True)
+        self.orig_config = srv_mod.config
+        srv_mod.config = self.cfg
+        self.server = LandropServer(port=5997, enable_mesh=False)
+        self.client = self.server.app.test_client()
+        self.events = queue.Queue()
+        self.server.event_subscribers.append(self.events)
+
+    def tearDown(self):
+        self.server.shutdown()
+        srv_mod.config = self.orig_config
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _progress_events(self):
+        out = []
+        while not self.events.empty():
+            ev = json.loads(self.events.get_nowait())
+            if ev["type"] == "upload_progress":
+                out.append(ev)
+        return out
+
+    def test_progress_arrives_before_a_slow_chunk_finishes(self):
+        size = 1536 * 1024
+        resp = self.client.post(
+            "/api/upload/chunk",
+            input_stream=_SlowBody(size, 128 * 1024, 0.1),
+            headers={
+                "Content-Length": str(size),
+                "X-Session-Id": "slow1",
+                "X-Filename": "video.mp4",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "1",
+                "X-Chunk-Offset": "0",
+                "X-File-Size": str(size),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        events = self._progress_events()
+        partial = [e for e in events if e["received_bytes"] < size]
+        self.assertTrue(partial, "no progress while the chunk was still arriving")
+        self.assertTrue(all(e["total_bytes"] == size for e in events))
+        received = [e["received_bytes"] for e in events]
+        self.assertEqual(received, sorted(received))
+
+    def test_progress_uses_real_file_size_across_chunks(self):
+        self.client.post(
+            "/api/upload/chunk",
+            data=b"a" * (2 * 1024 * 1024),
+            content_type="application/octet-stream",
+            headers={"X-Session-Id": "multi1", "X-Filename": "big.bin", "X-Chunk-Index": "0",
+                     "X-Total-Chunks": "2", "X-Chunk-Offset": "0", "X-File-Size": str(3 * 1024 * 1024)},
+        )
+        last = self._progress_events()[-1]
+        self.assertEqual(last["received_bytes"], 2 * 1024 * 1024)
+        self.assertEqual(last["total_bytes"], 3 * 1024 * 1024)
+        self.assertAlmostEqual(last["percent"], 66.7, places=1)
+
+
+class TestPortCheck(unittest.TestCase):
+    def test_port_held_by_running_server_is_not_free(self):
+        """A second NearBeam must not share a port the first one listens on."""
+        import socket
+        from core.network import find_available_port, is_port_available
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # how werkzeug's server binds
+        srv.bind(("0.0.0.0", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            self.assertFalse(is_port_available(port))
+            self.assertNotEqual(find_available_port(port), port)
+        finally:
+            srv.close()
 
 
 class TestConfigConcurrency(unittest.TestCase):

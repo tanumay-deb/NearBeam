@@ -163,9 +163,6 @@
             </svg>
             <span>Clipboard</span>
           </button>
-          <button class="secondary-btn" id="btnCreateDropZone" type="button" title="Create temporary 24h Guest Drop Link">
-            <span>🎁 Guest Link</span>
-          </button>
         </div>
       </div>
 
@@ -197,7 +194,7 @@
               <option value="">Loading shared folders...</option>
             </select>
             <div class="safelist-btn-group">
-              <button class="action-btn" id="btnDownloadFolderZip" title="Download current folder as ZIP">
+              <button class="action-btn" id="btnDownloadFolderZip" title="Download current folder as ZIP" aria-label="Download current folder as ZIP">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                   <polyline points="7 10 12 15 17 10"></polyline>
@@ -236,7 +233,26 @@
             <circle cx="11" cy="11" r="8"></circle>
             <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
-          <input type="text" id="safeSearchInput" placeholder="Filter files or folders by name..." />
+          <input type="text" id="safeSearchInput" placeholder="Search this folder" aria-label="Search this folder" />
+        </div>
+
+        <!-- Type filters, sort and list/grid switch (shown inside a folder) -->
+        <div class="browse-toolbar" id="browseToolbar" hidden>
+          <div class="type-chips" id="typeChips" role="group" aria-label="Show only"></div>
+          <div class="browse-tools">
+            <select class="sort-select" id="safeSortSelect" aria-label="Sort files">
+              <option value="newest">Newest first</option>
+              <option value="name">Name A–Z</option>
+            </select>
+            <div class="view-toggle" role="group" aria-label="View">
+              <button type="button" class="view-btn" data-view="list" aria-label="List view" aria-pressed="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="9" y1="6" x2="20" y2="6"></line><line x1="9" y1="12" x2="20" y2="12"></line><line x1="9" y1="18" x2="20" y2="18"></line><line x1="4" y1="6" x2="4.01" y2="6"></line><line x1="4" y1="12" x2="4.01" y2="12"></line><line x1="4" y1="18" x2="4.01" y2="18"></line></svg>
+              </button>
+              <button type="button" class="view-btn" data-view="grid" aria-label="Grid view" aria-pressed="false">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg>
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- File Items Grid / List -->
@@ -324,6 +340,17 @@
               <span>Send a Folder</span>
             </button>
           </div>
+        </div>
+
+        <!-- Guest link: someone without NearBeam can drop files onto this PC for 24 h -->
+        <div class="guest-link-row">
+          <div class="guest-link-text">
+            <div class="guest-link-title">Guest link</div>
+            <div class="guest-link-desc">Let someone without NearBeam send you files for the next 24 hours.</div>
+          </div>
+          <button class="secondary-btn" id="btnCreateDropZone" type="button" title="Create a 24-hour guest drop link">
+            <span>Create link</span>
+          </button>
         </div>
 
         <!-- Active Transfer Manager Container (NB-03) -->

@@ -971,8 +971,7 @@ class MainWindow(QMainWindow):
             tid = f"in:{ev.get('session_id')}"
             if etype == "upload_progress":
                 received = int(ev.get("received_bytes") or 0)
-                pct = float(ev.get("percent") or 0)
-                total = int(received * 100 / pct) if pct > 0 else received
+                total = int(ev.get("total_bytes") or 0) or received
                 entry = self.active_transfers.get(tid)
                 now = time.monotonic()
                 if not entry:

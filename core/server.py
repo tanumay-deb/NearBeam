@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 from flask import (
@@ -112,6 +113,25 @@ def get_file_type_category(filename: str, is_dir: bool = False) -> str:
         return "code"
     else:
         return "file"
+
+
+THUMB_PX = 320  # sharp on 3x phone screens for grid tiles, still ~20 KB
+
+
+@lru_cache(maxsize=512)
+def make_thumbnail(path: str, mtime_ns: int, size: int) -> bytes:
+    """Small JPEG of a photo. mtime/size are part of the cache key so edits invalidate it."""
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as im:
+        im.draft("RGB", (THUMB_PX * 2, THUMB_PX * 2))  # JPEGs decode at reduced scale: big photos stay fast
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((THUMB_PX, THUMB_PX))
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=75, optimize=True)
+        return buf.getvalue()
 
 
 class NearBeamServer:
@@ -632,9 +652,12 @@ class NearBeamServer:
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
             offset_raw = request.headers.get("X-Chunk-Offset")
             offset = int(offset_raw) if offset_raw is not None else None
+            size_raw = request.headers.get("X-File-Size")
+            file_size = int(size_raw) if size_raw is not None else None
         except (TypeError, ValueError):
             return jsonify({"error": "Invalid chunk headers"}), 400
-        if chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks or (offset is not None and offset < 0):
+        if (chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks
+                or (offset is not None and offset < 0) or (file_size is not None and file_size < 0)):
             return jsonify({"error": "Invalid chunk headers"}), 400
 
         # Drop any directory parts smuggled into the name; Windows accepts both separators.
@@ -660,35 +683,25 @@ class NearBeamServer:
         if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
             temp_path = legacy_temp
 
+        have = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
         if offset is None:
             # Legacy clients without X-Chunk-Offset: append-only.
             mode = "ab" if chunk_index > 0 else "wb"
+            received = have if chunk_index > 0 else 0
         else:
-            have = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
             if offset > have:
                 return jsonify({"error": "Chunk offset beyond received data", "received_bytes": have}), 409
             mode = "r+b" if have else "wb"
+            received = offset
 
-        buf_size = 8 * 1024 * 1024
-        with open(temp_path, mode, buffering=buf_size) as f:
-            if offset is not None:
-                # A resent chunk overwrites its own range instead of being appended twice.
-                f.seek(offset)
-                f.truncate()
-            stream = request.files["file"].stream if request.files.get("file") else request.stream
-            while True:
-                data = stream.read(buf_size)
-                if not data:
-                    break
-                f.write(data)
+        # Older clients don't send X-File-Size; every chunk but the last is full-size.
+        total_bytes = file_size if file_size is not None else (request.content_length or 0) * total_chunks
+        from_addr = request.remote_addr
 
-        # Broadcast live incoming progress so the host web app (and any
-        # other connected device) can show a bar for large transfers.
-        if total_chunks > 1:
-            try:
-                received_bytes = os.path.getsize(temp_path)
-            except OSError:
-                received_bytes = 0
+        def emit_progress():
+            # Live incoming progress for the desktop Transfers page and the host web app.
+            if total_bytes < 1024 * 1024:
+                return  # tiny files finish before a progress bar would help
             self.broadcast_event({
                 "type": "upload_progress",
                 "session_id": session_id,
@@ -696,10 +709,33 @@ class NearBeamServer:
                 "relative_dir": relative_dir,
                 "chunk_index": chunk_index,
                 "total_chunks": total_chunks,
-                "percent": round(((chunk_index + 1) / total_chunks) * 100, 1),
-                "received_bytes": received_bytes,
-                "from_addr": request.remote_addr,
+                "percent": round(min(received / total_bytes, 1.0) * 100, 1),
+                "received_bytes": received,
+                "total_bytes": total_bytes,
+                "from_addr": from_addr,
             })
+
+        # Small reads so a slow Wi-Fi upload still reports progress every ~0.5 s
+        # instead of once per 50 MB chunk; file writes stay buffered.
+        read_size = 64 * 1024
+        last_emit = time.monotonic()
+        with open(temp_path, mode, buffering=8 * 1024 * 1024) as f:
+            if offset is not None:
+                # A resent chunk overwrites its own range instead of being appended twice.
+                f.seek(offset)
+                f.truncate()
+            stream = request.files["file"].stream if request.files.get("file") else request.stream
+            while True:
+                data = stream.read(read_size)
+                if not data:
+                    break
+                f.write(data)
+                received += len(data)
+                now = time.monotonic()
+                if now - last_emit >= 0.5:
+                    last_emit = now
+                    emit_progress()
+        emit_progress()
 
         if chunk_index < total_chunks - 1:
             return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
@@ -981,6 +1017,29 @@ class NearBeamServer:
 
             mime_type, _ = mimetypes.guess_type(real_target)
             return send_file(real_target, mimetype=mime_type or "application/octet-stream", conditional=True)
+
+        @app.route("/api/safelist/thumb")
+        def api_safelist_thumb():
+            """Small cached JPEG of a shared photo, so browsing big folders doesn't pull full-size images."""
+            folder_id = request.args.get("folder_id", "")
+            subpath = request.args.get("subpath", "")
+            try:
+                real_target = config.resolve_safe_path(folder_id, subpath)
+            except PermissionError:
+                return jsonify({"error": "Access denied"}), 403
+            except Exception as e:
+                return jsonify({"error": str(e)}), 404
+            if not os.path.isfile(real_target) or get_file_type_category(real_target) != "image":
+                return jsonify({"error": "No thumbnail"}), 404
+            try:
+                st = os.stat(real_target)
+                data = make_thumbnail(real_target, st.st_mtime_ns, st.st_size)
+            except Exception:
+                # SVG, HEIC, corrupt files: the page shows the type icon instead.
+                return jsonify({"error": "No thumbnail"}), 404
+            resp = send_file(io.BytesIO(data), mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "private, max-age=86400"
+            return resp
 
         @app.route("/api/safelist/prepare-zip", methods=["POST"])
         def api_safelist_prepare_zip():

@@ -63,9 +63,11 @@ class TestControlPanelSmoke(unittest.TestCase):
     def test_incoming_upload_events_become_rows_then_history(self):
         q = self.win.server_events
         q.put(json.dumps({"type": "upload_progress", "session_id": "abc", "filename": "movie.mp4",
-                          "percent": 40, "received_bytes": 40_000_000, "from_addr": "10.0.0.9"}))
+                          "percent": 40, "received_bytes": 40_000_000, "total_bytes": 100_000_000,
+                          "from_addr": "10.0.0.9"}))
         self.win._drain_server_events()
         self.assertIn("in:abc", self.win.active_transfers)
+        self.assertEqual(self.win.active_transfers["in:abc"]["row"].pct.text(), "40%")
         self.assertEqual(self.win.nav_buttons[1].badge.text(), "1")
         self.win.cfg_record = self.cfg.add_transfer_history({"filename": "movie.mp4", "size": 100_000_000, "peer": "10.0.0.9"})
         q.put(json.dumps({"type": "file_received", "session_id": "abc", "file": {"filename": "movie.mp4"}}))

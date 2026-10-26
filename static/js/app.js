@@ -8,6 +8,8 @@
 let currentFolderId = "";
 let currentSubpath = "";
 let safeItemsCache = [];
+let browseType = "all"; // type chip: all | image | video | document | audio | other
+const browsePrefs = loadBrowsePrefs(); // list/grid + sort, remembered on this device
 let cachedSafeFolders = [];
 let serverInfo = null;
 let meshNodes = [];
@@ -26,6 +28,9 @@ const safeSearchInput = document.getElementById("safeSearchInput");
 const btnDownloadFolderZip = document.getElementById("btnDownloadFolderZip");
 const btnRefreshSafe = document.getElementById("btnRefreshSafe");
 const badgeSafeCount = document.getElementById("badgeSafeCount");
+const browseToolbar = document.getElementById("browseToolbar");
+const typeChips = document.getElementById("typeChips");
+const safeSortSelect = document.getElementById("safeSortSelect");
 
 // Upload DOM Elements
 const dropzone = document.getElementById("dropzone");
@@ -284,6 +289,8 @@ function showAllSafeFolders(pushHistory = true) {
   if (selectSafeFolder) selectSafeFolder.value = "";
   if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
   if (btnSafeBack) btnSafeBack.style.display = "none";
+  if (browseToolbar) browseToolbar.hidden = true;
+  safeFilesContainer.classList.remove("view-list", "view-grid");
 
   breadcrumbBar.innerHTML = `<span class="breadcrumb-item active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>Shared Safe Folders</span>`;
 
@@ -682,7 +689,9 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
     const data = await res.json();
     renderBreadcrumbs(data.breadcrumbs || []);
     safeItemsCache = data.items || [];
-    renderSafeItems(safeItemsCache);
+    browseType = "all";
+    if (browseToolbar) browseToolbar.hidden = false;
+    applyBrowseView();
   } catch (e) {
     renderSafeEmptyState("Error browsing folder: " + e.message);
   }
@@ -720,7 +729,122 @@ function renderBreadcrumbs(crumbs) {
   });
 }
 
-function renderSafeItems(items) {
+// --- Browse view: type chips, sort, list/grid (big folders stay scannable) ---
+
+const TYPE_CHIPS = [
+  ["all", "All"],
+  ["image", "Photos"],
+  ["video", "Videos"],
+  ["document", "Docs"],
+  ["audio", "Audio"],
+  ["other", "Other"],
+];
+
+function loadBrowsePrefs() {
+  try {
+    return {
+      view: localStorage.getItem("nearbeam.browseView") === "grid" ? "grid" : "list",
+      sort: localStorage.getItem("nearbeam.browseSort") === "name" ? "name" : "newest",
+    };
+  } catch (e) {
+    return { view: "list", sort: "newest" };
+  }
+}
+
+function saveBrowsePrefs() {
+  try {
+    localStorage.setItem("nearbeam.browseView", browsePrefs.view);
+    localStorage.setItem("nearbeam.browseSort", browsePrefs.sort);
+  } catch (e) {
+    /* private mode / blocked storage: the choice just isn't remembered */
+  }
+}
+
+function typeGroup(item) {
+  if (item.is_dir) return "folder";
+  return ["image", "video", "document", "audio"].includes(item.category) ? item.category : "other";
+}
+
+function compareBrowseItems(a, b) {
+  if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1; // folders first
+  const byName = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  if (browsePrefs.sort === "newest") {
+    return (b.modified || "").localeCompare(a.modified || "") || byName;
+  }
+  return byName;
+}
+
+function formatModified(stamp) {
+  // "2025-10-24 18:12" -> "24 Oct" (this year) or "24 Oct 2023"
+  const d = new Date((stamp || "").replace(" ", "T"));
+  if (isNaN(d)) return stamp || "";
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: sameYear ? undefined : "numeric" });
+}
+
+function renderTypeChips(counts) {
+  if (!typeChips) return;
+  typeChips.innerHTML = "";
+  TYPE_CHIPS.forEach(([key, label]) => {
+    const n = key === "all" ? safeItemsCache.length : counts[key] || 0;
+    if (key !== "all" && n === 0) return; // only offer types this folder actually has
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "type-chip";
+    chip.setAttribute("aria-pressed", String(browseType === key));
+    chip.innerHTML = `${label} <span class="type-chip-count">${n}</span>`;
+    chip.addEventListener("click", () => {
+      browseType = key;
+      applyBrowseView();
+    });
+    typeChips.appendChild(chip);
+  });
+}
+
+function applyBrowseView() {
+  const query = (safeSearchInput ? safeSearchInput.value : "").toLowerCase().trim();
+  const counts = {};
+  safeItemsCache.forEach((item) => {
+    const g = typeGroup(item);
+    counts[g] = (counts[g] || 0) + 1;
+  });
+  if (browseType !== "all" && !counts[browseType]) browseType = "all";
+  renderTypeChips(counts);
+
+  const items = safeItemsCache
+    .filter((item) => !query || item.name.toLowerCase().includes(query))
+    .filter((item) => browseType === "all" || typeGroup(item) === browseType)
+    .sort(compareBrowseItems);
+
+  safeFilesContainer.classList.toggle("view-grid", browsePrefs.view === "grid");
+  safeFilesContainer.classList.toggle("view-list", browsePrefs.view !== "grid");
+  if (safeSortSelect) safeSortSelect.value = browsePrefs.sort;
+  document.querySelectorAll(".view-btn").forEach((btn) => {
+    btn.setAttribute("aria-pressed", String(btn.dataset.view === browsePrefs.view));
+  });
+  renderSafeItems(items, Boolean(query) || browseType !== "all");
+}
+
+if (safeSortSelect) {
+  safeSortSelect.addEventListener("change", () => {
+    browsePrefs.sort = safeSortSelect.value === "name" ? "name" : "newest";
+    saveBrowsePrefs();
+    applyBrowseView();
+  });
+}
+document.querySelectorAll(".view-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    browsePrefs.view = btn.dataset.view === "grid" ? "grid" : "list";
+    saveBrowsePrefs();
+    applyBrowseView();
+  });
+});
+
+function safeItemUrl(kind, item) {
+  return `/api/safelist/${kind}?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`;
+}
+
+function renderSafeItems(items, filtered = false) {
   safeFilesContainer.innerHTML = "";
 
   // Add Parent Directory item at top if inside a subfolder
@@ -767,8 +891,15 @@ function renderSafeItems(items) {
     safeFilesContainer.appendChild(parentCard);
   }
 
-  if (items.length === 0 && !currentSubpath) {
-    renderSafeEmptyState("This folder is empty");
+  if (items.length === 0) {
+    if (!currentSubpath && !filtered) {
+      renderSafeEmptyState("This folder is empty");
+      return;
+    }
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.innerHTML = `<p>${filtered ? "No files match. Try another type or search." : "This folder is empty"}</p>`;
+    safeFilesContainer.appendChild(empty);
     return;
   }
 
@@ -782,6 +913,16 @@ function renderSafeItems(items) {
     const iconDiv = document.createElement("div");
     iconDiv.className = `file-icon ${item.category || "file"}`;
     iconDiv.innerHTML = categoryIcons[item.category] || categoryIcons.file;
+    if (item.category === "image") {
+      const thumb = document.createElement("img");
+      thumb.className = "file-thumb";
+      thumb.alt = "";
+      thumb.loading = "lazy";
+      thumb.decoding = "async";
+      thumb.src = safeItemUrl("thumb", item);
+      thumb.addEventListener("error", () => thumb.remove()); // HEIC/SVG/corrupt: keep the icon
+      iconDiv.appendChild(thumb);
+    }
 
     const details = document.createElement("div");
     details.className = "file-details";
@@ -793,7 +934,7 @@ function renderSafeItems(items) {
 
     const meta = document.createElement("div");
     meta.className = "file-meta";
-    meta.innerText = item.is_dir ? "Folder" : `${item.formatted_size} • ${item.modified}`;
+    meta.innerText = item.is_dir ? "Folder" : `${item.formatted_size} · ${formatModified(item.modified)}`;
 
     details.appendChild(name);
     details.appendChild(meta);
@@ -817,7 +958,7 @@ function renderSafeItems(items) {
     } else {
       // Preview button for media/documents
       const previewBtn = document.createElement("button");
-      previewBtn.className = "card-action-btn";
+      previewBtn.className = "card-action-btn btn-preview";
       previewBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg><span>Preview</span>`;
       previewBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -827,7 +968,8 @@ function renderSafeItems(items) {
 
       // Download button
       const dlBtn = document.createElement("button");
-      dlBtn.className = "card-action-btn";
+      dlBtn.className = "card-action-btn btn-download";
+      dlBtn.setAttribute("aria-label", `Download ${item.name}`);
       dlBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg><span>Download</span>`;
       dlBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -860,14 +1002,8 @@ function renderSafeEmptyState(msg) {
 
 // Search Filter
 if (safeSearchInput) {
-  safeSearchInput.addEventListener("input", (e) => {
-    const query = e.target.value.toLowerCase().trim();
-    if (!query) {
-      renderSafeItems(safeItemsCache);
-      return;
-    }
-    const filtered = safeItemsCache.filter((item) => item.name.toLowerCase().includes(query));
-    renderSafeItems(filtered);
+  safeSearchInput.addEventListener("input", () => {
+    if (currentFolderId) applyBrowseView(); // the all-folders overview has nothing to filter
   });
 }
 
@@ -1584,6 +1720,7 @@ class TransferManager {
     t.xhr.setRequestHeader("X-Chunk-Index", t.currentChunk.toString());
     t.xhr.setRequestHeader("X-Total-Chunks", t.totalChunks.toString());
     t.xhr.setRequestHeader("X-Chunk-Offset", start.toString());
+    t.xhr.setRequestHeader("X-File-Size", t.file.size.toString());
     if (t.relativeDir) {
       t.xhr.setRequestHeader("X-Relative-Dir", encodeURIComponent(t.relativeDir));
     }

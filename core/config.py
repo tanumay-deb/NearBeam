@@ -5,20 +5,35 @@ Handles Safe List folders, Auto-Save preferences, and settings.
 
 import json
 import os
+import shutil
 import sys
 import threading
 import uuid
 from pathlib import Path
 
 
+def user_config_path() -> Path:
+    """One settings file per user, shared by every build. Installers and updates never touch it."""
+    if sys.platform == "win32" and os.environ.get("APPDATA"):
+        return Path(os.environ["APPDATA"]) / "NearBeam" / "config.json"
+    return Path.home() / ".config" / "nearbeam" / "config.json"
+
+
+def legacy_config_paths() -> list[Path]:
+    """Where versions up to 1.6.0 kept settings: next to the installed exe, or in the source folder."""
+    paths = []
+    if getattr(sys, "frozen", False):
+        paths.append(Path(sys.executable).parent / "config.json")
+    paths.append(Path(__file__).resolve().parent.parent / "config.json")
+    return paths
+
+
 class ConfigManager:
     def __init__(self, config_path=None):
         if config_path is None:
-            if getattr(sys, "frozen", False):
-                base_dir = Path(sys.executable).parent
-            else:
-                base_dir = Path(__file__).resolve().parent.parent
-            self.config_path = base_dir / "config.json"
+            self.config_path = user_config_path()
+            if not self.config_path.exists():
+                self._migrate_legacy()
         else:
             self.config_path = Path(config_path)
 
@@ -40,6 +55,17 @@ class ConfigManager:
 
         self.load()
         self.ensure_save_directory()
+
+    def _migrate_legacy(self):
+        """One-time copy of settings from where older versions kept them (the old file stays as a backup)."""
+        for old in legacy_config_paths():
+            if old.exists():
+                try:
+                    self.config_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(old, self.config_path)
+                except OSError as e:
+                    print(f"Could not copy settings from {old}: {e}")
+                return
 
     def ensure_save_directory(self):
         """Creates the auto-save directory if it does not exist."""
@@ -64,6 +90,7 @@ class ConfigManager:
         try:
             with self._lock:
                 text = json.dumps(self.data, indent=2, ensure_ascii=False)
+                self.config_path.parent.mkdir(parents=True, exist_ok=True)
                 # Write-then-rename so a crash mid-write never leaves a truncated config.
                 tmp_path = f"{self.config_path}.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:

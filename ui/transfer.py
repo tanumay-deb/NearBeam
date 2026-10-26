@@ -95,6 +95,7 @@ class OutgoingTransfer:
                             "X-Chunk-Index": str(idx),
                             "X-Total-Chunks": str(total_chunks),
                             "X-Chunk-Offset": str(offset),
+                            "X-File-Size": str(self.total),
                         },
                         method="POST",
                     )
