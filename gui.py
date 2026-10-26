@@ -5,9 +5,15 @@ Features High-DPI support, scrollable responsive cards, no-wrap buttons,
 and clean visual alignment.
 """
 
+import datetime
+import html
+import json
 import os
+import queue
+import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -28,25 +34,20 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QStyle,
     QSystemTrayIcon,
-    QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -64,9 +65,27 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
-from core.server import NearBeamServer, LandropServer, NearBeamRequestHandler
+from core.server import NearBeamServer, LandropServer, NearBeamRequestHandler, format_size
 from core.shell_integration import is_shell_integration_enabled, set_shell_integration
 from core.version import APP_VERSION, RELEASES_URL, check_for_updates
+from ui import theme
+from ui.pages import ClipboardPage, HomePage, SettingsPage, SharedFoldersPage, TransfersPage
+from ui.transfer import OutgoingTransfer
+from ui.widgets import (
+    DEVICE_ICONS,
+    LiveDot,
+    NavButton,
+    TransferRow,
+    button,
+    clear_layout,
+    device_role,
+    fade_in,
+    icon,
+    icon_button,
+    icon_label,
+    label,
+    repolish,
+)
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -109,6 +128,8 @@ class ActivityBridge(QObject):
     clipboard_received = Signal(str)
     clipboard_image_received = Signal(bytes, str)
     mesh_updated = Signal(str, list)
+    transfer_progress = Signal(str, object, object, float)
+    transfer_done = Signal(str, bool, str)
 
 
 class QRDialog(QDialog):
@@ -263,153 +284,11 @@ class MainWindow(QMainWindow):
     def __init__(self, send_paths: list[str] = None):
         super().__init__()
         self.initial_send_paths = send_paths or []
-        self.setWindowTitle("NearBeam — Transfer files without QR codes, accounts, or cables")
-        self.resize(880, 760)
-        self.setMinimumSize(780, 620)
+        self.setWindowTitle("NearBeam")
+        self.resize(1000, 700)
+        self.setMinimumSize(860, 600)
         self.setAcceptDrops(True)
-
-        # Apply clean, properly-scaled dark theme
-        qss = """
-            QMainWindow, QWidget#contentWidget {
-                background-color: #080c14;
-            }
-            QWidget {
-                color: #f8fafc;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
-            QScrollArea {
-                border: none;
-                background-color: transparent;
-                background: transparent;
-            }
-            QScrollArea > QWidget > QWidget {
-                background-color: transparent;
-                background: transparent;
-            }
-            QFrame.card {
-                background-color: #0f172a;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 12px;
-            }
-            QLabel {
-                background-color: transparent;
-                background: transparent;
-            }
-            QLabel.card-title {
-                background-color: transparent;
-                background: transparent;
-                font-size: 13px;
-                font-weight: 700;
-                color: #38bdf8;
-            }
-            QLabel.card-subtitle {
-                background-color: transparent;
-                background: transparent;
-                font-size: 11px;
-                color: #94a3b8;
-                line-height: 1.3;
-            }
-            QLineEdit {
-                background-color: #131d31;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 7px;
-                color: #f8fafc;
-                padding: 7px 10px;
-                font-size: 12px;
-            }
-            QLineEdit:focus {
-                border: 1px solid #38bdf8;
-            }
-            QPushButton {
-                background-color: #1a263d;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 7px;
-                color: #f8fafc;
-                padding: 7px 14px;
-                font-weight: 600;
-                font-size: 12px;
-                white-space: nowrap;
-            }
-            QPushButton:hover {
-                background-color: #243452;
-                border-color: #38bdf8;
-                color: #ffffff;
-            }
-            QPushButton#primaryBtn {
-                background-color: #0284c7;
-                color: #ffffff;
-                border: none;
-            }
-            QPushButton#primaryBtn:hover {
-                background-color: #0369a1;
-            }
-            QPushButton#dangerBtn {
-                background-color: rgba(239, 68, 68, 0.12);
-                border: 1px solid rgba(239, 68, 68, 0.25);
-                color: #fca5a5;
-            }
-            QPushButton#dangerBtn:hover {
-                background-color: rgba(239, 68, 68, 0.25);
-                border-color: #ef4444;
-                color: #ffffff;
-            }
-            QTableWidget {
-                background-color: #131d31;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 7px;
-                gridline-color: rgba(255, 255, 255, 0.03);
-                selection-background-color: rgba(56, 189, 248, 0.2);
-                selection-color: #ffffff;
-            }
-            QHeaderView::section {
-                background-color: #18233a;
-                color: #94a3b8;
-                border: none;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-                padding: 7px 10px;
-                font-weight: 700;
-                font-size: 11px;
-            }
-            QCheckBox {
-                color: #f8fafc;
-                font-size: 12px;
-                font-weight: 600;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                border: 1.5px solid rgba(255, 255, 255, 0.25);
-                background-color: #131d31;
-            }
-            QCheckBox::indicator:hover {
-                border-color: #38bdf8;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #10b981;
-                border-color: #10b981;
-                image: url("__CHECKMARK_URL__");
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 6px;
-                margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 0.15);
-                min-height: 20px;
-                border-radius: 3px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: rgba(255, 255, 255, 0.25);
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-        """
-        chk_icon = get_resource_path("assets/checkmark.png").as_posix()
-        self.setStyleSheet(qss.replace("__CHECKMARK_URL__", chk_icon))
+        self.setStyleSheet(theme.QSS)
 
         # Setup icon
         self.icon_path = get_resource_path("assets/icon.ico")
@@ -418,476 +297,224 @@ class MainWindow(QMainWindow):
         if self.icon_path.exists():
             self.setWindowIcon(QIcon(str(self.icon_path)))
 
-        # Setup activity bridge
+        # Setup activity bridge (worker threads -> UI thread)
         self.bridge = ActivityBridge()
         self.bridge.new_activity.connect(self._append_log)
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.clipboard_received.connect(self._on_remote_clipboard_received)
         self.bridge.clipboard_image_received.connect(self._on_remote_clipboard_image_received)
         self.bridge.mesh_updated.connect(self._on_mesh_updated)
+        self.bridge.transfer_progress.connect(self._on_transfer_progress)
+        self.bridge.transfer_done.connect(self._on_transfer_done)
         self.current_mesh_nodes = []
+        self.mesh_role = "leader"
+        self._device_signature = None
+
+        # Transfers: id -> {"row": TransferRow, "tx": OutgoingTransfer | None, ...}
+        self.active_transfers = {}
+        self.server_events = queue.Queue()
 
         # Clipboard auto-sync tracking state
         self._suppress_clipboard_echo = False
         self._last_synced_clipboard = ""
         self._last_synced_image_hash = ""
+        self._clip_last = None
         QApplication.clipboard().dataChanged.connect(self._on_local_clipboard_changed)
 
         # Server setup
         self.server_thread = None
         self.server_instance = None
         self.port = config.data.get("port", 5000)
+        self.current_url = f"http://nearbeam.local:{self.port}"
+        self.ip_url = f"http://127.0.0.1:{self.port}"
 
         self._build_ui()
         self._setup_tray()
         self.start_server()
+        self._refresh_history()
 
         # Periodic refresh for connected browser/mobile clients in Nearby Devices
         self.nearby_timer = QTimer(self)
         self.nearby_timer.timeout.connect(self._refresh_nearby_devices_ui)
         self.nearby_timer.start(4000)
 
+        # Incoming transfer progress arrives on the same event stream the web app uses
+        self.events_timer = QTimer(self)
+        self.events_timer.timeout.connect(self._drain_server_events)
+        self.events_timer.start(250)
+
         if self.initial_send_paths:
             QTimer.singleShot(400, lambda: self._handle_shared_paths(self.initial_send_paths, source="Explorer"))
 
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        # Scroll area container to guarantee responsive scaling on any display DPI
-        scroll_area = QScrollArea(self)
-        scroll_area.setWidgetResizable(True)
-        self.setCentralWidget(scroll_area)
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        self.setCentralWidget(root)
 
-        content_widget = QWidget()
-        content_widget.setObjectName("contentWidget")
-        scroll_area.setWidget(content_widget)
+        root_layout.addWidget(self._build_sidebar())
 
-        root_layout = QVBoxLayout(content_widget)
-        root_layout.setContentsMargins(24, 20, 24, 20)
-        root_layout.setSpacing(14)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("pageStack")
+        root_layout.addWidget(self.stack, 1)
 
-        # ==========================================
-        # 0. Modern Top Header Bar (No in-window menu)
-        # ==========================================
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 4)
-        header_layout.setSpacing(10)
-        header_layout.setAlignment(Qt.AlignVCenter)
+        self.home = HomePage()
+        self.transfers_page = TransfersPage()
+        self.shared_page = SharedFoldersPage()
+        self.clipboard_page = ClipboardPage(config.clipboard_sync_enabled)
+        self.settings_page = SettingsPage(
+            config.save_directory,
+            config.auto_save_enabled,
+            config.clipboard_sync_enabled,
+            is_shell_integration_enabled(),
+            is_autostart_enabled(),
+        )
+        for page in (self.home, self.transfers_page, self.shared_page, self.clipboard_page, self.settings_page):
+            self.stack.addWidget(page)
+        self.stack.currentChanged.connect(lambda i: fade_in(self.stack.widget(i), 240, rise=10))
 
-        if self.icon_path.exists():
-            icon_lbl = QLabel()
-            icon_pix = QPixmap(str(self.icon_path)).scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            icon_lbl.setPixmap(icon_pix)
-            header_layout.addWidget(icon_lbl)
+        # Home
+        self.home.drop_zone.files_dropped.connect(lambda paths: self._handle_shared_paths(paths, source="Drop zone"))
+        self.home.btn_send.clicked.connect(self._send_file_to_node_dialog)
+        self.home.btn_received.clicked.connect(self._open_save_folder)
+        self.home.btn_view_all.clicked.connect(lambda: self._go(1))
 
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
+        # Transfers
+        self.log_view = self.transfers_page.log_view
+        self.transfers_page.btn_clear_history.clicked.connect(self._clear_history)
 
-        app_title = QLabel("NearBeam")
-        app_title.setStyleSheet("font-size: 20px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px;")
-        title_col.addWidget(app_title)
+        # Shared folders
+        self.safe_table = self.shared_page.table
+        self.shared_page.btn_add.clicked.connect(self._add_safe_folder)
+        self.shared_page.btn_remove.clicked.connect(self._remove_safe_folder)
 
-        app_desc = QLabel("Transfer files without QR codes, accounts, or cables • Open your PC at nearbeam.local:5000")
-        app_desc.setStyleSheet("font-size: 11px; color: #38bdf8; font-weight: 600;")
-        title_col.addWidget(app_desc)
-        header_layout.addLayout(title_col)
+        # Clipboard (two switches, one setting)
+        self.clipboard_page.copy_clicked.connect(self._copy_last_clipboard)
 
-        header_layout.addStretch()
-
-        self.btn_update = QPushButton(f"✓ v{APP_VERSION} Latest")
-        self.btn_update.setFixedHeight(30)
-        self.btn_update.setStyleSheet("""
-            background-color: rgba(56, 189, 248, 0.12);
-            border: 1px solid rgba(56, 189, 248, 0.3);
-            color: #38bdf8;
-            font-weight: 700;
-            border-radius: 8px;
-            padding: 0px 12px;
-            font-size: 11px;
-        """)
-        self.btn_update.setCursor(Qt.PointingHandCursor)
-        self.btn_update.setToolTip("Click to check for latest updates")
-        self.btn_update.clicked.connect(lambda: self._check_updates_async(manual=True))
-        header_layout.addWidget(self.btn_update)
-
-        self.status_badge = QLabel("● Online on Wi-Fi")
-        self.status_badge.setFixedHeight(30)
-        self.status_badge.setAlignment(Qt.AlignCenter)
-        self.status_badge.setStyleSheet("""
-            background-color: rgba(16, 185, 129, 0.12);
-            border: 1px solid rgba(16, 185, 129, 0.35);
-            color: #34d399;
-            padding: 0px 12px;
-            border-radius: 8px;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        header_layout.addWidget(self.status_badge)
-
-        self.connected_count_badge = QLabel("🌐 1 Node • 0 Devices")
-        self.connected_count_badge.setFixedHeight(30)
-        self.connected_count_badge.setAlignment(Qt.AlignCenter)
-        self.connected_count_badge.setToolTip("Live count of online LAN Host Nodes and connected Browser/Phone Devices")
-        self.connected_count_badge.setStyleSheet("""
-            background-color: rgba(56, 189, 248, 0.12);
-            border: 1px solid rgba(56, 189, 248, 0.35);
-            color: #38bdf8;
-            padding: 0px 12px;
-            border-radius: 8px;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        header_layout.addWidget(self.connected_count_badge)
-
-        btn_header_web = QPushButton("Open Web App")
-        btn_header_web.setObjectName("primaryBtn")
-        btn_header_web.setFixedHeight(30)
-        btn_header_web.setStyleSheet("""
-            background-color: #0284c7;
-            color: #ffffff;
-            border: none;
-            border-radius: 8px;
-            padding: 0px 14px;
-            font-weight: 600;
-            font-size: 12px;
-        """)
-        btn_header_web.setMinimumWidth(115)
-        btn_header_web.clicked.connect(self._open_browser)
-        header_layout.addWidget(btn_header_web)
-
-        root_layout.addLayout(header_layout)
-
-        # ==========================================
-        # 1. Nearby Devices & Quick Actions Dashboard (NB-02 Hero)
-        # ==========================================
-        mesh_card = QFrame()
-        mesh_card.setProperty("class", "card")
-        mesh_layout = QVBoxLayout(mesh_card)
-        mesh_layout.setContentsMargins(18, 15, 18, 15)
-        mesh_layout.setSpacing(10)
-
-        mesh_header_row = QHBoxLayout()
-        mesh_title = QLabel("🌐 Nearby Devices")
-        mesh_title.setProperty("class", "card-title")
-        mesh_header_row.addWidget(mesh_title)
-
-        self.mesh_role_badge = QLabel("🟢 Primary Leader")
-        self.mesh_role_badge.setStyleSheet("""
-            background-color: rgba(16, 185, 129, 0.12);
-            border: 1px solid rgba(16, 185, 129, 0.35);
-            color: #34d399;
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        mesh_header_row.addWidget(self.mesh_role_badge)
-
-        self.nearby_count_badge = QLabel("1 Host Node • 0 Connected Devices")
-        self.nearby_count_badge.setStyleSheet("""
-            background-color: rgba(99, 102, 241, 0.14);
-            border: 1px solid rgba(99, 102, 241, 0.38);
-            color: #a5b4fc;
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        mesh_header_row.addWidget(self.nearby_count_badge)
-        mesh_header_row.addStretch()
-
-        drop_hint_badge = QLabel("✨ Drag & drop files anywhere on this window")
-        drop_hint_badge.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
-        mesh_header_row.addWidget(drop_hint_badge)
-        mesh_layout.addLayout(mesh_header_row)
-
-        self.mesh_nodes_summary = QLabel("Scanning Wi-Fi for nearby computers and connected phones...")
-        self.mesh_nodes_summary.setWordWrap(True)
-        self.mesh_nodes_summary.setStyleSheet("""
-            background-color: #131d31;
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 8px;
-            padding: 10px 12px;
-            color: #e2e8f0;
-            font-size: 12px;
-        """)
-        mesh_layout.addWidget(self.mesh_nodes_summary)
-
-        quick_actions_row = QHBoxLayout()
-        quick_actions_row.setSpacing(8)
-
-        self.btn_send_to_node = QPushButton("📤 Send Files to Device...")
-        self.btn_send_to_node.setObjectName("primaryBtn")
-        self.btn_send_to_node.clicked.connect(self._send_file_to_node_dialog)
-        quick_actions_row.addWidget(self.btn_send_to_node)
-
-        btn_quick_share = QPushButton("📁 Share Folder")
-        btn_quick_share.clicked.connect(self._add_safe_folder)
-        quick_actions_row.addWidget(btn_quick_share)
-
-        btn_quick_received = QPushButton("📥 Open Received Folder")
-        btn_quick_received.clicked.connect(self._open_save_folder)
-        quick_actions_row.addWidget(btn_quick_received)
-
-        quick_actions_row.addStretch()
-        mesh_layout.addLayout(quick_actions_row)
-
-        root_layout.addWidget(mesh_card)
-
-        # ==========================================
-        # 1.5 Connection Address Card (No QR / No IP Hero)
-        # ==========================================
-        conn_card = QFrame()
-        conn_card.setProperty("class", "card")
-        conn_layout = QVBoxLayout(conn_card)
-        conn_layout.setContentsMargins(18, 16, 18, 16)
-        conn_layout.setSpacing(10)
-
-        card_title_row = QHBoxLayout()
-        card_title = QLabel("📡 Open Your PC From Your Phone")
-        card_title.setProperty("class", "card-title")
-        card_title_row.addWidget(card_title)
-
-        perm_badge = QLabel("No QR Codes • No Accounts • No Cables")
-        perm_badge.setStyleSheet("background-color: rgba(56, 189, 248, 0.15); color: #38bdf8; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 8px;")
-        card_title_row.addWidget(perm_badge)
-        card_title_row.addStretch()
-        conn_layout.addLayout(card_title_row)
-
-        card_subtitle = QLabel("Type this permanent address once on your phone or laptop browser — bookmark it forever:")
-        card_subtitle.setProperty("class", "card-subtitle")
-        conn_layout.addWidget(card_subtitle)
-
-        # 3-Mode Selector Row: Permanent vs Hostname vs Direct IP
-        mode_btn_row = QHBoxLayout()
-        mode_btn_row.setSpacing(8)
-
-        self.btn_addr_perm = QPushButton("⭐ Permanent (nearbeam.local)")
-        self.btn_addr_perm.setFixedHeight(28)
-        self.btn_addr_perm.setCursor(Qt.PointingHandCursor)
-        self.btn_addr_perm.clicked.connect(lambda: self._set_addr_mode("perm"))
-        mode_btn_row.addWidget(self.btn_addr_perm)
-
-        self.btn_addr_host = QPushButton("🏷️ Hostname (.local)")
-        self.btn_addr_host.setFixedHeight(28)
-        self.btn_addr_host.setCursor(Qt.PointingHandCursor)
-        self.btn_addr_host.clicked.connect(lambda: self._set_addr_mode("host"))
-        mode_btn_row.addWidget(self.btn_addr_host)
-
-        self.btn_addr_ip = QPushButton("📱 Direct IP")
-        self.btn_addr_ip.setFixedHeight(28)
-        self.btn_addr_ip.setCursor(Qt.PointingHandCursor)
-        self.btn_addr_ip.clicked.connect(lambda: self._set_addr_mode("ip"))
-        mode_btn_row.addWidget(self.btn_addr_ip)
-
-        mode_btn_row.addStretch()
-        conn_layout.addLayout(mode_btn_row)
-
-        # Input + Buttons in a clean, non-wrapping row
-        addr_row = QHBoxLayout()
-        addr_row.setSpacing(8)
-
-        self.url_label = QLineEdit("http://nearbeam.local:5000")
-        self.url_label.setReadOnly(True)
-        self.url_label.setStyleSheet("""
-            background-color: #131d31;
-            border: 1px solid rgba(56, 189, 248, 0.35);
-            border-radius: 7px;
-            color: #38bdf8;
-            font-size: 14px;
-            font-weight: bold;
-            font-family: 'Consolas', 'Courier New', monospace;
-            padding: 7px 10px;
-        """)
-        addr_row.addWidget(self.url_label, 1)
-
-        self.btn_copy_url = QPushButton("Copy Link")
-        self.btn_copy_url.setMinimumWidth(85)
-        self.btn_copy_url.clicked.connect(self._copy_url)
-        addr_row.addWidget(self.btn_copy_url)
-
-        self.btn_open_browser = QPushButton("Open in Browser")
-        self.btn_open_browser.setObjectName("primaryBtn")
-        self.btn_open_browser.setMinimumWidth(125)
-        self.btn_open_browser.clicked.connect(self._open_browser)
-        addr_row.addWidget(self.btn_open_browser)
-
-        self.btn_show_qr = QPushButton("Show QR")
-        self.btn_show_qr.setMinimumWidth(75)
-        self.btn_show_qr.clicked.connect(self._show_qr)
-        addr_row.addWidget(self.btn_show_qr)
-
-        conn_layout.addLayout(addr_row)
-
-        self.ip_subtext = QLabel()
-        self.ip_subtext.setStyleSheet("color: #64748b; font-size: 11px; margin-top: 2px;")
-        conn_layout.addWidget(self.ip_subtext)
-
-        root_layout.addWidget(conn_card)
-
-        # ==========================================
-        # 2. Auto-Save & Windows Shell Settings Card
-        # ==========================================
-        autosave_card = QFrame()
-        autosave_card.setProperty("class", "card")
-        autosave_layout = QVBoxLayout(autosave_card)
-        autosave_layout.setContentsMargins(18, 16, 18, 16)
-        autosave_layout.setSpacing(10)
-
-        autosave_title = QLabel("📥 Auto-Save & Windows Integration")
-        autosave_title.setProperty("class", "card-title")
-        autosave_layout.addWidget(autosave_title)
-
-        options_row = QHBoxLayout()
-        options_row.setSpacing(20)
-
-        self.chk_autosave = QCheckBox("Auto-Save incoming files")
-        self.chk_autosave.setChecked(config.auto_save_enabled)
+        # Settings — existing handlers keep their original attribute names
+        s = self.settings_page
+        self.txt_save_dir = s.txt_save_dir
+        s.btn_change_dir.clicked.connect(self._choose_save_directory)
+        s.btn_open_dir.clicked.connect(self._open_save_folder)
+        self.chk_autosave = s.autosave.switch
         self.chk_autosave.toggled.connect(self._toggle_autosave)
-        options_row.addWidget(self.chk_autosave)
-
-        self.chk_clipboard_sync = QCheckBox("Live clipboard sync")
-        self.chk_clipboard_sync.setChecked(config.clipboard_sync_enabled)
-        self.chk_clipboard_sync.toggled.connect(self._toggle_clipboard_sync)
-        options_row.addWidget(self.chk_clipboard_sync)
-
-        self.chk_shell_menu = QCheckBox("Explorer right-click ('Send with NearBeam')")
-        self.chk_shell_menu.setChecked(is_shell_integration_enabled())
+        self.chk_clipboard_sync = s.clipboard.switch
+        self.chk_clipboard_sync.toggled.connect(lambda on: self._set_clipboard_switches(on))
+        self.clipboard_page.sync_row.switch.toggled.connect(lambda on: self._set_clipboard_switches(on))
+        self.chk_shell_menu = s.shell_menu.switch
         self.chk_shell_menu.toggled.connect(self._toggle_shell_integration)
-        options_row.addWidget(self.chk_shell_menu)
-
-        self.chk_autostart = QCheckBox("Start with Windows")
-        self.chk_autostart.setChecked(is_autostart_enabled())
+        self.chk_autostart = s.autostart.switch
         self.chk_autostart.toggled.connect(self._toggle_autostart)
-        options_row.addWidget(self.chk_autostart)
+        s.btn_firewall.clicked.connect(self._configure_firewall)
 
-        options_row.addStretch()
-        autosave_layout.addLayout(options_row)
-
-        dir_row = QHBoxLayout()
-        dir_row.setSpacing(8)
-
-        dir_lbl = QLabel("Save Folder:")
-        dir_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
-        dir_row.addWidget(dir_lbl)
-
-        self.txt_save_dir = QLineEdit(config.save_directory)
-        self.txt_save_dir.setReadOnly(True)
-        dir_row.addWidget(self.txt_save_dir, 1)
-
-        btn_change_dir = QPushButton("Change Folder")
-        btn_change_dir.setMinimumWidth(110)
-        btn_change_dir.clicked.connect(self._choose_save_directory)
-        dir_row.addWidget(btn_change_dir)
-
-        btn_open_dir = QPushButton("Open in Explorer")
-        btn_open_dir.setMinimumWidth(115)
-        btn_open_dir.clicked.connect(self._open_save_folder)
-        dir_row.addWidget(btn_open_dir)
-
-        autosave_layout.addLayout(dir_row)
-
-        fw_row = QHBoxLayout()
-        fw_row.setSpacing(10)
-
-        fw_lbl = QLabel("🛡️ Windows Firewall:")
-        fw_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
-        fw_row.addWidget(fw_lbl)
-
-        fw_desc = QLabel("Fix repeated 'Allow Python to connect' network pop-ups on this PC")
-        fw_desc.setStyleSheet("color: #64748b; font-size: 11px;")
-        fw_row.addWidget(fw_desc, 1)
-
-        btn_firewall = QPushButton("Allow in Windows Firewall (1-Click)")
-        btn_firewall.setMinimumWidth(210)
-        btn_firewall.clicked.connect(self._configure_firewall)
-        fw_row.addWidget(btn_firewall)
-
-        autosave_layout.addLayout(fw_row)
-        root_layout.addWidget(autosave_card)
-
-        # ==========================================
-        # 3. Safe List (Shared PC Folders) Card
-        # ==========================================
-        safelist_card = QFrame()
-        safelist_card.setProperty("class", "card")
-        safelist_layout = QVBoxLayout(safelist_card)
-        safelist_layout.setContentsMargins(18, 16, 18, 16)
-        safelist_layout.setSpacing(8)
-
-        safelist_title = QLabel("🔒 Safe List Folders (Shared with Wi-Fi)")
-        safelist_title.setProperty("class", "card-title")
-        safelist_layout.addWidget(safelist_title)
-
-        safelist_sub = QLabel("Only folders explicitly added here can be browsed by devices on your Wi-Fi network:")
-        safelist_sub.setProperty("class", "card-subtitle")
-        safelist_layout.addWidget(safelist_sub)
-
-        self.safe_table = QTableWidget(0, 2)
-        self.safe_table.setHorizontalHeaderLabels(["Shared Folder Name", "Path on Computer"])
-        self.safe_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.safe_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.safe_table.horizontalHeader().resizeSection(0, 220)
-        self.safe_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.safe_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.safe_table.setMinimumHeight(130)
-        safelist_layout.addWidget(self.safe_table)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        btn_add_safe = QPushButton("+ Add Folder to Safe List")
-        btn_add_safe.setObjectName("primaryBtn")
-        btn_add_safe.setMinimumWidth(165)
-        btn_add_safe.clicked.connect(self._add_safe_folder)
-        btn_row.addWidget(btn_add_safe)
-
-        btn_remove_safe = QPushButton("Remove Selected Folder")
-        btn_remove_safe.setObjectName("dangerBtn")
-        btn_remove_safe.setMinimumWidth(160)
-        btn_remove_safe.clicked.connect(self._remove_safe_folder)
-        btn_row.addWidget(btn_remove_safe)
-
-        btn_row.addStretch()
-        safelist_layout.addLayout(btn_row)
-
-        root_layout.addWidget(safelist_card)
-
-        # ==========================================
-        # 4. Live Activity Console Card
-        # ==========================================
-        log_card = QFrame()
-        log_card.setProperty("class", "card")
-        log_layout = QVBoxLayout(log_card)
-        log_layout.setContentsMargins(18, 14, 18, 14)
-        log_layout.setSpacing(8)
-
-        log_top = QHBoxLayout()
-        log_title = QLabel("⚡ Live Activity Log")
-        log_title.setProperty("class", "card-title")
-        log_top.addWidget(log_title)
-        log_top.addStretch()
-
-        btn_clear_log = QPushButton("Clear")
-        btn_clear_log.setStyleSheet("padding: 3px 10px; font-size: 11px;")
-        btn_clear_log.clicked.connect(lambda: self.log_view.clear())
-        log_top.addWidget(btn_clear_log)
-        log_layout.addLayout(log_top)
-
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(100)
-        self.log_view.setStyleSheet("""
-            background-color: #0b1120;
-            border: 1px solid rgba(255, 255, 255, 0.07);
-            border-radius: 7px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 11px;
-            padding: 8px 10px;
-        """)
-        log_layout.addWidget(self.log_view)
-
-        root_layout.addWidget(log_card)
-
+        self.nav_buttons[0].setChecked(True)
         self._refresh_safe_table()
+        self.transfers_page.refresh_empty_states()
+
+    def _build_sidebar(self) -> QFrame:
+        side = QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(228)
+        col = QVBoxLayout(side)
+        col.setContentsMargins(14, 18, 14, 16)
+        col.setSpacing(4)
+
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        if self.icon_path.exists():
+            logo = QLabel()
+            logo.setPixmap(QIcon(str(self.icon_path)).pixmap(30, 30))
+            brand.addWidget(logo)
+        name = QLabel("NearBeam")
+        name.setObjectName("brand")
+        brand.addWidget(name)
+        brand.addStretch()
+        col.addLayout(brand)
+        col.addSpacing(18)
+
+        self.nav_buttons = []
+        for i, (text, icon_name) in enumerate([
+            ("Home", "home"),
+            ("Transfers", "transfers"),
+            ("Shared folders", "folder"),
+            ("Clipboard", "clipboard"),
+            ("Settings", "settings"),
+        ]):
+            btn = NavButton(text, icon_name)
+            btn.clicked.connect(lambda _=False, idx=i: self._go(idx))
+            col.addWidget(btn)
+            self.nav_buttons.append(btn)
+        col.addStretch()
+
+        # The one place the phone address lives
+        phone = QFrame()
+        phone.setObjectName("phoneBox")
+        pv = QVBoxLayout(phone)
+        pv.setContentsMargins(12, 12, 12, 12)
+        pv.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(icon_label("phone", theme.ACCENT, 16))
+        head.addWidget(label("Open on your phone"))
+        head.addStretch()
+        pv.addLayout(head)
+        # Always-visible QR (encodes the IP address: it works on every phone, scanning
+        # already means you're on the same Wi-Fi). Click it for the larger dialog.
+        self.btn_show_qr = QPushButton()
+        self.btn_show_qr.setObjectName("qrButton")
+        self.btn_show_qr.setCursor(Qt.PointingHandCursor)
+        self.btn_show_qr.setToolTip("Scan with your phone's camera. Click for a larger code.")
+        self.btn_show_qr.setAccessibleName("Connection QR code")
+        self.btn_show_qr.setIconSize(QSize(112, 112))
+        self.btn_show_qr.setFixedSize(124, 124)
+        self.btn_show_qr.clicked.connect(self._show_qr)
+        pv.addWidget(self.btn_show_qr, 0, Qt.AlignHCenter)
+
+        # Both addresses, always shown
+        self.addr_labels = {}
+        self.addr_copy_buttons = {}
+        for key, tag, tip in (
+            ("name", "Name", "Permanent address. Works on iPhone, iPad, Mac and Windows."),
+            ("ip", "IP", "Direct IP address, for devices that can't open .local names."),
+        ):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            addr = label("", "monoSmall")
+            addr.setProperty("tip", tip)
+            addr.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            addr.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            row.addWidget(addr, 1)
+            copy_btn = icon_button("copy", f"Copy {tag.lower()} address")
+            copy_btn.setFixedSize(26, 26)
+            copy_btn.clicked.connect(lambda _=False, k=key: self._copy_url(k))
+            row.addWidget(copy_btn)
+            pv.addLayout(row)
+            self.addr_labels[key] = addr
+            self.addr_copy_buttons[key] = copy_btn
+        col.addWidget(phone)
+        col.addSpacing(10)
+
+        status = QHBoxLayout()
+        status.setSpacing(4)
+        self.live_dot = LiveDot()
+        status.addWidget(self.live_dot)
+        self.status_label = label("Online on Wi-Fi", "success")
+        status.addWidget(self.status_label)
+        status.addStretch()
+        col.addLayout(status)
+        self.btn_update = button(f"v{APP_VERSION} · Up to date", kind="updateBtn")
+        self.btn_update.setToolTip("Check for updates")
+        self.btn_update.clicked.connect(lambda: self._check_updates_async(manual=True))
+        col.addWidget(self.btn_update)
+        return side
+
+    def _go(self, index: int):
+        self.nav_buttons[index].setChecked(True)
+        self.stack.setCurrentIndex(index)
 
     def _setup_tray(self):
         """Sets up the Windows system tray icon with custom app icon."""
@@ -916,6 +543,9 @@ class MainWindow(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.show()
 
+    # ------------------------------------------------------------------
+    # Server, address, updates
+    # ------------------------------------------------------------------
     def start_server(self):
         try:
             actual_port = find_available_port(self.port)
@@ -939,6 +569,7 @@ class MainWindow(QMainWindow):
             self.server_instance.add_mesh_callback(
                 lambda role, nodes: self.bridge.mesh_updated.emit(role, nodes)
             )
+            self.server_instance.event_subscribers.append(self.server_events)
 
             self.server_thread = ServerThread(self.server_instance.app, "0.0.0.0", actual_port)
             self.server_thread.start()
@@ -949,9 +580,7 @@ class MainWindow(QMainWindow):
             self.active_primary_url = urls["primary_url"]
             self.active_mdns_url = urls["mdns_url"]
 
-            self.btn_addr_host.setText(f"🏷️ {urls['hostname']}.local")
-            self.btn_addr_ip.setText(f"📱 Direct IP ({urls['primary_ip']})")
-            self._set_addr_mode("perm")
+            self._show_addresses()
             self._append_log(f"Server started on port {actual_port}. Permanent address: {urls['nearbeam_url']}.", "info")
 
             # Initialize mesh status display
@@ -960,34 +589,28 @@ class MainWindow(QMainWindow):
                     self.server_instance.mesh.role,
                     self.server_instance.mesh.get_nodes_list(),
                 )
+            else:
+                self._refresh_nearby_devices_ui()
 
             # Check for updates in background
             self._check_updates_async(manual=False)
         except Exception as e:
+            self.live_dot.set_color(theme.DANGER)
+            self.status_label.setText("Server offline")
+            self.status_label.setProperty("role", "warning")
+            repolish(self.status_label)
             QMessageBox.critical(self, "Server Error", f"Failed to start server: {e}")
 
-    def _set_addr_mode(self, mode: str):
-        """Switches displayed URL between Permanent (nearbeam.local), Hostname, and Direct IP."""
-        self.current_addr_mode = mode
-        active_btn = "background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; border-radius: 6px; font-weight: 600; font-size: 11px; padding: 2px 10px;"
-        inactive_btn = "background-color: #131d31; color: #94a3b8; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; font-weight: 500; font-size: 11px; padding: 2px 10px;"
-
-        self.btn_addr_perm.setStyleSheet(active_btn if mode == "perm" else inactive_btn)
-        self.btn_addr_host.setStyleSheet(active_btn if mode == "host" else inactive_btn)
-        self.btn_addr_ip.setStyleSheet(active_btn if mode == "ip" else inactive_btn)
-
-        if mode == "perm":
-            url = getattr(self, "active_nearbeam_url", "http://nearbeam.local:5000")
-            desc = "⭐ Permanent address: Never changes even if router reassigns your IP. Works on iPhone, iPad, Mac & Windows."
-        elif mode == "host":
-            url = getattr(self, "active_mdns_url", "http://nearbeam.local:5000")
-            desc = "🏷️ Hostname address: Permanent local address mapped to your computer name via native Windows mDNS."
-        else:
-            url = getattr(self, "active_primary_url", "http://127.0.0.1:5000")
-            desc = "📱 Direct numeric IP: Use if an older device does not support .local mDNS names."
-
-        self.url_label.setText(url)
-        self.ip_subtext.setText(desc)
+    def _show_addresses(self):
+        """Fills the sidebar's name + IP addresses and the QR code."""
+        self.current_url = getattr(self, "active_nearbeam_url", f"http://nearbeam.local:{self.port}")
+        self.ip_url = getattr(self, "active_primary_url", f"http://127.0.0.1:{self.port}")
+        for key, url in (("name", self.current_url), ("ip", self.ip_url)):
+            self.addr_labels[key].setText(url.replace("http://", ""))
+            self.addr_labels[key].setToolTip(url + "\n" + self.addr_labels[key].property("tip"))
+        qr = QPixmap()
+        if qr.loadFromData(generate_qr_png_bytes(self.ip_url)):
+            self.btn_show_qr.setIcon(QIcon(qr))
 
     def _configure_firewall(self):
         """Allows NearBeam through Windows Firewall with a single click."""
@@ -1030,18 +653,10 @@ class MainWindow(QMainWindow):
     def _on_update_checked(self, res: dict):
         if res.get("update_available"):
             latest = res.get("latest_version")
-            self.btn_update.setText(f"🚀 Update v{latest} Available")
-            self.btn_update.setFixedHeight(30)
-            self.btn_update.setStyleSheet("""
-                background-color: #f59e0b;
-                color: #0b0f19;
-                font-weight: 800;
-                border-radius: 8px;
-                padding: 0px 12px;
-                font-size: 11px;
-                border: 1px solid #fbbf24;
-            """)
-            self.btn_update.setToolTip(f"New update v{latest} available! Click to download on GitHub.")
+            self.btn_update.setText(f"Update to v{latest} available")
+            self.btn_update.setProperty("available", True)
+            repolish(self.btn_update)
+            self.btn_update.setToolTip(f"Open the v{latest} release page on GitHub")
             try:
                 self.btn_update.clicked.disconnect()
             except Exception:
@@ -1058,18 +673,8 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.Yes:
                     webbrowser.open(res.get("release_url", RELEASES_URL))
         else:
-            self.btn_update.setText(f"✓ v{APP_VERSION} Latest")
-            self.btn_update.setFixedHeight(30)
-            self.btn_update.setStyleSheet("""
-                background-color: rgba(56, 189, 248, 0.12);
-                border: 1px solid rgba(56, 189, 248, 0.3);
-                color: #38bdf8;
-                font-weight: 700;
-                border-radius: 8px;
-                padding: 0px 12px;
-                font-size: 11px;
-            """)
-            self.btn_update.setToolTip(f"You are running the latest version (v{APP_VERSION}). Click to re-check.")
+            self.btn_update.setText(f"v{APP_VERSION} · Up to date")
+            self.btn_update.setToolTip("Check for updates")
             if getattr(self, "manual_update_check", False):
                 QMessageBox.information(
                     self,
@@ -1078,145 +683,124 @@ class MainWindow(QMainWindow):
                 )
 
     def _append_log(self, msg: str, event_type: str = "info"):
-        """Thread-safe UI append to Live Activity Log with color formatting."""
+        """Appends to the Activity log on the Transfers page (UI thread only)."""
         if hasattr(self, "log_view") and self.log_view:
-            if event_type == "upload":
-                color = "#34d399"
-            elif event_type == "error":
-                color = "#f87171"
-            elif event_type == "warning":
-                color = "#fbbf24"
-            else:
-                color = "#94a3b8"
-            self.log_view.append(f'<span style="color: {color};">{msg}</span>')
+            color = {"upload": theme.SUCCESS, "error": theme.DANGER, "warning": theme.WARNING}.get(event_type, theme.MUTED)
+            stamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log_view.append(f'<span style="color: {theme.DIM};">{stamp}</span>&nbsp; <span style="color: {color};">{html.escape(msg)}</span>')
             scrollbar = self.log_view.verticalScrollBar()
             if scrollbar:
                 scrollbar.setValue(scrollbar.maximum())
         if "connected from" in msg.lower():
             self._refresh_nearby_devices_ui()
 
-    def _copy_url(self):
-        clipboard = QApplication.clipboard()
-        clipboard.setText(self.url_label.text())
-        self._append_log(f"Copied URL {self.url_label.text()} to clipboard.", "info")
+    def _copy_url(self, key: str = "name"):
+        url = self.current_url if key == "name" else self.ip_url
+        QApplication.clipboard().setText(url)
+        btn = self.addr_copy_buttons[key]
+        btn.setIcon(icon("check", theme.SUCCESS, 16))
+        QTimer.singleShot(1200, lambda: btn.setIcon(icon("copy", theme.MUTED, 16)))
+        self._append_log(f"Copied URL {url} to clipboard.", "info")
 
     def _open_browser(self):
-        webbrowser.open(self.url_label.text())
+        webbrowser.open(self.current_url)
 
     def _show_qr(self):
-        urls = getattr(self, "active_urls", self.url_label.text())
-        dlg = QRDialog(urls, initial_url=self.url_label.text(), parent=self)
+        urls = getattr(self, "active_urls", self.current_url)
+        dlg = QRDialog(urls, initial_url=self.ip_url, parent=self)
         dlg.exec()
 
+    # ------------------------------------------------------------------
+    # Nearby devices
+    # ------------------------------------------------------------------
     def _on_mesh_updated(self, role: str, nodes: list):
         """Updates GUI when mesh role changes or nodes join/leave."""
         self.current_mesh_nodes = nodes or []
-        is_leader = (role == "leader")
-
-        if is_leader:
-            self.mesh_role_badge.setText("🟢 Primary Leader (nearbeam.local)")
-            self.mesh_role_badge.setStyleSheet("""
-                background-color: rgba(16, 185, 129, 0.12);
-                border: 1px solid rgba(16, 185, 129, 0.35);
-                color: #34d399;
-                padding: 3px 10px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: 700;
-            """)
-        else:
-            leader_node = next((n for n in self.current_mesh_nodes if n.get("is_leader")), None)
-            leader_ip = leader_node.get("ip") if leader_node else "Connected"
-            self.mesh_role_badge.setText(f"🔵 Secondary Node (Leader: {leader_ip})")
-            self.mesh_role_badge.setStyleSheet("""
-                background-color: rgba(56, 189, 248, 0.12);
-                border: 1px solid rgba(56, 189, 248, 0.35);
-                color: #38bdf8;
-                padding: 3px 10px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: 700;
-            """)
-
+        self.mesh_role = role
         self._refresh_nearby_devices_ui()
 
-    def _refresh_nearby_devices_ui(self):
-        """Updates the Nearby Devices dashboard with active LAN hosts and connected browser clients."""
-        peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
+    def _nearby_devices(self) -> list[dict]:
         devices = []
-        if hasattr(self, "server_instance") and self.server_instance:
+        if self.server_instance:
             try:
                 devices = self.server_instance.get_nearby_devices()
             except Exception:
                 devices = []
+        if not devices:
+            devices = [{"id": "self", "kind": "host", "name": get_hostname(), "device_type": "desktop", "is_self": True}]
+        # This PC first, then other PCs, then phones/browsers
+        return sorted(devices, key=lambda d: (not d.get("is_self"), d.get("kind") != "host", d.get("name", "")))
 
-        host_devs = [d for d in devices if d.get("kind") == "host"]
-        client_devs = [d for d in devices if d.get("kind") != "host"]
-
-        host_count = max(1, len(host_devs), len(getattr(self, "current_mesh_nodes", [])))
-        client_count = len(client_devs)
-        peer_hosts_count = max(0, host_count - 1)
-        total_connected_remotes = peer_hosts_count + client_count
-
-        node_word = "Node" if host_count == 1 else "Nodes"
-        dev_word = "Device" if client_count == 1 else "Devices"
-
-        if hasattr(self, "connected_count_badge") and self.connected_count_badge:
-            self.connected_count_badge.setText(f"🌐 {host_count} {node_word} • {client_count} {dev_word}")
-            self.connected_count_badge.setToolTip(
-                f"Active on Wi-Fi: {host_count} Host {node_word} (1 This PC + {peer_hosts_count} Peer PC) and {client_count} Browser/Phone {dev_word}"
-            )
-
-        if hasattr(self, "nearby_count_badge") and self.nearby_count_badge:
-            if total_connected_remotes > 0:
-                self.nearby_count_badge.setText(
-                    f"🟢 {host_count} Host {node_word} • {client_count} Connected {dev_word} ({host_count + client_count} Total)"
-                )
-            else:
-                self.nearby_count_badge.setText(f"{host_count} Host {node_word} • 0 Connected Devices")
-
+    def _refresh_nearby_devices_ui(self):
+        """Rebuilds the device cards when the set of nearby devices changes."""
+        if not hasattr(self, "home"):
+            return
+        devices = self._nearby_devices()
+        others = [d for d in devices if not d.get("is_self")]
+        role = "Primary host" if self.mesh_role == "leader" else "Joined another host"
+        count = len(others)
+        detail = f"{role}  ·  {count} other device{'s' if count != 1 else ''} online"
+        self.home.set_status(get_hostname(), detail)
         if hasattr(self, "tray_icon") and self.tray_icon:
-            self.tray_icon.setToolTip(
-                f"NearBeam v{APP_VERSION} — {host_count} {node_word}, {client_count} {dev_word} Connected"
-            )
+            self.tray_icon.setToolTip(f"NearBeam v{APP_VERSION} — {count} device{'s' if count != 1 else ''} online")
 
-        if devices:
-            parts = []
-            for dev in devices:
-                dtype = dev.get("device_type", "laptop")
-                icon = "📱" if dtype == "phone" else ("📲" if dtype == "tablet" else ("🖥️" if dtype == "desktop" else "💻"))
-                name = dev.get("name", "Device")
-                status = dev.get("status", "Online")
-                conn = dev.get("connection", "LAN")
-                parts.append(f"{icon} {name} ({status} • {conn})")
-            self.mesh_nodes_summary.setText("   •   ".join(parts))
-        elif peers:
-            peer_descs = [f"💻 {p.get('name', 'Peer')} ({p.get('ip')})" for p in peers]
-            self.mesh_nodes_summary.setText(f"Active Cluster ({len(self.current_mesh_nodes)} Hosts Online):  " + "  •  ".join(peer_descs))
-        else:
-            self.mesh_nodes_summary.setText(
-                f"💻 {get_hostname()} (Online • Wi-Fi / LAN)  •  Open nearbeam.local:{self.port} on your phone or drop files here"
-            )
+        signature = tuple((d.get("id"), d.get("name"), d.get("kind")) for d in devices)
+        if signature == self._device_signature:
+            return
+        self._device_signature = signature
+        self.home.set_devices(devices, self._send_to_device, self._pick_and_send_to_device)
 
-        if peers:
-            self.btn_send_to_node.setText(f"📤 Send Files to Peer ({len(peers)} Online)...")
+    def _pick_and_send_to_device(self, device: dict):
+        file_paths, _ = QFileDialog.getOpenFileNames(self, f"Send files to {device.get('name')}", "", "All Files (*.*)")
+        if file_paths:
+            self._send_to_device(device, file_paths)
+
+    def _send_to_device(self, device: dict, paths: list[str]):
+        """A PC gets the files pushed to it; a phone or browser gets them shared to download."""
+        if device.get("kind") == "host" and not device.get("is_self"):
+            files = [p for p in paths if os.path.isfile(p)]
+            skipped = len(paths) - len(files)
+            if skipped:
+                self._append_log(f"Skipped {skipped} folder(s): only files can be sent straight to another PC.", "warning")
+            if files:
+                self._start_outgoing(f"{device['url']}/api/upload", device.get("name", "PC"), files)
+                self._go(1)
         else:
-            self.btn_send_to_node.setText("📤 Stage / Share Files...")
-        self.btn_send_to_node.setEnabled(True)
+            self._handle_shared_paths(paths, source=f"Shared for {device.get('name', 'device')}", send_to_peers=False)
+
+    def _choose_target(self, anchor) -> dict | None:
+        """Menu of where files can go: each other PC by name, or shared for phones/browsers."""
+        pcs = [d for d in self._nearby_devices() if d.get("kind") == "host" and not d.get("is_self")]
+        share = {"kind": "share", "name": "phones and browsers"}
+        if not pcs:
+            return share
+        menu = QMenu(self)
+        chosen = [None]
+        for d in pcs:
+            role, _ = device_role(d)
+            act = menu.addAction(icon(DEVICE_ICONS.get(d.get("device_type"), "laptop"), theme.ACCENT, 16), f"Send to {d.get('name')}  ·  {role}")
+            act.triggered.connect(lambda _=False, dev=d: chosen.__setitem__(0, dev))
+        menu.addSeparator()
+        act = menu.addAction(icon("phone", theme.SUCCESS, 16), "Share with phones and browsers")
+        act.triggered.connect(lambda _=False: chosen.__setitem__(0, share))
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        return chosen[0]
 
     def _send_file_to_node_dialog(self):
-        """Allows 1-click file sending to a peer computer or staging for connected mobile devices."""
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select File(s) to Send or Share via NearBeam",
-            "",
-            "All Files (*.*)",
-        )
+        """Pick a destination first, then the files."""
+        target = self._choose_target(self.home.btn_send)
+        if target is None:
+            return
+        title = "Choose files to share" if target["kind"] == "share" else f"Send files to {target.get('name')}"
+        file_paths, _ = QFileDialog.getOpenFileNames(self, title, "", "All Files (*.*)")
         if not file_paths:
             return
-        self._handle_shared_paths(file_paths, source="Send button")
+        if target["kind"] == "share":
+            self._handle_shared_paths(file_paths, source="Send button", send_to_peers=False)
+        else:
+            self._send_to_device(target, file_paths)
 
-    def _handle_shared_paths(self, paths: list[str], source: str = "Drag & Drop"):
+    def _handle_shared_paths(self, paths: list[str], source: str = "Drag & Drop", send_to_peers: bool = True):
         """Stages dropped/shared files & folders in Safe List and optionally beams to online peer computers."""
         valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
         if not valid_paths:
@@ -1241,31 +825,25 @@ class MainWindow(QMainWindow):
                 "message": f"Shared via {source}: {', '.join(added_items)}",
             })
 
-        self._append_log(
-            f"✓ Shared {len(valid_paths)} item(s) via {source}: {', '.join(added_items)}",
-            "upload",
-        )
+        self._append_log(f"Shared {len(valid_paths)} item(s) via {source}: {', '.join(added_items)}", "upload")
+        if hasattr(self, "tray_icon") and self.tray_icon and not send_to_peers:
+            self.tray_icon.showMessage("Ready on your phone", f"{len(valid_paths)} item(s) are now in Shared folders.", QSystemTrayIcon.Information, 2500)
 
         # If a peer NearBeam computer is online and files were selected, offer/send directly
         peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
-        if peers and file_only_paths:
+        if send_to_peers and peers and file_only_paths:
             target_node = peers[0]
             if len(peers) > 1:
                 menu = QMenu(self)
                 selected_box = [None]
                 for p in peers:
-                    action = menu.addAction(f"💻 Send to {p['name']} ({p['ip']})")
+                    action = menu.addAction(icon("laptop", theme.ACCENT, 16), f"Send to {p['name']}  ·  {'Host' if p.get('is_leader') else 'Peer PC'}  ({p['ip']})")
                     action.triggered.connect(lambda checked=False, node=p: selected_box.__setitem__(0, node))
                 menu.exec(self.mapToGlobal(self.rect().center()))
-                if selected_box[0]:
-                    target_node = selected_box[0]
-            target_url = f"{target_node['url']}/api/upload"
-            t = threading.Thread(
-                target=self._send_files_async,
-                args=(target_url, target_node["name"], file_only_paths),
-                daemon=True,
-            )
-            t.start()
+                if not selected_box[0]:
+                    return
+                target_node = selected_box[0]
+            self._start_outgoing(f"{target_node['url']}/api/upload", target_node["name"], file_only_paths)
 
     def dragEnterEvent(self, event):
         """Accept files and folders dragged anywhere onto the NearBeam desktop window (NB-04)."""
@@ -1287,51 +865,202 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
             self._handle_shared_paths(dropped_paths, source="Window Drag & Drop")
 
-    def _send_files_async(self, upload_url: str, target_name: str, file_paths: list[str]):
-        """Streams files directly to peer computer in 16 MB chunks over HTTP/1.1 with O(1) memory."""
-        import urllib.parse
-        import urllib.request
-        import uuid
+    # ------------------------------------------------------------------
+    # Transfers
+    # ------------------------------------------------------------------
+    def _start_outgoing(self, upload_url: str, target_name: str, file_paths: list[str]):
+        """Queues files to a peer PC; they're sent one after another on a worker thread."""
+        batch = []
+        for fp in file_paths:
+            tx = OutgoingTransfer(
+                upload_url,
+                target_name,
+                fp,
+            )
+            tid = tx.id
+            tx.on_progress = lambda sent, total, bps, tid=tid: self.bridge.transfer_progress.emit(tid, sent, total, bps)
+            tx.on_done = lambda ok, msg, tid=tid: self.bridge.transfer_done.emit(tid, ok, msg)
+            row = TransferRow(tx.filename, "sent", target_name, tx.total, controls=True)
+            row.set_queued()
+            row.pause_toggled.connect(lambda paused, t=tx: t.pause() if paused else t.resume())
+            row.cancel_clicked.connect(tx.cancel)
+            self._add_active_row(tid, row, tx=tx)
+            batch.append(tx)
+        self._append_log(f"Sending {len(batch)} file(s) to {target_name}...", "info")
+        threading.Thread(target=lambda: [tx.run() for tx in batch], daemon=True).start()
 
-        chunk_url = upload_url.rstrip("/") + "/chunk" if not upload_url.endswith("/chunk") else upload_url
-        chunk_size = 16 * 1024 * 1024  # 16 MB streaming chunks
-        self._append_log(f"Sending {len(file_paths)} file(s) directly to {target_name}...", "info")
+    def _add_active_row(self, tid: str, row, tx=None, **extra):
+        self.transfers_page.active_box.addWidget(row)
+        fade_in(row, 200)
+        self.active_transfers[tid] = {"row": row, "tx": tx, **extra}
+        self._update_transfer_badge()
 
-        try:
-            for fp in file_paths:
-                fname = os.path.basename(fp)
-                fsize = os.path.getsize(fp)
-                total_chunks = max(1, (fsize + chunk_size - 1) // chunk_size)
-                session_id = f"desk_{uuid.uuid4().hex[:12]}"
+    def _remove_active_row(self, tid: str):
+        entry = self.active_transfers.pop(tid, None)
+        if entry:
+            self.transfers_page.active_box.removeWidget(entry["row"])
+            entry["row"].deleteLater()
+        self._update_transfer_badge()
 
-                with open(fp, "rb", buffering=chunk_size) as f:
-                    for idx in range(total_chunks):
-                        data = f.read(chunk_size)
-                        req = urllib.request.Request(
-                            chunk_url,
-                            data=data,
-                            headers={
-                                "Content-Type": "application/octet-stream",
-                                "X-Session-Id": session_id,
-                                "X-Filename": urllib.parse.quote(fname),
-                                "X-Chunk-Index": str(idx),
-                                "X-Total-Chunks": str(total_chunks),
-                                "X-Chunk-Offset": str(idx * chunk_size),
-                            },
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(req, timeout=60.0) as resp:
-                            if resp.status != 200:
-                                raise RuntimeError(f"HTTP status {resp.status}")
+    def _update_transfer_badge(self):
+        self.nav_buttons[1].set_badge(len(self.active_transfers))
+        self.transfers_page.refresh_empty_states()
 
-            self._append_log(f"✓ Successfully sent {len(file_paths)} file(s) to {target_name}!", "upload")
-        except Exception as e:
-            self._append_log(f"Failed sending files to {target_name}: {e}", "error")
+    def _on_transfer_progress(self, tid: str, sent, total, bps: float):
+        entry = self.active_transfers.get(tid)
+        if entry:
+            entry["row"].set_progress(int(sent), int(total), bps)
 
+    def _on_transfer_done(self, tid: str, ok: bool, msg: str):
+        entry = self.active_transfers.get(tid)
+        if not entry:
+            return
+        tx, row = entry["tx"], entry["row"]
+        status = "completed" if ok else ("cancelled" if msg == "Cancelled" else "failed")
+        row.set_finished(ok, "Sent" if ok else msg)
+        config.add_transfer_history({
+            "filename": tx.filename,
+            "size": tx.total,
+            "formatted_size": format_size(tx.total),
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": "sent",
+            "peer": tx.target_name,
+            "status": status,
+        })
+        if ok:
+            self._append_log(f"Sent '{tx.filename}' to {tx.target_name}.", "upload")
+        elif status == "failed":
+            self._append_log(f"Failed sending '{tx.filename}' to {tx.target_name}: {msg}", "error")
+        QTimer.singleShot(1500 if ok else 3000, lambda: (self._remove_active_row(tid), self._refresh_history()))
+
+    def _peer_name(self, ip: str) -> str:
+        for d in self._nearby_devices():
+            if d.get("ip") == ip:
+                return d.get("name") or ip
+        return ip or "a device"
+
+    def _drain_server_events(self):
+        """Turns the server's live upload events into incoming transfer rows."""
+        changed_history = False
+        while True:
+            try:
+                payload = self.server_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                ev = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            etype = ev.get("type")
+            tid = f"in:{ev.get('session_id')}"
+            if etype == "upload_progress":
+                received = int(ev.get("received_bytes") or 0)
+                pct = float(ev.get("percent") or 0)
+                total = int(received * 100 / pct) if pct > 0 else received
+                entry = self.active_transfers.get(tid)
+                now = time.monotonic()
+                if not entry:
+                    row = TransferRow(ev.get("filename", "file"), "received", self._peer_name(ev.get("from_addr", "")), total)
+                    self._add_active_row(tid, row, last=(now, received))
+                    row.set_progress(received, total, 0)
+                    continue
+                last_t, last_b = entry.get("last", (now, received))
+                bps = (received - last_b) / (now - last_t) if now > last_t else 0
+                entry["last"] = (now, received)
+                entry["row"].set_progress(received, total, max(bps, 0))
+            elif etype == "file_received":
+                entry = self.active_transfers.get(tid)
+                if entry:
+                    entry["row"].set_finished(True, "Received")
+                    QTimer.singleShot(1500, lambda t=tid: self._remove_active_row(t))
+                changed_history = True
+            elif etype == "upload_cancelled":
+                self._remove_active_row(tid)
+            elif etype == "download_progress":
+                # A phone/browser pulling a shared file from this PC
+                did = ev.get("download_id")
+                sent, total = int(ev.get("sent") or 0), int(ev.get("total") or 0)
+                now = time.monotonic()
+                entry = self.active_transfers.get(did)
+                if not entry:
+                    row = TransferRow(ev.get("filename", "file"), "sent", self._peer_name(ev.get("to_addr", "")), total)
+                    self._add_active_row(did, row, last=(now, sent))
+                    row.set_progress(sent, total, 0)
+                    continue
+                last_t, last_b = entry.get("last", (now, sent))
+                bps = (sent - last_b) / (now - last_t) if now > last_t and sent >= last_b else 0
+                entry["last"] = (now, sent)
+                entry["row"].set_progress(sent, total, bps)
+            elif etype == "download_finished":
+                did = ev.get("download_id")
+                entry = self.active_transfers.get(did)
+                if ev.get("completed"):
+                    if entry:
+                        entry["row"].set_finished(True, "Downloaded")
+                        QTimer.singleShot(1500, lambda t=did: self._remove_active_row(t))
+                    changed_history = True
+                elif entry:
+                    # Video players stream in ranges; a stopped range isn't a failure.
+                    if ev.get("partial_range"):
+                        self._remove_active_row(did)
+                    else:
+                        entry["row"].set_finished(False, "Stopped")
+                        QTimer.singleShot(3000, lambda t=did: self._remove_active_row(t))
+        if changed_history:
+            self._refresh_history()
+
+    def _history_row(self, rec: dict):
+        direction = "sent" if rec.get("direction") == "sent" else "received"
+        row = TransferRow(rec.get("filename", "file"), direction, rec.get("peer", ""), int(rec.get("size") or 0), openable=direction == "received")
+        status = rec.get("status", "completed")
+        when = (rec.get("timestamp") or "")[5:16].replace("-", "/")
+        row.set_finished(status == "completed", when if status == "completed" else f"{status.capitalize()} · {when}")
+        row.bar.hide()
+        row.pct.hide()
+        row.open_clicked.connect(lambda name=rec.get("filename", ""): self._reveal_received(name))
+        return row
+
+    def _refresh_history(self):
+        history = config.get_transfer_history()
+        clear_layout(self.transfers_page.history_box)
+        for rec in history[:50]:
+            self.transfers_page.history_box.addWidget(self._history_row(rec))
+        clear_layout(self.home.recent_box)
+        for rec in history[:3]:
+            self.home.recent_box.addWidget(self._history_row(rec))
+        if not history:
+            self.home.recent_box.addWidget(label("Nothing yet. Drop files above to get started.", "dim"))
+        self.transfers_page.refresh_empty_states()
+
+    def _clear_history(self):
+        config.clear_transfer_history()
+        self._refresh_history()
+
+    def _reveal_received(self, filename: str):
+        path = os.path.join(config.save_directory, filename)
+        if filename and os.path.exists(path):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            self._open_save_folder()
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
     def _toggle_autosave(self, checked: bool):
         config.set_auto_save(checked)
         state_str = "ENABLED" if checked else "DISABLED"
         self._append_log(f"Auto-Save setting updated: {state_str}", "info")
+
+    def _set_clipboard_switches(self, on: bool):
+        """Keeps the Settings and Clipboard page switches in step."""
+        for sw in (self.chk_clipboard_sync, self.clipboard_page.sync_row.switch):
+            if sw.isChecked() != on:
+                sw.blockSignals(True)
+                sw.setChecked(on)
+                sw._animate(on)
+                sw.blockSignals(False)
+        if config.clipboard_sync_enabled != on:
+            self._toggle_clipboard_sync(on)
 
     def _toggle_clipboard_sync(self, checked: bool):
         config.set_clipboard_sync(checked)
@@ -1340,6 +1069,32 @@ class MainWindow(QMainWindow):
         if checked:
             self._on_local_clipboard_changed()
 
+    # ------------------------------------------------------------------
+    # Clipboard
+    # ------------------------------------------------------------------
+    def _show_clip(self, kind: str, value, source: str):
+        stamp = datetime.datetime.now().strftime("%H:%M")
+        meta = f"{source}  ·  {stamp}"
+        self._clip_last = (kind, value)
+        if kind == "text":
+            self.clipboard_page.show_text(value, meta)
+        else:
+            self.clipboard_page.show_image(QPixmap.fromImage(value), meta)
+
+    def _copy_last_clipboard(self):
+        if not self._clip_last:
+            return
+        kind, value = self._clip_last
+        self._suppress_clipboard_echo = True
+        try:
+            if kind == "text":
+                QApplication.clipboard().setText(value)
+            else:
+                QApplication.clipboard().setImage(value)
+        finally:
+            self._suppress_clipboard_echo = False
+        self.clipboard_page.btn_copy.setText("Copied")
+        QTimer.singleShot(1200, lambda: self.clipboard_page.btn_copy.setText("Copy text" if kind == "text" else "Copy image"))
     def _on_local_clipboard_changed(self):
         """Called whenever text or a screenshot/image is copied anywhere on Windows (Ctrl+C / Win+Shift+S)."""
         if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
@@ -1378,6 +1133,7 @@ class MainWindow(QMainWindow):
                                     f"Auto-synced Windows screenshot/image ({kb:.1f} KB) to shared clipboard",
                                     "upload",
                                 )
+                                self._show_clip("image", qimg, "From this PC")
                 return
 
             # 2. Check for copied text
@@ -1396,6 +1152,7 @@ class MainWindow(QMainWindow):
                         self.server_instance.mesh.broadcast_clipboard_mesh(text)
                     snippet = (text[:30] + "...") if len(text) > 30 else text
                     self._append_log(f"Auto-synced Windows clipboard to network: '{snippet}'", "info")
+                    self._show_clip("text", text, "From this PC")
         except Exception as e:
             print(f"Error in _on_local_clipboard_changed: {e}")
 
@@ -1413,6 +1170,7 @@ class MainWindow(QMainWindow):
             self._suppress_clipboard_echo = False
             snippet = (text[:30] + "...") if len(text) > 30 else text
             self._append_log(f"Received and copied mobile clipboard to Windows: '{snippet}'", "info")
+            self._show_clip("text", text, "From another device")
         except Exception as e:
             self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_received: {e}")
@@ -1440,9 +1198,10 @@ class MainWindow(QMainWindow):
             self._suppress_clipboard_echo = False
             kb = len(img_bytes) / 1024.0
             self._append_log(
-                f"✓ Copied incoming image ({kb:.1f} KB) directly to Windows clipboard (Ready to Ctrl+V!)",
+                f"Copied incoming image ({kb:.1f} KB) to the Windows clipboard",
                 "upload",
             )
+            self._show_clip("image", qimg, "From another device")
         except Exception as e:
             self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_image_received: {e}")
@@ -1488,8 +1247,7 @@ class MainWindow(QMainWindow):
         self.safe_table.setRowCount(len(folders))
         for row, folder in enumerate(folders):
             p = folder.get("path", "")
-            prefix = "📄" if (p and os.path.isfile(p)) else "📁"
-            name_item = QTableWidgetItem(f"{prefix}  {folder.get('name', 'Unnamed')}")
+            name_item = QTableWidgetItem(icon("file" if (p and os.path.isfile(p)) else "folder", theme.ACCENT, 16), folder.get("name", "Unnamed"))
             path_item = QTableWidgetItem(p)
             name_item.setFlags(name_item.flags() ^ Qt.ItemIsEditable)
             path_item.setFlags(path_item.flags() ^ Qt.ItemIsEditable)

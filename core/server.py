@@ -560,6 +560,64 @@ class NearBeamServer:
                 if q in self.event_subscribers:
                     self.event_subscribers.remove(q)
 
+    def _track_download(self, resp, filename: str):
+        """Wraps a file response so the desktop app can show phone/browser downloads
+        with live progress. Small files and non-file responses pass through untouched."""
+        total = resp.content_length
+        if resp.status_code not in (200, 206) or not total or total < 1024 * 1024:
+            return resp
+        full_file = resp.status_code == 200
+        addr = request.remote_addr or ""
+        peer = self.connected_clients.get(addr, {}).get("name") or addr or "a device"
+        download_id = f"dl:{addr}:{filename}"
+        inner = resp.response
+        server = self
+
+        def stream():
+            sent = 0
+            last_emit = 0.0
+            try:
+                for chunk in inner:
+                    sent += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.4:
+                        last_emit = now
+                        server.broadcast_event({
+                            "type": "download_progress",
+                            "download_id": download_id,
+                            "filename": filename,
+                            "sent": sent,
+                            "total": total,
+                            "to_addr": addr,
+                        })
+                    yield chunk
+            finally:
+                if hasattr(inner, "close"):
+                    inner.close()
+                completed = full_file and sent >= total
+                server.broadcast_event({
+                    "type": "download_finished",
+                    "download_id": download_id,
+                    "filename": filename,
+                    "completed": completed,
+                    "partial_range": not full_file,
+                    "to_addr": addr,
+                })
+                if completed:
+                    config.add_transfer_history({
+                        "filename": filename,
+                        "size": total,
+                        "formatted_size": format_size(total),
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "direction": "sent",
+                        "peer": peer,
+                        "status": "completed",
+                        "category": get_file_type_category(filename),
+                    })
+
+        resp.response = stream()
+        return resp
+
     def _receive_chunk(self, save_dir: str, peer: str, log_template: str):
         """Shared chunk receiver for host uploads and guest drops."""
         from urllib.parse import unquote
@@ -901,7 +959,9 @@ class NearBeamServer:
 
             filename = os.path.basename(real_target)
             self.log_activity(f"File downloaded: {filename} from {request.remote_addr}")
-            return send_file(real_target, as_attachment=True, download_name=filename, conditional=True)
+            return self._track_download(
+                send_file(real_target, as_attachment=True, download_name=filename, conditional=True), filename
+            )
 
         @app.route("/api/safelist/preview")
         def api_safelist_preview():
@@ -1062,11 +1122,14 @@ class NearBeamServer:
 
             threading.Thread(target=delayed_cleanup, daemon=True).start()
 
-            return send_file(
-                temp_path,
-                mimetype="application/zip",
-                as_attachment=True,
-                download_name=f"{folder_name}.zip",
+            return self._track_download(
+                send_file(
+                    temp_path,
+                    mimetype="application/zip",
+                    as_attachment=True,
+                    download_name=f"{folder_name}.zip",
+                ),
+                f"{folder_name}.zip",
             )
 
         @app.route("/api/safelist/download-zip")
@@ -1400,7 +1463,9 @@ class NearBeamServer:
             target = os.path.join(save_dir, safe_name)
             if not os.path.isfile(target):
                 return jsonify({"error": "File not found"}), 404
-            return send_file(target, as_attachment=True, download_name=safe_name, conditional=True)
+            return self._track_download(
+                send_file(target, as_attachment=True, download_name=safe_name, conditional=True), safe_name
+            )
 
         @app.route("/api/received/preview/<filename>")
         def api_received_preview(filename: str):
