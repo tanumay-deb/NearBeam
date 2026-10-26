@@ -70,7 +70,7 @@ irm https://raw.githubusercontent.com/tanumay-deb/NearBeam/main/install.ps1 | ie
 ---
 
 ### Option 2: Windows Setup Installer (`.exe`)
-Download **`NearBeam-v1.6.0-Setup.exe`** from the [GitHub Releases](https://github.com/tanumay-deb/NearBeam/releases) page. Run the installer to get:
+Download **`NearBeam-v1.6.1-Setup.exe`** from the [GitHub Releases](https://github.com/tanumay-deb/NearBeam/releases) page. Run the installer to get:
 - Start Menu & Desktop shortcuts
 - Optional background startup on Windows login
 - Automatic Windows Firewall configuration

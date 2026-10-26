@@ -2,7 +2,7 @@
 ; Bundles NearBeam into a professional Windows Setup Installer
 
 #define MyAppName "NearBeam"
-#define MyAppVersion "1.6.0"
+#define MyAppVersion "1.6.1"
 #define MyAppPublisher "Tanumay Goswami"
 #define MyAppURL "https://github.com/tanumay-deb/NearBeam"
 #define MyAppExeName "NearBeam.exe"
