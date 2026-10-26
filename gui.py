@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_tray()
+        self._style_title_bar()
         self.start_server()
         self._refresh_history()
 
@@ -511,6 +512,21 @@ class MainWindow(QMainWindow):
         self.btn_update.clicked.connect(lambda: self._check_updates_async(manual=True))
         col.addWidget(self.btn_update)
         return side
+
+    def _style_title_bar(self):
+        """Dark native title bar tinted to the sidebar (Windows 11; older Windows ignores it)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            dwm = ctypes.windll.dwmapi
+            dark = ctypes.c_int(1)
+            dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))  # DWMWA_USE_IMMERSIVE_DARK_MODE
+            caption = ctypes.c_int(0x003B1D12)  # COLORREF 0x00BBGGRR of #121d3b
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))  # DWMWA_CAPTION_COLOR
+        except Exception:
+            pass
 
     def _go(self, index: int):
         self.nav_buttons[index].setChecked(True)

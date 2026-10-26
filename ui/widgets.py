@@ -388,8 +388,11 @@ class DeviceCard(_DropMixin, QFrame):
             self.setProperty("host", True)
         text = QVBoxLayout()
         text.setSpacing(3)
-        name = label(device.get("name", "Device"))
-        name.setToolTip(device.get("name", ""))
+        name_text = device.get("name", "Device")
+        if device.get("is_self"):
+            name_text = name_text.removesuffix(" (This PC)")  # mesh adds it; the card shows its own tag
+        name = label(name_text)
+        name.setToolTip(name_text)
         name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         text.addWidget(name)
         tags = QHBoxLayout()
