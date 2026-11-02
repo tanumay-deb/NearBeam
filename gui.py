@@ -6,6 +6,7 @@ and clean visual alignment.
 """
 
 import datetime
+import getpass
 import html
 import json
 import os
@@ -22,6 +23,7 @@ os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -528,6 +530,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_other_instance(self, msg: dict):
+        """A second launch (Start menu, desktop icon, Explorer "Send with") reached this window."""
+        paths = [p for p in msg.get("paths") or [] if isinstance(p, str)]
+        if paths:
+            self._handle_shared_paths(paths, source="Explorer")
+        if msg.get("show") or paths:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
     def _go(self, index: int):
         self.nav_buttons[index].setChecked(True)
         self.stack.setCurrentIndex(index)
@@ -619,7 +631,11 @@ class MainWindow(QMainWindow):
 
     def _show_addresses(self):
         """Fills the sidebar's name + IP addresses and the QR code."""
-        self.current_url = getattr(self, "active_nearbeam_url", f"http://nearbeam.local:{self.port}")
+        # nearbeam.local belongs to the mesh leader; on a secondary PC it would open the other PC.
+        if getattr(self, "mesh_role", "leader") == "leader":
+            self.current_url = getattr(self, "active_nearbeam_url", f"http://nearbeam.local:{self.port}")
+        else:
+            self.current_url = getattr(self, "active_mdns_url", f"http://{get_hostname()}.local:{self.port}")
         self.ip_url = getattr(self, "active_primary_url", f"http://127.0.0.1:{self.port}")
         for key, url in (("name", self.current_url), ("ip", self.ip_url)):
             self.addr_labels[key].setText(url.replace("http://", ""))
@@ -732,7 +748,10 @@ class MainWindow(QMainWindow):
     def _on_mesh_updated(self, role: str, nodes: list):
         """Updates GUI when mesh role changes or nodes join/leave."""
         self.current_mesh_nodes = nodes or []
+        role_changed = role != getattr(self, "mesh_role", None)
         self.mesh_role = role
+        if role_changed and getattr(self, "active_urls", None):
+            self._show_addresses()
         self._refresh_nearby_devices_ui()
 
     def _nearby_devices(self) -> list[dict]:
@@ -1023,6 +1042,17 @@ class MainWindow(QMainWindow):
                         QTimer.singleShot(3000, lambda t=did: self._remove_active_row(t))
         if changed_history:
             self._refresh_history()
+        self._sweep_stalled_rows()
+
+    def _sweep_stalled_rows(self, max_idle: float = 120.0):
+        """A phone upload/download that stops (screen locked, Wi-Fi lost) never sends a finish
+        event; mark it stopped instead of leaving it 'active' forever. A resume makes a new row."""
+        now = time.monotonic()
+        for tid, entry in list(self.active_transfers.items()):
+            if entry.get("tx") is None and "last" in entry and not entry.get("stalled") and now - entry["last"][0] > max_idle:
+                entry["stalled"] = True
+                entry["row"].set_finished(False, "Stopped responding")
+                QTimer.singleShot(3000, lambda t=tid: self._remove_active_row(t))
 
     def _history_row(self, rec: dict):
         direction = "sent" if rec.get("direction") == "sent" else "received"
@@ -1333,10 +1363,62 @@ class MainWindow(QMainWindow):
             event.ignore()
 
 
+# Per Windows user: local pipe names are machine-wide.
+INSTANCE_KEY = f"NearBeam-{getpass.getuser()}"
+
+
+def hand_off_to_running_instance(key: str, message: dict) -> bool:
+    """True if a NearBeam window already runs for this user and took the message."""
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY: let the running window come to the front
+    sock = QLocalSocket()
+    sock.connectToServer(key)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(json.dumps(message).encode("utf-8"))
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+def listen_for_other_instances(key: str, on_message, parent=None) -> QLocalServer:
+    """Later launches hand their request to this instance instead of starting a second NearBeam."""
+    server = QLocalServer(parent)
+    QLocalServer.removeServer(key)  # clears a stale socket left by a crash (no-op for Windows pipes)
+    server.listen(key)
+
+    def accept():
+        while server.hasPendingConnections():
+            sock = server.nextPendingConnection()
+            buf = bytearray()
+
+            def read(sock=sock, buf=buf):
+                buf.extend(bytes(sock.readAll()))
+                try:
+                    msg = json.loads(bytes(buf).decode("utf-8"))
+                except ValueError:
+                    return  # not all of it has arrived yet
+                buf.clear()
+                on_message(msg)
+
+            sock.readyRead.connect(read)
+            sock.disconnected.connect(sock.deleteLater)
+            if sock.bytesAvailable():
+                read()
+
+    server.newConnection.connect(accept)
+    return server
+
+
 def run_gui(start_minimized: bool = False, send_paths: list[str] = None):
     app = QApplication(sys.argv)
     app.setApplicationName("NearBeam")
+    # One NearBeam per user: e.g. opening it from the Start menu while the autostarted tray copy runs.
+    if hand_off_to_running_instance(INSTANCE_KEY, {"show": not start_minimized, "paths": send_paths or []}):
+        return
     window = MainWindow(send_paths=send_paths)
+    window.instance_server = listen_for_other_instances(INSTANCE_KEY, window._on_other_instance, window)
     if not start_minimized:
         window.show()
         window.raise_()

@@ -106,16 +106,18 @@ class ConfigManager:
         return bool(self.data.get("auto_save", True))
 
     def set_auto_save(self, enabled: bool):
-        self.data["auto_save"] = bool(enabled)
-        self.save()
+        with self._lock:
+            self.data["auto_save"] = bool(enabled)
+            self.save()
 
     @property
     def clipboard_sync_enabled(self) -> bool:
         return bool(self.data.get("clipboard_sync", True))
 
     def set_clipboard_sync(self, enabled: bool):
-        self.data["clipboard_sync"] = bool(enabled)
-        self.save()
+        with self._lock:
+            self.data["clipboard_sync"] = bool(enabled)
+            self.save()
 
     @property
     def save_directory(self) -> str:
@@ -124,8 +126,9 @@ class ConfigManager:
     def set_save_directory(self, path: str):
         abs_path = os.path.abspath(path)
         os.makedirs(abs_path, exist_ok=True)
-        self.data["save_directory"] = abs_path
-        self.save()
+        with self._lock:
+            self.data["save_directory"] = abs_path
+            self.save()
 
     def get_unique_filepath(self, filename: str) -> tuple[str, str]:
         """
@@ -170,29 +173,31 @@ class ConfigManager:
         if not os.path.exists(abs_path):
             raise ValueError(f"Path does not exist: {folder_path}")
 
-        # Check if already in safe list
-        for item in self.get_safe_folders():
-            if os.path.realpath(item["path"]) == abs_path:
-                return item
+        # Upload threads save history concurrently: check-and-add under the save lock.
+        with self._lock:
+            for item in self.get_safe_folders():
+                if os.path.realpath(item["path"]) == abs_path:
+                    return item
 
-        name = display_name if display_name else os.path.basename(abs_path) or abs_path
-        folder_entry = {
-            "id": uuid.uuid4().hex[:12],
-            "name": name,
-            "path": abs_path,
-        }
-        self.data.setdefault("safe_folders", []).append(folder_entry)
-        self.save()
+            name = display_name if display_name else os.path.basename(abs_path) or abs_path
+            folder_entry = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "path": abs_path,
+            }
+            self.data.setdefault("safe_folders", []).append(folder_entry)
+            self.save()
         return folder_entry
 
     def remove_safe_folder(self, folder_id: str) -> bool:
         """Removes a folder from the Safe List by its ID."""
-        folders = self.get_safe_folders()
-        initial_len = len(folders)
-        self.data["safe_folders"] = [f for f in folders if f.get("id") != folder_id]
-        if len(self.data["safe_folders"]) != initial_len:
-            self.save()
-            return True
+        with self._lock:
+            folders = self.get_safe_folders()
+            initial_len = len(folders)
+            self.data["safe_folders"] = [f for f in folders if f.get("id") != folder_id]
+            if len(self.data["safe_folders"]) != initial_len:
+                self.save()
+                return True
         return False
 
     def get_safe_folder_by_id(self, folder_id: str) -> dict | None:
@@ -268,8 +273,9 @@ class ConfigManager:
 
     def clear_transfer_history(self):
         """Clears all saved transfer history records."""
-        self.data["transfer_history"] = []
-        self.save()
+        with self._lock:
+            self.data["transfer_history"] = []
+            self.save()
 
 
 # Global default instance

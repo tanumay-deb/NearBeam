@@ -339,6 +339,13 @@ function showAllSafeFolders(pushHistory = true) {
     openBtn.className = "card-action-btn";
     openBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg><span>Browse Folder</span>`;
     actions.appendChild(openBtn);
+    actions.appendChild(
+      f.is_file
+        ? downloadButton(`Download ${f.name}`, () => {
+            window.location.href = `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`;
+          })
+        : downloadButton(`Download ${f.name} as ZIP`, () => startFolderZipDownload(f.id, ""))
+    );
     card.appendChild(actions);
 
     card.addEventListener("click", () => {
@@ -840,6 +847,22 @@ document.querySelectorAll(".view-btn").forEach((btn) => {
   });
 });
 
+const DOWNLOAD_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`;
+
+function downloadButton(label, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "card-action-btn btn-download";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = `${DOWNLOAD_ICON}<span>Download</span>`;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation(); // don't also open/preview the card
+    onClick();
+  });
+  return btn;
+}
+
 function safeItemUrl(kind, item) {
   return `/api/safelist/${kind}?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`;
 }
@@ -951,6 +974,7 @@ function renderSafeItems(items, filtered = false) {
       openBtn.className = "card-action-btn";
       openBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg><span>Open Folder</span>`;
       actions.appendChild(openBtn);
+      actions.appendChild(downloadButton(`Download ${item.name} as ZIP`, () => startFolderZipDownload(currentFolderId, item.subpath)));
 
       card.addEventListener("click", () => {
         browseSafeFolder(currentFolderId, item.subpath);
@@ -966,16 +990,9 @@ function renderSafeItems(items, filtered = false) {
       });
       actions.appendChild(previewBtn);
 
-      // Download button
-      const dlBtn = document.createElement("button");
-      dlBtn.className = "card-action-btn btn-download";
-      dlBtn.setAttribute("aria-label", `Download ${item.name}`);
-      dlBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg><span>Download</span>`;
-      dlBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        window.location.href = `/api/safelist/download?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`;
-      });
-      actions.appendChild(dlBtn);
+      actions.appendChild(downloadButton(`Download ${item.name}`, () => {
+        window.location.href = safeItemUrl("download", item);
+      }));
 
       card.addEventListener("click", () => {
         openPreviewModal(item.name, item.category, `/api/safelist/preview?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`, `/api/safelist/download?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`);
@@ -995,9 +1012,10 @@ function renderSafeEmptyState(msg) {
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
         </svg>
       </div>
-      <p>${msg}</p>
+      <p></p>
     </div>
   `;
+  safeFilesContainer.querySelector(".empty-state p").textContent = msg; // may echo server error text
 }
 
 // Search Filter
@@ -1383,7 +1401,13 @@ function renderMeshNodesUI(role, nodes) {
         ? "Leader"
         : "Satellite";
 
-      btn.innerHTML = `<span>${icon} ${node.name}</span> <span class="dest-badge">${badgeText}</span>`;
+      // Node names come from /api/mesh/register (any device on the Wi-Fi): text only, never HTML.
+      const nameEl = document.createElement("span");
+      nameEl.textContent = `${icon} ${node.name}`;
+      const badgeEl = document.createElement("span");
+      badgeEl.className = "dest-badge";
+      badgeEl.textContent = badgeText;
+      btn.replaceChildren(nameEl, " ", badgeEl);
       btn.addEventListener("click", () => {
         selectedTargetNodeId = node.id;
         document
@@ -2154,9 +2178,22 @@ async function uploadClipboardImageBlob(blob) {
   }
 }
 
+// Created on first use: a static <img> with no source would be an empty broken-image box.
+function clipboardPreviewImg() {
+  let img = document.getElementById("clipboardImagePreview");
+  const wrap = document.getElementById("clipboardImagePreviewWrap");
+  if (!img && wrap) {
+    img = document.createElement("img");
+    img.id = "clipboardImagePreview";
+    img.alt = "Shared clipboard image";
+    wrap.appendChild(img);
+  }
+  return img;
+}
+
 function renderClipboardImageState(data) {
   const card = document.getElementById("clipboardImageCard");
-  const previewImg = document.getElementById("clipboardImagePreview");
+  const previewImg = clipboardPreviewImg();
   const metaEl = document.getElementById("clipboardImageMeta");
   const dlBtn = document.getElementById("btnDownloadClipboardImage");
   if (!card || !previewImg) return;

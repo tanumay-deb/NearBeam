@@ -12,7 +12,12 @@ import urllib.request
 import uuid
 from typing import Callable, Optional
 
-CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB streaming chunks
+CHUNK_SIZE = 4 * 1024 * 1024  # pause waits for a chunk boundary: ~30 s at 140 KB/s instead of ~2 min
+PIECE_SIZE = 256 * 1024  # cancel is checked between pieces, so it works mid-chunk
+
+
+class _Cancelled(Exception):
+    pass
 
 
 class OutgoingTransfer:
@@ -87,9 +92,10 @@ class OutgoingTransfer:
                     data = f.read(self.chunk_size)
                     req = urllib.request.Request(
                         self.chunk_url,
-                        data=data,
+                        data=self._pieces(data),
                         headers={
                             "Content-Type": "application/octet-stream",
+                            "Content-Length": str(len(data)),
                             "X-Session-Id": self.session_id,
                             "X-Filename": urllib.parse.quote(self.filename),
                             "X-Chunk-Index": str(idx),
@@ -107,7 +113,17 @@ class OutgoingTransfer:
                     self.on_progress(self.sent, self.total, (self.sent - sent_at_t0) / elapsed)
             self.on_done(True, "")
         except Exception as e:
-            self.on_done(False, str(e))
+            if self._cancelled:
+                self._abort_remote()
+                self.on_done(False, "Cancelled")
+            else:
+                self.on_done(False, str(e))
+
+    def _pieces(self, data: bytes):
+        for i in range(0, len(data), PIECE_SIZE):
+            if self._cancelled:
+                raise _Cancelled()
+            yield data[i:i + PIECE_SIZE]
 
     def _abort_remote(self):
         """Ask the receiver to delete its partial temp file."""

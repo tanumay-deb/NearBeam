@@ -561,7 +561,7 @@ class TestLandrop(unittest.TestCase):
             "nearbyDevicesCountBadge",
             "globalDropOverlay",
             "clipboardImageCard",
-            "clipboardImagePreview",
+            "clipboardImagePreviewWrap",  # the <img> itself is created once there is an image
             "btnDownloadClipboardImage",
             "btnCopyClipboardImage",
             "btnClearClipboardImage",

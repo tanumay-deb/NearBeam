@@ -115,6 +115,49 @@ def get_file_type_category(filename: str, is_dir: bool = False) -> str:
         return "file"
 
 
+def remove_when_released(path: str, first_delay: float = 120, retry: float = 30, give_up: float = 6 * 3600, on_removed=None):
+    """Deletes a temp file once nothing holds it open. Windows refuses to delete a file that is
+    still being streamed, so a slow download keeps it until the download ends."""
+    time.sleep(first_delay)
+    deadline = time.time() + give_up
+    while os.path.exists(path) and time.time() < deadline:
+        try:
+            os.remove(path)
+        except OSError:
+            time.sleep(retry)
+    if on_removed:
+        on_removed()
+
+
+def finalize_upload(temp_path: str, dest_dir: str, filename: str) -> str:
+    """Moves a finished upload to a free name in dest_dir and returns the final path."""
+    os.makedirs(dest_dir, exist_ok=True)
+    base, ext = os.path.splitext(filename)
+    final_path, counter = os.path.join(dest_dir, filename), 1
+    while True:
+        try:
+            # Claim the name atomically: two same-name uploads finishing together can't both get it.
+            open(final_path, "xb").close()
+            break
+        except FileExistsError:
+            final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
+            counter += 1
+    try:
+        os.replace(temp_path, final_path)
+    except OSError:
+        import shutil
+        shutil.move(temp_path, final_path)
+    return final_path
+
+
+def inside_folder(root_real: str, path: str) -> bool:
+    """True if path (after resolving links/junctions) stays inside root_real."""
+    try:
+        return os.path.commonpath([root_real, os.path.realpath(path)]) == root_real
+    except ValueError:  # different drive on Windows
+        return False
+
+
 THUMB_PX = 320  # sharp on 3x phone screens for grid tiles, still ~20 KB
 
 
@@ -589,7 +632,7 @@ class NearBeamServer:
         full_file = resp.status_code == 200
         addr = request.remote_addr or ""
         peer = self.connected_clients.get(addr, {}).get("name") or addr or "a device"
-        download_id = f"dl:{addr}:{filename}"
+        download_id = f"dl:{uuid.uuid4().hex}"  # unique per download: same-named files can run at once
         inner = resp.response
         server = self
 
@@ -740,20 +783,8 @@ class NearBeamServer:
         if chunk_index < total_chunks - 1:
             return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
 
-        os.makedirs(dest_dir, exist_ok=True)
-        final_path = os.path.join(dest_dir, filename)
-        base, ext = os.path.splitext(filename)
-        counter = 1
-        while os.path.exists(final_path):
-            final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
-            counter += 1
+        final_path = finalize_upload(temp_path, dest_dir, filename)
         final_name = os.path.basename(final_path)
-
-        try:
-            os.replace(temp_path, final_path)
-        except OSError:
-            import shutil
-            shutil.move(temp_path, final_path)
         total_bytes = os.path.getsize(final_path)
 
         file_info = {
@@ -1066,6 +1097,8 @@ class NearBeamServer:
             for root, _, filenames in os.walk(real_target):
                 for filename in filenames:
                     file_path = os.path.join(root, filename)
+                    if not inside_folder(real_target, file_path):
+                        continue  # link/junction to outside the shared folder: browse/download refuse it too
                     try:
                         f_size = os.path.getsize(file_path)
                     except OSError:
@@ -1169,17 +1202,14 @@ class NearBeamServer:
 
             self.log_activity(f"Folder downloaded as ZIP: {folder_name} by {request.remote_addr}")
 
-            def delayed_cleanup():
-                time.sleep(120)  # Wait 2 minutes for download stream to finish
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except Exception:
-                    pass
+            def forget_job():
                 with self.zip_jobs_lock:
                     self.zip_jobs.pop(job_id, None)
 
-            threading.Thread(target=delayed_cleanup, daemon=True).start()
+            # The job stays (so a retry can re-download) until the file is actually gone.
+            threading.Thread(
+                target=remove_when_released, args=(temp_path,), kwargs={"on_removed": forget_job}, daemon=True
+            ).start()
 
             return self._track_download(
                 send_file(
@@ -1214,6 +1244,8 @@ class NearBeamServer:
                     for root, _, filenames in os.walk(real_target):
                         for filename in filenames:
                             file_path = os.path.join(root, filename)
+                            if not inside_folder(real_target, file_path):
+                                continue
                             archive_name = os.path.relpath(file_path, real_target)
                             ext = os.path.splitext(filename)[1].lower()
                             c_type = zipfile.ZIP_STORED if ext in PRECOMPRESSED_EXTENSIONS else zipfile.ZIP_DEFLATED
@@ -1235,15 +1267,7 @@ class NearBeamServer:
                     download_name=f"{folder_name}.zip",
                 )
 
-                def cleanup_sync_temp():
-                    time.sleep(120)
-                    try:
-                        if os.path.exists(temp_zip.name):
-                            os.remove(temp_zip.name)
-                    except Exception:
-                        pass
-
-                threading.Thread(target=cleanup_sync_temp, daemon=True).start()
+                threading.Thread(target=remove_when_released, args=(temp_zip.name,), daemon=True).start()
                 return response
             except Exception as e:
                 try:
@@ -1270,7 +1294,9 @@ class NearBeamServer:
             self.active_drop_zones[token] = {"expires_at": expires_at}
             
             urls = get_connection_urls(self.port)
-            drop_url = f"{urls['nearbeam_url'] or urls['primary_url']}/drop/{token}"
+            # nearbeam.local is the mesh leader; a link made on another PC must point here.
+            is_leader = not self.mesh or self.mesh.role == "leader"
+            drop_url = f"{urls['nearbeam_url'] if is_leader else urls['primary_url']}/drop/{token}"
             return jsonify({"success": True, "token": token, "url": drop_url})
 
         @app.route("/drop/<token>")
@@ -1309,18 +1335,29 @@ class NearBeamServer:
                     continue
 
                 original_name = f.filename
-                dest_path, final_name = config.get_unique_filepath(original_name)
+                clean_name = os.path.basename(original_name.replace("\\", "/")).strip() or f"unnamed_file_{uuid.uuid4().hex[:8]}"
+                save_dir = config.save_directory
+                os.makedirs(save_dir, exist_ok=True)
+                temp_path = os.path.join(save_dir, f".{uuid.uuid4().hex}.tmp")
 
-                # Stream save to disk in 8 MB buffered chunks for maximum LAN throughput
+                # Stream to a temp file first: an interrupted upload must not leave a
+                # truncated file under its real name.
                 total_bytes = 0
                 buf_size = 8 * 1024 * 1024
-                with open(dest_path, "wb", buffering=buf_size) as out_file:
-                    while True:
-                        chunk = f.stream.read(buf_size)
-                        if not chunk:
-                            break
-                        out_file.write(chunk)
-                        total_bytes += len(chunk)
+                try:
+                    with open(temp_path, "wb", buffering=buf_size) as out_file:
+                        while True:
+                            chunk = f.stream.read(buf_size)
+                            if not chunk:
+                                break
+                            out_file.write(chunk)
+                            total_bytes += len(chunk)
+                except Exception:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    raise
+                dest_path = finalize_upload(temp_path, save_dir, clean_name)
+                final_name = os.path.basename(dest_path)
 
                 file_info = {
                     "filename": final_name,
@@ -1371,7 +1408,7 @@ class NearBeamServer:
 
         @app.route("/api/upload/status/<session_id>")
         def api_upload_status(session_id):
-            if ".." in session_id or "/" in session_id or "\\" in session_id:
+            if not _SESSION_ID_RE.fullmatch(session_id):
                 return jsonify({"received_bytes": 0})
             candidates = [
                 os.path.join(config.save_directory, f".{session_id}.tmp"),
@@ -1389,7 +1426,7 @@ class NearBeamServer:
             data = request.get_json(silent=True) or {}
             session_id = data.get("session_id", "")
             removed_tmp = False
-            if session_id and ".." not in session_id and "/" not in session_id and "\\" not in session_id:
+            if session_id and _SESSION_ID_RE.fullmatch(session_id):
                 candidates = [
                     os.path.join(config.save_directory, f".{session_id}.tmp"),
                     os.path.join(config.save_directory, "Guest Drops", f".{session_id}.tmp"),
@@ -1427,6 +1464,10 @@ class NearBeamServer:
             or desktop drag-and-drop.
             """
             import shutil
+            # Only the PC itself (Explorer "Send with NearBeam") may add paths: from the
+            # network this would let anyone share, then download, any folder on the PC.
+            if request.remote_addr not in ("127.0.0.1", "::1"):
+                return jsonify({"error": "Only available on this PC"}), 403
             data = request.get_json(silent=True) or {}
             paths = data.get("paths", [])
             if not paths:
@@ -1520,7 +1561,7 @@ class NearBeamServer:
             save_dir = config.save_directory
             safe_name = os.path.basename(filename)
             target = os.path.join(save_dir, safe_name)
-            if not os.path.isfile(target):
+            if safe_name.startswith(".") or not os.path.isfile(target):  # hidden = another device's partial upload
                 return jsonify({"error": "File not found"}), 404
             return self._track_download(
                 send_file(target, as_attachment=True, download_name=safe_name, conditional=True), safe_name
@@ -1532,7 +1573,7 @@ class NearBeamServer:
             save_dir = config.save_directory
             safe_name = os.path.basename(filename)
             target = os.path.join(save_dir, safe_name)
-            if not os.path.isfile(target):
+            if safe_name.startswith(".") or not os.path.isfile(target):
                 return jsonify({"error": "File not found"}), 404
             mime_type, _ = mimetypes.guess_type(target)
             return send_file(target, mimetype=mime_type or "application/octet-stream", conditional=True)

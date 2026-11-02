@@ -121,6 +121,7 @@ def icon(name: str, color: str = theme.MUTED, size: int = 18, checked_color: str
 
 def label(text: str = "", role: str = None, wrap: bool = False) -> QLabel:
     lbl = QLabel(text)
+    lbl.setTextFormat(Qt.PlainText)  # names come from other devices: never render them as HTML
     if role:
         lbl.setProperty("role", role)
     lbl.setWordWrap(wrap)

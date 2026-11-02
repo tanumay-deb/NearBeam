@@ -17,6 +17,11 @@ from core.network import get_hostname, get_local_ip
 
 MESH_DISCOVERY_PORT = 5005
 HEARTBEAT_INTERVAL = 3.0
+
+
+def _rank(info: dict) -> tuple:
+    """Lower ranks first: the longest-running leader wins, node id breaks ties."""
+    return (info.get("started_at") or 0, str(info.get("node_id")))
 NODE_TIMEOUT = 30.0
 
 
@@ -71,6 +76,9 @@ class MeshManager:
         self.node_id = f"{self.device_name}_{self.port}_{uuid.uuid4().hex[:6]}"
 
         self.role = "leader"  # Will be determined during discovery
+        self.started_at = time.time()  # older leader wins when two leaders meet
+        self.electing = False
+        self._beacon_count = 0
         self.leader_info: Optional[dict] = None
         self.nodes: dict[str, MeshNode] = {}
 
@@ -123,6 +131,7 @@ class MeshManager:
         print("  [Mesh] Searching for existing NearBeam Leader on Wi-Fi...")
         leader_found = False
         start_time = time.time()
+        self.electing = True
 
         # Send discovery beacon
         beacon = {
@@ -141,6 +150,7 @@ class MeshManager:
                 break
             time.sleep(0.1)
 
+        self.electing = False
         if leader_found and self.leader_info:
             self.role = "node"
             print(f"  [Mesh] Found active Leader: {self.leader_info.get('name')} ({self.leader_info.get('ip')}:{self.leader_info.get('port')})")
@@ -176,63 +186,85 @@ class MeshManager:
         except Exception:
             pass
 
+    def _leader_announcement(self) -> dict:
+        return {
+            "type": "LEADER_ANNOUNCE",
+            "node_id": self.node_id,
+            "name": self.device_name,
+            "ip": self.ip,
+            "port": self.port,
+            "started_at": self.started_at,
+        }
+
     def _listen_udp_loop(self):
         """Listens for peer beacons and responds to discovery requests."""
         while self.running and self.udp_sock:
             try:
                 data, addr = self.udp_sock.recvfrom(4096)
-                msg = json.loads(data.decode("utf-8"))
-                msg_type = msg.get("type")
-
-                # Ignore our own messages
-                if msg.get("node_id") == self.node_id:
-                    continue
-
-                if msg_type == "WHO_IS_LEADER":
-                    if self.role == "leader":
-                        # Reply announcing that we are the Leader
-                        reply = {
-                            "type": "LEADER_ANNOUNCE",
-                            "node_id": self.node_id,
-                            "name": self.device_name,
-                            "ip": self.ip,
-                            "port": self.port,
-                        }
-                        payload = json.dumps(reply).encode("utf-8")
-                        try:
-                            self.udp_sock.sendto(payload, addr)
-                        except Exception:
-                            pass
-                        self._send_broadcast(reply)
-
-                elif msg_type == "LEADER_ANNOUNCE":
-                    with self._lock:
-                        if self.role != "leader" or msg.get("node_id") != self.node_id:
-                            self.leader_info = {
-                                "node_id": msg.get("node_id"),
-                                "name": msg.get("name"),
-                                "ip": msg.get("ip"),
-                                "port": msg.get("port"),
-                            }
-
-                elif msg_type == "NODE_ANNOUNCE":
-                    if self.role == "leader":
-                        # Record node
-                        node = MeshNode(
-                            node_id=msg.get("node_id"),
-                            name=msg.get("name"),
-                            ip=msg.get("ip"),
-                            port=msg.get("port"),
-                            role="node",
-                            last_seen=time.time(),
-                        )
-                        self.register_node(node)
-
+                self._handle_message(json.loads(data.decode("utf-8")), addr)
             except socket.timeout:
                 continue
             except Exception:
                 if not self.running:
                     break
+
+    def _handle_message(self, msg: dict, addr):
+        msg_type = msg.get("type")
+        if msg.get("node_id") == self.node_id:
+            return  # our own broadcast
+
+        if msg_type == "WHO_IS_LEADER":
+            if self.role == "leader" and not self.electing:
+                reply = self._leader_announcement()
+                try:
+                    self.udp_sock.sendto(json.dumps(reply).encode("utf-8"), addr)
+                except Exception:
+                    pass
+                self._send_broadcast(reply)
+
+        elif msg_type == "LEADER_ANNOUNCE":
+            other = {k: msg.get(k) for k in ("node_id", "name", "ip", "port")}
+            other["started_at"] = msg.get("started_at") or 0  # pre-1.6.2 leaders send none: they rank first
+            if self.role == "leader" and not self.electing:
+                # Two leaders (a lost discovery packet, firewall, simultaneous start) would both
+                # advertise nearbeam.local and break it. The newer one steps down and joins.
+                if _rank(other) < _rank({"started_at": self.started_at, "node_id": self.node_id}):
+                    self._step_down(other)
+                return
+            with self._lock:
+                # While leaders coexist, every node picks the same (oldest) one instead of
+                # following whichever announced last.
+                current = self.leader_info
+                if current and current.get("node_id") != other["node_id"] and _rank(other) >= _rank(current):
+                    return
+                changed = not current or current.get("node_id") != other["node_id"]
+                self.leader_info = other
+            if changed and not self.electing:  # during election _discover_and_elect registers
+                threading.Thread(target=self._register_with_leader, daemon=True).start()
+
+        elif msg_type == "NODE_ANNOUNCE":
+            if self.role == "leader":
+                self.register_node(MeshNode(
+                    node_id=msg.get("node_id"),
+                    name=msg.get("name"),
+                    ip=msg.get("ip"),
+                    port=msg.get("port"),
+                    role="node",
+                    last_seen=time.time(),
+                ))
+
+    def _step_down(self, leader: dict):
+        """Another leader outranks this one: become its node (server then stops advertising nearbeam.local)."""
+        with self._lock:
+            self.role = "node"
+            self.leader_info = leader
+            self.nodes.clear()
+        print(f"  [Mesh] Another Leader found: {leader.get('name')} ({leader.get('ip')}). Joining it as a Secondary Node.")
+        threading.Thread(target=self._register_with_leader, daemon=True).start()
+        if self.on_role_change:
+            self.on_role_change(self.role)
+        if self.on_nodes_change:
+            self.on_nodes_change(self.get_nodes_list())
 
     def _register_with_leader(self):
         """Sends HTTP registration request to Primary Leader."""
@@ -280,17 +312,36 @@ class MeshManager:
                     with urllib.request.urlopen(req, timeout=2.5) as resp:
                         if resp.status == 200:
                             missed_leader_heartbeats = 0
+                            # Leader restarted or merged and doesn't know us: register again.
+                            if json.loads(resp.read() or b"{}").get("updated") is False:
+                                self._register_with_leader()
                 except Exception:
                     missed_leader_heartbeats += 1
                     print(f"  [Mesh] Missed heartbeat to Leader ({missed_leader_heartbeats}/5)")
 
                     if missed_leader_heartbeats >= 5:
                         print("  [Mesh] Leader is unreachable! Promoting self to Primary Leader.")
+                        missed_leader_heartbeats = 0  # else a later step-down re-promotes on its first miss
                         self.promote_to_leader()
 
             elif self.role == "leader":
                 # Clean up inactive nodes
                 self._prune_stale_nodes()
+                self._leader_beacon()
+
+    def _leader_beacon(self):
+        """Leaders announce every heartbeat so a second leader (missed discovery) hears them and merges.
+        Every 5th beat they also ask WHO_IS_LEADER: pre-1.6.2 leaders only speak when asked."""
+        self._beacon_count += 1
+        self._send_broadcast(self._leader_announcement())
+        if self._beacon_count % 5 == 0:
+            self._send_broadcast({
+                "type": "WHO_IS_LEADER",
+                "node_id": self.node_id,
+                "name": self.device_name,
+                "ip": self.ip,
+                "port": self.port,
+            })
 
     def promote_to_leader(self):
         """Promotes this node to Primary Host (Leader)."""
@@ -299,14 +350,7 @@ class MeshManager:
             self.leader_info = None
 
         # Announce leadership to the network
-        announcement = {
-            "type": "LEADER_ANNOUNCE",
-            "node_id": self.node_id,
-            "name": self.device_name,
-            "ip": self.ip,
-            "port": self.port,
-        }
-        self._send_broadcast(announcement)
+        self._send_broadcast(self._leader_announcement())
 
         if self.on_role_change:
             self.on_role_change(self.role)

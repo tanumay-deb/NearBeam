@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="/static/css/style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body class="theme-dark">
   <!-- Top Sticky Navbar -->
@@ -137,7 +137,7 @@
     <section class="nearby-dashboard-card" id="nearbyDashboardCard">
       <div class="nearby-hero-row">
         <div class="nearby-hero-text">
-          <div class="hero-kicker">⚡ ZERO QR • ZERO ACCOUNTS • ZERO CABLES</div>
+          <div class="hero-kicker">⚡ Zero QR · Zero accounts · Zero cables</div>
           <h1 class="hero-headline">Transfer files without QR codes, accounts, or cables.</h1>
           <p class="hero-subline">Open your PC from your phone at <code class="code-pill" id="heroLocalUrl">nearbeam.local:5000</code> — or drop files onto any nearby device below.</p>
         </div>
@@ -356,7 +356,7 @@
         <!-- Active Transfer Manager Container (NB-03) -->
         <div class="transfer-manager hidden" id="transferManagerCard">
           <div class="transfer-manager-header">
-            <h4 class="subheading">⚡ Active Transfers</h4>
+            <h3 class="subheading">⚡ Active Transfers</h3>
           </div>
           <div id="activeTransfersList" class="transfers-list"></div>
         </div>
@@ -364,7 +364,7 @@
         <!-- Failed Transfers Queue (NB-03) -->
         <div class="transfer-manager failed-transfers-card hidden" id="failedTransfersCard">
           <div class="transfer-manager-header">
-            <h4 class="subheading" style="color: var(--accent-rose);">⚠️ Failed Transfers</h4>
+            <h3 class="subheading" style="color: var(--accent-rose);">⚠️ Failed Transfers</h3>
             <button class="card-action-btn" id="btnRetryAllFailed" type="button">↻ Retry All</button>
           </div>
           <div id="failedTransfersList" class="transfers-list"></div>
@@ -373,7 +373,7 @@
         <!-- Persistent Completed Transfer History (NB-03) -->
         <div class="sent-history" id="completedHistoryCard">
           <div class="transfer-manager-header">
-            <h4 class="subheading">✓ Completed Transfer History</h4>
+            <h3 class="subheading">✓ Completed Transfer History</h3>
             <button class="card-action-btn" id="btnClearHistory" type="button">Clear History</button>
           </div>
           <div id="sentList" class="sent-list">
@@ -388,7 +388,7 @@
       <!-- Live incoming transfers from other devices (populated over SSE) -->
       <div class="transfer-manager hidden" id="incomingTransferCard" style="margin-bottom: 16px;">
         <div class="transfer-manager-header">
-          <h4 class="subheading">Incoming from other devices</h4>
+          <h3 class="subheading">Incoming from other devices</h3>
         </div>
         <div id="incomingTransfersList" class="transfers-list"></div>
       </div>
@@ -463,9 +463,7 @@
                 <button type="button" class="btn-cancel btn-xs" id="btnClearClipboardImage">✕ Clear</button>
               </div>
             </div>
-            <div class="clipboard-image-preview-wrap">
-              <img id="clipboardImagePreview" src="" alt="Shared Clipboard Image" />
-            </div>
+            <div class="clipboard-image-preview-wrap" id="clipboardImagePreviewWrap"></div>
           </div>
         </div>
 
@@ -505,7 +503,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-security">Security</span>
-                <h4>Why does this link use http:// instead of https://?</h4>
+                <h3>Why does this link use http:// instead of https://?</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>
@@ -524,7 +522,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-ios">iPhone & iPad</span>
-                <h4>Chrome on iPhone is stuck loading or won't open</h4>
+                <h3>Chrome on iPhone is stuck loading or won't open</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>
@@ -552,7 +550,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-ios">iOS / VPN</span>
-                <h4>"This site cannot be reached" or Connection Timed Out</h4>
+                <h3>"This site cannot be reached" or Connection Timed Out</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>
@@ -571,7 +569,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-android">Android</span>
-                <h4>Android phones: "Wi-Fi has no internet" prompt</h4>
+                <h3>Android phones: "Wi-Fi has no internet" prompt</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>
@@ -588,7 +586,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-network">Network</span>
-                <h4>What address should I use to connect?</h4>
+                <h3>What address should I use to connect?</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>
@@ -607,7 +605,7 @@
             <div class="faq-question">
               <div class="faq-q-left">
                 <span class="faq-badge badge-router">Router Settings</span>
-                <h4>Devices are on the same Wi-Fi but still cannot communicate</h4>
+                <h3>Devices are on the same Wi-Fi but still cannot communicate</h3>
               </div>
               <span class="faq-toggle">▼</span>
             </div>

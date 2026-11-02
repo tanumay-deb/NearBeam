@@ -101,6 +101,29 @@ class TestControlPanelSmoke(unittest.TestCase):
         self._settle(1800)
         self.assertNotIn("dl:x:a.mp4", self.win.active_transfers)
 
+    def test_stalled_incoming_upload_does_not_stay_active_forever(self):
+        self.win.server_events.put(json.dumps({"type": "upload_progress", "session_id": "stuck", "filename": "v.mp4",
+                                               "received_bytes": 50_000_000, "total_bytes": 90_000_000}))
+        self.win._drain_server_events()
+        entry = self.win.active_transfers["in:stuck"]
+        entry["last"] = (entry["last"][0] - 121, entry["last"][1])  # nothing heard for 2 minutes
+        self.win._sweep_stalled_rows()
+        self._settle(3300)
+        self.assertNotIn("in:stuck", self.win.active_transfers)
+
+    def test_secondary_pc_does_not_advertise_nearbeam_local(self):
+        self.win._on_mesh_updated("node", [])
+        self.assertNotIn("nearbeam.local", self.win.addr_labels["name"].text())
+        self.win._on_mesh_updated("leader", [])
+        self.assertIn("nearbeam.local", self.win.addr_labels["name"].text())
+
+    def test_remote_device_names_are_plain_text(self):
+        from PySide6.QtCore import Qt
+        from ui.widgets import DeviceCard
+        card = DeviceCard({"kind": "client", "name": "<b>evil</b>", "device_type": "phone"})
+        name = [l for l in card.findChildren(type(self.win.addr_labels["name"])) if l.text() == "<b>evil</b>"][0]
+        self.assertEqual(name.textFormat(), Qt.PlainText)
+
     def test_clipboard_switches_stay_in_step(self):
         start = self.cfg.clipboard_sync_enabled
         self.win.clipboard_page.sync_row.switch.click()

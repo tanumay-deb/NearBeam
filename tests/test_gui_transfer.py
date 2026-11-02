@@ -142,6 +142,31 @@ class TestOutgoingTransfer(unittest.TestCase):
         self.assertEqual(self.cfg.get_transfer_history()[0]["filename"], "shared.bin")
         self.assertEqual(self.cfg.get_transfer_history()[0]["direction"], "sent")
 
+    def test_cancel_stops_mid_chunk_on_slow_link(self):
+        src = self._make_file("slowcancel.bin", 8 * MB)
+
+        class SlowLink(OutgoingTransfer):
+            def _pieces(self, data):
+                for piece in super()._pieces(data):
+                    time.sleep(0.05)  # ~5 MB/s: one 8 MB chunk would take ~1.6 s
+                    yield piece
+
+        tx = SlowLink(self.url, "peer", src, chunk_size=8 * MB)
+        done = self._run(tx)
+        tx.start()
+        time.sleep(0.3)
+        cancelled_at = time.monotonic()
+        tx.cancel()
+        tx.join(10)
+        self.assertEqual(done.get("msg"), "Cancelled")
+        self.assertLess(time.monotonic() - cancelled_at, 1.0, "cancel waited for the whole chunk")
+        tmp = os.path.join(self.save_dir, f".{tx.session_id}.tmp")
+        deadline = time.time() + 3
+        while os.path.exists(tmp) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(os.path.exists(tmp))
+        self.assertFalse(os.path.exists(os.path.join(self.save_dir, "slowcancel.bin")))
+
     def test_unreachable_target_reports_failure(self):
         src = self._make_file("nowhere.bin", 10)
         tx = OutgoingTransfer("http://127.0.0.1:1/api/upload", "ghost", src)
