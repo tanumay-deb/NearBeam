@@ -6,6 +6,7 @@ Auto-Save file uploads, clipboard synchronization, and media previews.
 
 import datetime
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -17,6 +18,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -79,6 +81,76 @@ from core.network import (
 from core.version import APP_VERSION, check_for_updates
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_PARTIAL_UPLOAD_RE = re.compile(r"\.[A-Za-z0-9_-]{1,128}\.tmp")  # dot first: a received 'notes.tmp' isn't one
+_LEGACY_PARTIAL_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\.tmp")
+
+# Pages served by other NearBeam PCs need these cross-origin: the finder probes /api/info and a
+# phone sends to another PC through /api/upload/*. Nothing else (clipboard, shared files,
+# history) may be read from another origin, so a website can't pull it through the browser.
+CORS_RESOURCES = {re.compile(r"/api/info$"): {}, re.compile(r"/api/upload/"): {}}
+# Name endings routers and mDNS hand out on a LAN; none can be registered by a website.
+LAN_HOST_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa", ".fritz.box", ".gateway", ".router")
+# No IPv6 addresses: NearBeam listens on IPv4 only (0.0.0.0), so no NearBeam page has one as its origin.
+LAN_ORIGINS = [re.compile(
+    r"https?://(localhost|127(\.\d+){3}|10(\.\d+){3}|192\.168(\.\d+){2}"
+    r"|172\.(1[6-9]|2\d|3[01])(\.\d+){2}|169\.254(\.\d+){2}|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])(\.\d+){2}"
+    r"|[a-z0-9-]+|[a-z0-9.-]+(" + "|".join(re.escape(s) for s in LAN_HOST_SUFFIXES) + r"))(:\d+)?$",
+    re.IGNORECASE,
+)]
+
+_WINDOWS_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+@lru_cache(maxsize=1)
+def _own_fqdn() -> str:
+    return socket.getfqdn().lower()
+
+
+def is_lan_host(host: str) -> bool:
+    """True for names a LAN device uses to reach this PC: an IP, localhost, a bare or .local name.
+    A website's own domain re-pointed at this PC (DNS rebinding) is not one."""
+    name = (host or "").strip().lower()
+    if name.startswith("["):
+        return True  # IPv6 literal
+    name = name.split(":", 1)[0].rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return "." not in name or name.endswith(LAN_HOST_SUFFIXES) or name == _own_fqdn()
+
+
+def safe_filename(name: str) -> str:
+    """A name Windows can store: no folder parts, reserved characters or device names.
+    (':' would otherwise hide the data in an NTFS stream; '?' fails after the whole upload.)"""
+    name = os.path.basename((name or "").replace("\\", "/"))
+    name = _WINDOWS_BAD_CHARS.sub("_", name).strip().rstrip(". ")
+    if name.split(".", 1)[0].upper() in _WINDOWS_DEVICE_NAMES:
+        name = f"_{name}"
+    return name or f"unnamed_file_{uuid.uuid4().hex[:8]}"
+
+
+def remove_stale_uploads(save_dir: str, max_age: float = 24 * 3600):
+    """Deletes partial uploads nobody resumed or cancelled within a day (a phone that gave up
+    halfway through a 4 GB video would otherwise leave 2 GB hidden in the folder forever)."""
+    cutoff = time.time() - max_age
+    for folder, pattern in (
+        (save_dir, _PARTIAL_UPLOAD_RE),
+        (os.path.join(save_dir, "Guest Drops"), _PARTIAL_UPLOAD_RE),
+        (os.path.join(tempfile.gettempdir(), "nearbeam_uploads"), _LEGACY_PARTIAL_RE),
+    ):
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if pattern.fullmatch(entry.name) and entry.is_file() and entry.stat().st_mtime < cutoff:
+                        try:
+                            os.remove(entry.path)
+                        except OSError:
+                            pass
+        except OSError:
+            continue
 
 
 def format_size(size_bytes: int) -> str:
@@ -192,7 +264,7 @@ class NearBeamServer:
             template_folder=str(self.template_dir),
             static_folder=str(self.static_dir),
         )
-        CORS(self.app)
+        CORS(self.app, resources=CORS_RESOURCES, origins=LAN_ORIGINS)
 
         # In-memory shared state
         self.clipboard_content = ""
@@ -229,6 +301,15 @@ class NearBeamServer:
         # Active background ZIP packaging jobs
         self.zip_jobs: Dict[str, Dict[str, Any]] = {}
         self.zip_jobs_lock = threading.Lock()
+
+        # Recently finished uploads: a resent last chunk (its response got lost) gets the
+        # same answer instead of a 409 or a second copy of the file.
+        self.finished_uploads: "OrderedDict[str, dict]" = OrderedDict()
+
+        self._stopping = threading.Event()
+        self.current_ip = get_local_ip()
+        threading.Thread(target=self._watch_network, daemon=True).start()
+        threading.Thread(target=remove_stale_uploads, args=(config.save_directory,), daemon=True).start()
 
         self._register_routes()
 
@@ -343,8 +424,28 @@ class NearBeamServer:
 
         return devices
 
+    def _watch_network(self):
+        """Follows the PC's address: Wi-Fi often connects after an autostarted NearBeam, and laptops move networks."""
+        while not self._stopping.wait(5.0):
+            self.check_network()
+
+    def check_network(self):
+        """Re-advertises nearbeam.local and re-announces the mesh when the IP changes."""
+        ip = get_local_ip()
+        if ip == self.current_ip:
+            return
+        self.current_ip = ip
+        if self.mesh:
+            self.mesh.set_ip(ip)
+        if not self.mesh or self.mesh.role == "leader":
+            self.broadcaster.stop()
+            self.broadcaster.start(ip)  # does nothing while offline (127.0.0.1)
+        self.log_activity(f"Network changed: this PC is now at {ip}", "info")
+        self.broadcast_event({"type": "network_changed", "ip": ip})
+
     def shutdown(self):
         """Stops background workers and unregisters mDNS services."""
+        self._stopping.set()
         if hasattr(self, "mesh") and self.mesh:
             try:
                 self.mesh.stop()
@@ -372,7 +473,8 @@ class NearBeamServer:
         to_delete = []
         with self.zip_jobs_lock:
             for jid, job in self.zip_jobs.items():
-                if now - job.get("created_at", now) > 1800:
+                # A big folder can take longer than 30 min to pack; dropping it mid-run would orphan its temp ZIP.
+                if job.get("status") != "processing" and now - job.get("created_at", now) > 1800:
                     to_delete.append((jid, job.get("temp_path")))
             for jid, temp_path in to_delete:
                 self.zip_jobs.pop(jid, None)
@@ -690,6 +792,9 @@ class NearBeamServer:
             return jsonify({"error": "Missing parameters"}), 400
         if not _SESSION_ID_RE.fullmatch(session_id):
             return jsonify({"error": "Invalid session id"}), 400
+        finished = self.finished_uploads.get(session_id)
+        if finished:
+            return jsonify({"success": True, "completed": True, "file": finished})
         try:
             chunk_index = int(request.headers.get("X-Chunk-Index", request.form.get("chunk_index", 0)))
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
@@ -703,10 +808,7 @@ class NearBeamServer:
                 or (offset is not None and offset < 0) or (file_size is not None and file_size < 0)):
             return jsonify({"error": "Invalid chunk headers"}), 400
 
-        # Drop any directory parts smuggled into the name; Windows accepts both separators.
-        filename = os.path.basename(unquote(filename_raw).replace("\\", "/")).strip()
-        if filename in ("", ".", ".."):
-            filename = f"unnamed_file_{uuid.uuid4().hex[:8]}"
+        filename = safe_filename(unquote(filename_raw))
         relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
         dest_dir = save_dir
@@ -719,6 +821,10 @@ class NearBeamServer:
                 inside = False
             if not inside:
                 return jsonify({"error": "Invalid relative directory"}), 400
+            # Folder names get the same clean-up as file names ('Trip: day 1' -> 'Trip_ day 1').
+            parts = os.path.relpath(dest_dir, save_dir).replace("\\", "/").split("/")
+            relative_dir = "/".join(safe_filename(p) for p in parts if p not in ("", "."))
+            dest_dir = os.path.join(save_dir, relative_dir) if relative_dir else save_dir
 
         os.makedirs(save_dir, exist_ok=True)
         temp_path = os.path.join(save_dir, f".{session_id}.tmp")
@@ -796,6 +902,9 @@ class NearBeamServer:
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "category": get_file_type_category(final_name),
         }
+        self.finished_uploads[session_id] = file_info
+        if len(self.finished_uploads) > 200:
+            self.finished_uploads.popitem(last=False)
         self.received_files_history.insert(0, file_info)
         if len(self.received_files_history) > 100:
             self.received_files_history.pop()
@@ -816,6 +925,12 @@ class NearBeamServer:
 
     def _register_routes(self):
         app = self.app
+
+        @app.before_request
+        def only_lan_hostnames():
+            # DNS rebinding: a website's own domain re-pointed at this PC must not reach the API.
+            if not is_lan_host(request.host):
+                return jsonify({"error": "Unknown host name"}), 421
 
         @app.route("/")
         def index():
@@ -1335,7 +1450,7 @@ class NearBeamServer:
                     continue
 
                 original_name = f.filename
-                clean_name = os.path.basename(original_name.replace("\\", "/")).strip() or f"unnamed_file_{uuid.uuid4().hex[:8]}"
+                clean_name = safe_filename(original_name)
                 save_dir = config.save_directory
                 os.makedirs(save_dir, exist_ok=True)
                 temp_path = os.path.join(save_dir, f".{uuid.uuid4().hex}.tmp")

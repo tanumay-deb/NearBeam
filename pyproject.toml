@@ -19,6 +19,13 @@ dependencies = [
     "PySide6>=6.5.0",
     "zeroconf>=0.130.0",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: File Sharing",
+]
 
 [project.urls]
 Homepage = "https://github.com/tanumay-deb/NearBeam"
@@ -27,5 +34,9 @@ Releases = "https://github.com/tanumay-deb/NearBeam/releases"
 
 [project.scripts]
 nearbeam = "main:main"
-nearbeam-gui = "main:main"
 landrop = "main:main"
+
+# No console window behind the app.
+[project.gui-scripts]
+nearbeam-gui = "main:main"
+landrop-gui = "main:main"

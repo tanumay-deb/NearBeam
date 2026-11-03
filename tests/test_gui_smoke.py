@@ -117,6 +117,115 @@ class TestControlPanelSmoke(unittest.TestCase):
         self.win._on_mesh_updated("leader", [])
         self.assertIn("nearbeam.local", self.win.addr_labels["name"].text())
 
+    def test_folder_shared_from_explorer_shows_in_shared_folders(self):
+        # Explorer "Send with NearBeam" reaches a running window through /api/shell-send.
+        folder = os.path.join(self.tmp, "from_explorer")
+        os.makedirs(folder, exist_ok=True)
+        r = self.win.server_instance.app.test_client().post("/api/shell-send", json={"paths": [folder]})
+        self.assertEqual(r.status_code, 200)
+        self.win._drain_server_events()
+        table = self.win.safe_table
+        self.assertIn(os.path.realpath(folder), [table.item(i, 1).text() for i in range(table.rowCount())])
+
+    def test_sidebar_follows_a_network_change(self):
+        orig = gui.get_connection_urls
+        gui.get_connection_urls = lambda port: {**orig(port), "primary_url": f"http://10.9.8.7:{port}"}
+        try:
+            self.win.server_events.put(json.dumps({"type": "network_changed", "ip": "10.9.8.7"}))
+            self.win._drain_server_events()
+        finally:
+            gui.get_connection_urls = orig
+        self.assertEqual(self.win.addr_labels["ip"].text(), f"10.9.8.7:{self.win.port}")
+
+    def test_password_manager_copies_stay_on_this_pc(self):
+        from PySide6.QtCore import QByteArray, QMimeData
+        self.win._set_clipboard_switches(True)
+        self.win._ignore_clipboard_until = 0
+        secret = QMimeData()
+        secret.setText("hunter2-secret")
+        secret.setData('application/x-qt-windows-mime;value="ExcludeClipboardContentFromMonitorProcessing"', QByteArray(b"\x01"))
+        QApplication.clipboard().setMimeData(secret)
+        self.app.processEvents()
+        self.assertNotEqual(self.win.server_instance.clipboard_content, "hunter2-secret")
+        QApplication.clipboard().setText("ordinary text")
+        self.app.processEvents()
+        self.assertEqual(self.win.server_instance.clipboard_content, "ordinary text")
+
+    def test_cloud_clipboard_opt_out_counts_as_private(self):
+        from PySide6.QtCore import QByteArray, QMimeData
+        fmt = 'application/x-qt-windows-mime;value="CanUploadToCloudClipboard"'
+        mime = QMimeData()
+        mime.setText("x")
+        mime.setData(fmt, QByteArray(b"\0\0\0\0"))
+        self.assertTrue(gui.is_private_clipboard(mime))
+        mime.setData(fmt, QByteArray(b"\x01\0\0\0"))
+        self.assertFalse(gui.is_private_clipboard(mime))
+
+    def test_incoming_image_is_not_sent_back_as_this_pcs(self):
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        from PySide6.QtGui import QColor, QImage
+        self.win._set_clipboard_switches(True)
+        img = QImage(8, 8, QImage.Format_RGB32)
+        img.fill(QColor("orange"))
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "JPG")
+        buf.close()
+        self.win.server_instance.clipboard_image_bytes = None
+        self.win._on_remote_clipboard_image_received(bytes(data), "image/jpeg")
+        self.win._on_local_clipboard_changed()  # Windows reports our own write a moment later
+        self.assertIsNone(self.win.server_instance.clipboard_image_bytes)
+
+    def test_failed_update_check_is_not_reported_as_up_to_date(self):
+        self.win.manual_update_check = False
+        self.win._on_update_checked({"checked": False, "error": "offline", "update_available": False})
+        self.assertNotIn("Up to date", self.win.btn_update.text())
+        self.win._on_update_checked({"checked": True, "update_available": False})
+        self.assertIn("Up to date", self.win.btn_update.text())
+
+    def _firewall_launch(self, bat):
+        """The command _configure_firewall launches for port 5003, with allow_firewall.bat at `bat`."""
+        launched = []
+        orig = (gui.get_resource_path, gui.subprocess.Popen, gui.QMessageBox.information, self.win.port)
+        gui.get_resource_path = lambda rel: gui.Path(bat)
+        gui.subprocess.Popen = lambda args, **kw: launched.append(args)
+        gui.QMessageBox.information = lambda *a, **k: None
+        self.win.port = 5003
+        try:
+            self.win._configure_firewall()
+        finally:
+            gui.get_resource_path, gui.subprocess.Popen, gui.QMessageBox.information, self.win.port = orig
+        return launched[0]
+
+    def test_firewall_script_gets_the_port_in_use(self):
+        # A stand-in script in a folder with a space and an apostrophe records what it was given.
+        import subprocess
+        folder = os.path.join(self.tmp, "Program Files", "O'Neil")
+        os.makedirs(folder, exist_ok=True)
+        bat = os.path.join(folder, "allow_firewall.bat")
+        with open(bat, "w") as f:
+            f.write('@echo %~1> "%~dp0got_port.txt"\n')
+        # Run what NearBeam would launch, minus the elevation prompt.
+        args = [a.replace("-Verb RunAs", "-Wait -WindowStyle Hidden") for a in self._firewall_launch(bat)]
+        subprocess.run(args, timeout=60)
+        with open(os.path.join(folder, "got_port.txt")) as f:
+            self.assertEqual(f.read().strip(), "5003")
+
+    def test_firewall_rules_without_the_script_reach_powershell_intact(self):
+        # A pip install has no allow_firewall.bat beside gui.py, so the rules go straight to PowerShell.
+        import subprocess
+        launched = self._firewall_launch(os.path.join(self.tmp, "missing", "allow_firewall.bat"))
+        self.assertIn("-LocalPort 5003", launched[-1])
+        # Run it minus the elevation prompt, with -WhatIf so no rule is really added.
+        out, err = os.path.join(self.tmp, "fw_out.txt"), os.path.join(self.tmp, "fw_err.txt")
+        redirect = f"-Wait -NoNewWindow -RedirectStandardOutput '{out}' -RedirectStandardError '{err}'"
+        args = [a.replace("-Verb RunAs", redirect).replace("-Action Allow", "-Action Allow -WhatIf") for a in launched]
+        subprocess.run(args, timeout=60)
+        with open(out) as f_out, open(err) as f_err:
+            self.assertEqual(f_err.read().strip(), "")
+            self.assertEqual(f_out.read().count("What if"), 4)
+
     def test_remote_device_names_are_plain_text(self):
         from PySide6.QtCore import Qt
         from ui.widgets import DeviceCard

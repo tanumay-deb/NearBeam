@@ -30,6 +30,36 @@ class TestSingleInstance(unittest.TestCase):
 
     def test_no_running_instance_means_start_normally(self):
         self.assertFalse(gui.hand_off_to_running_instance(f"NearBeam-test-{uuid.uuid4().hex}", {"show": True}))
+        lock = gui.claim_single_instance(f"NearBeam-test-{uuid.uuid4().hex}", {"show": True})
+        self.assertTrue(lock.isLocked())
+        lock.unlock()
+
+    def test_launch_during_anothers_startup_waits_instead_of_starting(self):
+        # The first copy holds the lock but is still building its window: no listener yet.
+        from PySide6.QtCore import QLockFile
+        key = f"NearBeam-test-{uuid.uuid4().hex}"
+        first = QLockFile(os.path.join(gui.tempfile.gettempdir(), f"{key}.lock"))
+        self.assertTrue(first.tryLock(0))
+        try:
+            code = f"import gui; print(gui.claim_single_instance({key!r}, {{'show': True}}) is None)"
+            proc = subprocess.Popen(
+                [sys.executable, "-c", code], cwd=REPO_ROOT,
+                env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self._pump(lambda: proc.poll() is not None, seconds=6)  # importing gui, then waiting on the lock
+            self.assertIsNone(proc.poll(), "second launch started (or quit) instead of waiting")
+            received = []
+            server = gui.listen_for_other_instances(key, received.append)  # first copy is up now
+            try:
+                self._pump(lambda: received and proc.poll() is not None, seconds=30)
+                out, err = proc.communicate(timeout=30)
+            finally:
+                server.close()
+            self.assertEqual(out.strip().splitlines()[-1], "True", err)
+            self.assertEqual(received, [{"show": True}])
+        finally:
+            first.unlock()
 
     def _second_launch(self, key, message):
         """A real second process, like clicking the Start-menu icon while NearBeam runs."""

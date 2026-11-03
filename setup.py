@@ -1,54 +1,11 @@
-from setuptools import setup, find_packages
-from pathlib import Path
+from setuptools import setup, find_namespace_packages, find_packages
 
-this_directory = Path(__file__).parent
-long_description = (this_directory / "README.md").read_text(encoding="utf-8") if (this_directory / "README.md").exists() else ""
-
+# Name, version, dependencies, commands and classifiers live in pyproject.toml, which overrides them here.
 setup(
-    name="nearbeam",
-    version="1.6.2",
-    description="Ultra-Fast Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    author="Tanumay Goswami",
-    author_email="tanumaygoswami2001@gmail.com",
-    url="https://github.com/tanumay-deb/NearBeam",
     py_modules=["main", "gui"],
-    packages=find_packages(),
+    # The app reads templates/, static/ and assets/ beside core/, so they install there as data
+    # folders, with their files listed in MANIFEST.in.
+    # shortcut: generic top-level names, like core/ and ui/; move all into a nearbeam/ package if one clashes.
+    packages=find_packages() + find_namespace_packages(include=["templates", "static*", "assets*"]),
     include_package_data=True,
-    package_data={
-        "": [
-            "templates/*",
-            "static/**/*",
-            "assets/*",
-            "allow_firewall.bat",
-        ],
-    },
-    install_requires=[
-        "flask>=3.0.0",
-        "flask-cors>=4.0.0",
-        "qrcode>=8.0.0",
-        "Pillow>=10.0.0",
-        "PySide6>=6.5.0",
-        "zeroconf>=0.130.0",
-    ],
-    entry_points={
-        "console_scripts": [
-            "nearbeam = main:main",
-            "landrop = main:main",
-        ],
-        "gui_scripts": [
-            "nearbeam-gui = main:main",
-            "landrop-gui = main:main",
-        ],
-    },
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
-        "Operating System :: Microsoft :: Windows",
-        "Operating System :: MacOS",
-        "Operating System :: POSIX :: Linux",
-        "Topic :: Communications :: File Sharing",
-    ],
-    python_requires=">=3.8",
 )

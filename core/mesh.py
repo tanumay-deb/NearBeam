@@ -343,6 +343,12 @@ class MeshManager:
                 "port": self.port,
             })
 
+    def set_ip(self, ip: str):
+        """The PC moved networks: announcements carry the new address, and a node re-registers."""
+        self.ip = ip
+        if self.role == "node" and self.leader_info:
+            threading.Thread(target=self._register_with_leader, daemon=True).start()
+
     def promote_to_leader(self):
         """Promotes this node to Primary Host (Leader)."""
         with self._lock:

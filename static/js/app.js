@@ -2489,19 +2489,37 @@ function setupModalEvents() {
   });
 }
 
+// Documents that read as plain text; PDFs and Office files are binary and would show as garbage.
+const TEXT_PREVIEW_EXTS = new Set(["txt", "md", "csv", "log"]);
+
 async function openPreviewModal(title, category, previewUrl, downloadUrl) {
   previewModalTitle.innerText = title;
   previewModalBody.innerHTML = "<p>Loading preview...</p>";
   btnModalDownload.href = downloadUrl;
   previewModal.classList.remove("hidden");
 
+  const ext = (title.split(".").pop() || "").toLowerCase();
   if (category === "image") {
-    previewModalBody.innerHTML = `<img src="${previewUrl}" alt="${title}" />`;
+    // Built as elements: the file name never becomes markup.
+    const img = document.createElement("img");
+    img.src = previewUrl;
+    img.alt = title;
+    previewModalBody.replaceChildren(img);
   } else if (category === "video") {
     previewModalBody.innerHTML = `<video src="${previewUrl}" controls autoplay playsinline></video>`;
   } else if (category === "audio") {
     previewModalBody.innerHTML = `<audio src="${previewUrl}" controls autoplay></audio>`;
-  } else if (category === "code" || category === "document") {
+  } else if (ext === "pdf") {
+    // The browser's own PDF viewer (in a new tab) works on phones; an inline frame often doesn't.
+    const p = document.createElement("p");
+    const link = document.createElement("a");
+    link.href = previewUrl;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Open PDF";
+    p.append(link);
+    previewModalBody.replaceChildren(p);
+  } else if (category === "code" || TEXT_PREVIEW_EXTS.has(ext)) {
     try {
       const res = await fetch(previewUrl);
       const text = await res.text();

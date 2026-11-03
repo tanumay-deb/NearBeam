@@ -13,6 +13,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -22,7 +23,7 @@ from pathlib import Path
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QLockFile, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QAction,
@@ -88,6 +89,17 @@ from ui.widgets import (
     label,
     repolish,
 )
+
+
+def is_private_clipboard(mime) -> bool:
+    """Password managers tag secrets with these Windows clipboard formats so that clipboard
+    monitors and sync tools leave them alone."""
+    for fmt in mime.formats():
+        if "ExcludeClipboardContentFromMonitorProcessing" in fmt or "Clipboard Viewer Ignore" in fmt:
+            return True
+        if ("CanUploadToCloudClipboard" in fmt or "CanIncludeInClipboardHistory" in fmt) and bytes(mime.data(fmt))[:4] == b"\0\0\0\0":
+            return True  # DWORD 0: keep it off other devices
+    return False
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -316,8 +328,9 @@ class MainWindow(QMainWindow):
         self.active_transfers = {}
         self.server_events = queue.Queue()
 
-        # Clipboard auto-sync tracking state
-        self._suppress_clipboard_echo = False
+        # Clipboard auto-sync tracking state. Windows reports our own clipboard writes later,
+        # through the message queue, so echoes are ignored for a moment rather than by a flag.
+        self._ignore_clipboard_until = 0.0
         self._last_synced_clipboard = ""
         self._last_synced_image_hash = ""
         self._clip_last = None
@@ -602,14 +615,8 @@ class MainWindow(QMainWindow):
             self.server_thread = ServerThread(self.server_instance.app, "0.0.0.0", actual_port)
             self.server_thread.start()
 
-            urls = get_connection_urls(actual_port)
-            self.active_urls = urls
-            self.active_nearbeam_url = urls["nearbeam_url"]
-            self.active_primary_url = urls["primary_url"]
-            self.active_mdns_url = urls["mdns_url"]
-
-            self._show_addresses()
-            self._append_log(f"Server started on port {actual_port}. Permanent address: {urls['nearbeam_url']}.", "info")
+            self._update_addresses()
+            self._append_log(f"Server started on port {actual_port}. Permanent address: {self.active_nearbeam_url}.", "info")
 
             # Initialize mesh status display
             if self.server_instance.mesh:
@@ -629,6 +636,15 @@ class MainWindow(QMainWindow):
             repolish(self.status_label)
             QMessageBox.critical(self, "Server Error", f"Failed to start server: {e}")
 
+    def _update_addresses(self):
+        """Reads this PC's current addresses (at start, and whenever the network changes)."""
+        urls = get_connection_urls(self.port)
+        self.active_urls = urls
+        self.active_nearbeam_url = urls["nearbeam_url"]
+        self.active_primary_url = urls["primary_url"]
+        self.active_mdns_url = urls["mdns_url"]
+        self._show_addresses()
+
     def _show_addresses(self):
         """Fills the sidebar's name + IP addresses and the QR code."""
         # nearbeam.local belongs to the mesh leader; on a secondary PC it would open the other PC.
@@ -646,32 +662,29 @@ class MainWindow(QMainWindow):
 
     def _configure_firewall(self):
         """Allows NearBeam through Windows Firewall with a single click."""
+        # NearBeam moves to 5001+ when 5000 is taken: open the port it is actually using.
+        # Passing a list lets Python quote the line for powershell.exe; '' escapes ' in PowerShell.
         bat_path = get_resource_path("allow_firewall.bat")
         if bat_path.exists():
-            cmd = f'powershell -Command "Start-Process cmd -ArgumentList \'/c \"\"{bat_path}\"\"\' -Verb RunAs"'
-            os.system(cmd)
-            self._append_log("Invoked Windows Firewall auto-configuration script with Administrator privileges.", "info")
-            QMessageBox.information(
-                self,
-                "Windows Firewall Configuration",
-                "A Windows User Account Control (UAC) prompt will appear.\n\n"
-                "Click 'Yes' to add permanent inbound firewall rules for Port 5000 & mDNS.\n"
-                "Once allowed, Windows will never prompt you again!",
-            )
+            # cmd strips the outer quotes of /c ""<bat>" <port>", which keeps a path with spaces whole.
+            bat = str(bat_path).replace("'", "''")
+            script = f"Start-Process cmd -ArgumentList '/c \"\"{bat}\" {self.port}\"' -Verb RunAs"
         else:
-            ps_cmd = (
-                'powershell -Command "Start-Process powershell -ArgumentList \'-Command '
-                '\\\"New-NetFirewallRule -DisplayName \\\'NearBeam Wi-Fi File Transfer\\\' -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'NearBeam Wi-Fi File Transfer UDP\\\' -Direction Inbound -LocalPort 5000 -Protocol UDP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'NearBeam mDNS Discovery\\\' -Direction Inbound -LocalPort 5353 -Protocol UDP -Action Allow; '
-                'New-NetFirewallRule -DisplayName \\\'NearBeam Mesh Peer Discovery\\\' -Direction Inbound -LocalPort 5005 -Protocol UDP -Action Allow\\\"\' -Verb RunAs"'
-            )
-            os.system(ps_cmd)
-            QMessageBox.information(
-                self,
-                "Windows Firewall",
-                "Firewall configuration commands have been sent. Confirm the administrator prompt to apply.",
-            )
+            # No script beside gui.py (a pip install): add the script's rules straight from PowerShell.
+            rules = [("NearBeam Wi-Fi File Transfer", "TCP", self.port), ("NearBeam Wi-Fi File Transfer UDP", "UDP", self.port),
+                     ("NearBeam mDNS Discovery", "UDP", 5353), ("NearBeam Mesh Peer Discovery", "UDP", 5005)]
+            command = "; ".join(f"New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -LocalPort {port} -Protocol {protocol} -Action Allow"
+                                for name, protocol, port in rules).replace("'", "''")
+            script = f"Start-Process powershell -ArgumentList '-NoProfile -Command {command}' -Verb RunAs"
+        subprocess.Popen(["powershell", "-NoProfile", "-Command", script], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self._append_log("Invoked Windows Firewall auto-configuration script with Administrator privileges.", "info")
+        QMessageBox.information(
+            self,
+            "Windows Firewall Configuration",
+            "A Windows User Account Control (UAC) prompt will appear.\n\n"
+            f"Click 'Yes' to add permanent inbound firewall rules for Port {self.port} & mDNS.\n"
+            "Once allowed, Windows will never prompt you again!",
+        )
 
     def _check_updates_async(self, manual: bool = False):
         self.manual_update_check = manual
@@ -704,6 +717,16 @@ class MainWindow(QMainWindow):
                 )
                 if reply == QMessageBox.Yes:
                     webbrowser.open(res.get("release_url", RELEASES_URL))
+        elif not res.get("checked"):
+            # Offline or GitHub unreachable: that says nothing about being up to date.
+            self.btn_update.setText(f"v{APP_VERSION} · Check for updates")
+            self.btn_update.setToolTip("Couldn't reach GitHub. Click to try again.")
+            if getattr(self, "manual_update_check", False):
+                QMessageBox.warning(
+                    self,
+                    "Couldn't Check for Updates",
+                    f"NearBeam couldn't reach GitHub to check for a newer version.\n\n{res.get('error') or ''}".strip(),
+                )
         else:
             self.btn_update.setText(f"v{APP_VERSION} · Up to date")
             self.btn_update.setToolTip("Check for updates")
@@ -975,8 +998,10 @@ class MainWindow(QMainWindow):
         return ip or "a device"
 
     def _drain_server_events(self):
-        """Turns the server's live upload events into incoming transfer rows."""
+        """Turns the server's live events into transfer rows, history and the shared folders list."""
         changed_history = False
+        changed_folders = False
+        changed_network = False
         while True:
             try:
                 payload = self.server_events.get_nowait()
@@ -1040,8 +1065,18 @@ class MainWindow(QMainWindow):
                     else:
                         entry["row"].set_finished(False, "Stopped")
                         QTimer.singleShot(3000, lambda t=did: self._remove_active_row(t))
+            elif etype == "safelist_updated":
+                # e.g. Explorer "Send with NearBeam" while this window runs (via /api/shell-send)
+                changed_folders = True
+            elif etype == "network_changed":
+                changed_network = True
         if changed_history:
             self._refresh_history()
+        if changed_folders:
+            self._refresh_safe_table()
+        if changed_network:
+            self._update_addresses()
+            self._refresh_nearby_devices_ui()
         self._sweep_stalled_rows()
 
     def _sweep_stalled_rows(self, max_idle: float = 120.0):
@@ -1130,26 +1165,25 @@ class MainWindow(QMainWindow):
         if not self._clip_last:
             return
         kind, value = self._clip_last
-        self._suppress_clipboard_echo = True
-        try:
-            if kind == "text":
-                QApplication.clipboard().setText(value)
-            else:
-                QApplication.clipboard().setImage(value)
-        finally:
-            self._suppress_clipboard_echo = False
+        self._ignore_clipboard_until = time.monotonic() + 1.0
+        if kind == "text":
+            QApplication.clipboard().setText(value)
+        else:
+            QApplication.clipboard().setImage(value)
         self.clipboard_page.btn_copy.setText("Copied")
         QTimer.singleShot(1200, lambda: self.clipboard_page.btn_copy.setText("Copy text" if kind == "text" else "Copy image"))
     def _on_local_clipboard_changed(self):
         """Called whenever text or a screenshot/image is copied anywhere on Windows (Ctrl+C / Win+Shift+S)."""
         if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
             return
-        if getattr(self, "_suppress_clipboard_echo", False):
-            return
+        if time.monotonic() < self._ignore_clipboard_until:
+            return  # our own write coming back
 
         try:
             clipboard = QApplication.clipboard()
             mime_data = clipboard.mimeData()
+            if mime_data and is_private_clipboard(mime_data):
+                return
 
             # 1. Check for copied screenshot or image first (NB-07)
             if mime_data and mime_data.hasImage():
@@ -1209,15 +1243,13 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._suppress_clipboard_echo = True
+            self._ignore_clipboard_until = time.monotonic() + 1.0
             self._last_synced_clipboard = text
             QApplication.clipboard().setText(text)
-            self._suppress_clipboard_echo = False
             snippet = (text[:30] + "...") if len(text) > 30 else text
             self._append_log(f"Received and copied mobile clipboard to Windows: '{snippet}'", "info")
             self._show_clip("text", text, "From another device")
         except Exception as e:
-            self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_received: {e}")
 
     def _on_remote_clipboard_image_received(self, img_bytes: bytes, mime_type: str):
@@ -1237,10 +1269,9 @@ class MainWindow(QMainWindow):
             if qimg.isNull():
                 return
 
-            self._suppress_clipboard_echo = True
+            self._ignore_clipboard_until = time.monotonic() + 1.0
             self._last_synced_image_hash = img_hash
             QApplication.clipboard().setImage(qimg)
-            self._suppress_clipboard_echo = False
             kb = len(img_bytes) / 1024.0
             self._append_log(
                 f"Copied incoming image ({kb:.1f} KB) to the Windows clipboard",
@@ -1248,7 +1279,6 @@ class MainWindow(QMainWindow):
             )
             self._show_clip("image", qimg, "From another device")
         except Exception as e:
-            self._suppress_clipboard_echo = False
             print(f"Error in _on_remote_clipboard_image_received: {e}")
 
     def _toggle_shell_integration(self, checked: bool):
@@ -1367,6 +1397,21 @@ class MainWindow(QMainWindow):
 INSTANCE_KEY = f"NearBeam-{getpass.getuser()}"
 
 
+def claim_single_instance(key: str, message: dict, wait: float = 20.0):
+    """Returns a held lock when this process should run NearBeam, or None once `message` reached
+    the copy that runs. The lock is atomic, so two launches at once (Explorer starts one per
+    selected file) can't both start; the loser waits for the winner's listener to come up."""
+    lock = QLockFile(os.path.join(tempfile.gettempdir(), f"{key}.lock"))
+    deadline = time.monotonic() + wait
+    while True:
+        if hand_off_to_running_instance(key, message):
+            return None
+        if lock.tryLock(0) or lock.error() != QLockFile.LockFailedError or time.monotonic() > deadline:
+            # Unusable lock file, or the holder never came up: better a second copy than none.
+            return lock
+        time.sleep(0.2)
+
+
 def hand_off_to_running_instance(key: str, message: dict) -> bool:
     """True if a NearBeam window already runs for this user and took the message."""
     if sys.platform == "win32":
@@ -1415,9 +1460,11 @@ def run_gui(start_minimized: bool = False, send_paths: list[str] = None):
     app = QApplication(sys.argv)
     app.setApplicationName("NearBeam")
     # One NearBeam per user: e.g. opening it from the Start menu while the autostarted tray copy runs.
-    if hand_off_to_running_instance(INSTANCE_KEY, {"show": not start_minimized, "paths": send_paths or []}):
+    instance_lock = claim_single_instance(INSTANCE_KEY, {"show": not start_minimized, "paths": send_paths or []})
+    if instance_lock is None:
         return
     window = MainWindow(send_paths=send_paths)
+    window.instance_lock = instance_lock  # held for the app's lifetime
     window.instance_server = listen_for_other_instances(INSTANCE_KEY, window._on_other_instance, window)
     if not start_minimized:
         window.show()
