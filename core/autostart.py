@@ -18,19 +18,15 @@ def is_windows() -> bool:
 
 
 def is_autostart_enabled() -> bool:
-    """Checks if NearBeam (or legacy LANDrop) is registered in Windows startup."""
+    """Checks if NearBeam is registered in Windows startup."""
     if not is_windows():
         return False
 
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_READ) as key:
-            try:
-                winreg.QueryValueEx(key, APP_NAME)
-                return True
-            except (FileNotFoundError, OSError):
-                winreg.QueryValueEx(key, LEGACY_APP_NAME)
-                return True
+            val, _ = winreg.QueryValueEx(key, APP_NAME)
+            return bool(val)
     except (FileNotFoundError, OSError):
         return False
 
@@ -46,7 +42,15 @@ def set_autostart(enabled: bool, start_minimized: bool = True) -> bool:
     import winreg
 
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            key_cm = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH)
+        else:
+            try:
+                key_cm = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE)
+            except FileNotFoundError:
+                return True
+
+        with key_cm as key:
             # Always purge legacy entry
             try:
                 winreg.DeleteValue(key, LEGACY_APP_NAME)

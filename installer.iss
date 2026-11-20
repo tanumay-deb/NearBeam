@@ -25,7 +25,6 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ; Close a running (tray) NearBeam or legacy LANDrop so its locked exe can be replaced
 CloseApplications=force
@@ -68,4 +67,4 @@ Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam"; ValueType: stri
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" --send ""%1"""; Tasks: contextmenu; Flags: uninsdeletekey
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser

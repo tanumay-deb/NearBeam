@@ -5,6 +5,7 @@ Network utilities for local IP detection, mDNS hostname resolution, and port man
 import io
 import socket
 import sys
+import threading
 
 
 def get_hostname() -> str:
@@ -18,17 +19,33 @@ def get_hostname() -> str:
 def get_local_ip() -> str:
     """
     Returns the primary non-loopback IPv4 address on the active network interface.
+    Falls back to local interface enumeration on isolated LANs without an internet route.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # Connecting to a public IP doesn't send packets, but prompts OS to select the active interface
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
-        ip = "127.0.0.1"
+        pass
     finally:
         s.close()
-    return ip
+
+    # Fallback for air-gapped / isolated Wi-Fi LANs with no default gateway
+    fallback = None
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            if not addr or addr.startswith("127."):
+                continue
+            if not addr.startswith("169.254."):
+                return addr
+            fallback = fallback or addr
+    except Exception:
+        pass
+    return fallback or "127.0.0.1"
 
 
 def get_all_local_ips() -> list[str]:
@@ -113,37 +130,61 @@ class ZeroconfBroadcaster:
         self.port = port
         self.zc = None
         self.info = None
+        self._lock = threading.Lock()
 
     def start(self, ip: str = None):
-        try:
-            from zeroconf import ServiceInfo, Zeroconf
+        with self._lock:
             target_ip = ip or get_local_ip()
-            if target_ip.startswith("127."):
+            if not target_ip or target_ip.startswith("127."):
                 return
 
-            self.zc = Zeroconf()
-            self.info = ServiceInfo(
-                type_="_http._tcp.local.",
-                name=f"{self.name}._http._tcp.local.",
-                addresses=[socket.inet_aton(target_ip)],
-                port=self.port,
-                properties={"path": "/", "app": "NearBeam"},
-                server=f"{self.name}.local.",
-            )
-            self.zc.register_service(self.info)
-            print(f"  [Zeroconf] Broadcasting permanent address: http://{self.name}.local:{self.port}")
-        except Exception as e:
-            print(f"  [Zeroconf] Could not start mDNS broadcaster: {e}")
+            if self.zc is not None:
+                self._stop_locked()
 
-    def stop(self):
-        if self.zc and self.info:
+            zc = None
             try:
-                self.zc.unregister_service(self.info)
-                self.zc.close()
+                from zeroconf import ServiceInfo, Zeroconf
+
+                zc = Zeroconf()
+                info = ServiceInfo(
+                    type_="_http._tcp.local.",
+                    name=f"{self.name}._http._tcp.local.",
+                    addresses=[socket.inet_aton(target_ip)],
+                    port=self.port,
+                    properties={"path": "/", "app": "NearBeam"},
+                    server=f"{self.name}.local.",
+                )
+                zc.register_service(info)
+                self.zc = zc
+                self.info = info
+                print(f"  [Zeroconf] Broadcasting permanent address: http://{self.name}.local:{self.port}")
+            except Exception as e:
+                if zc is not None:
+                    try:
+                        zc.close()
+                    except Exception:
+                        pass
+                print(f"  [Zeroconf] Could not start mDNS broadcaster: {e}")
+
+    def _stop_locked(self):
+        zc = self.zc
+        info = self.info
+        self.zc = None
+        self.info = None
+        if zc is not None:
+            if info is not None:
+                try:
+                    zc.unregister_service(info)
+                except Exception:
+                    pass
+            try:
+                zc.close()
             except Exception:
                 pass
-            self.zc = None
-            self.info = None
+
+    def stop(self):
+        with self._lock:
+            self._stop_locked()
 
 
 def generate_qr_png_bytes(url: str) -> bytes:

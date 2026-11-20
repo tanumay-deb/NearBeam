@@ -21,7 +21,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from core.config import config
+from core.config import config, user_config_path
 from core.network import (
     find_available_port,
     get_connection_urls,
@@ -43,7 +43,7 @@ def run_headless(port: int = 5000):
     print(f"  👉 Hostname URL:           {urls['mdns_url']}")
     print(f"  👉 Direct IP URL:          {urls['primary_url']}")
     print(f"  🔍 Network Auto-Finder:    {urls['primary_url']}/finder")
-    print("\n  💡 Tip: Bookmark 'http://nearbeam.local:5000' on your phone.")
+    print(f"\n  💡 Tip: Bookmark '{urls['nearbeam_url']}' on your phone.")
     print("  It automatically stays connected even if your router changes your IP!\n")
     print(f"  📁 Auto-Save Destination:  {config.save_directory}")
     print(f"  🔒 Safe List Folders:      {len(config.get_safe_folders())} folder(s) shared")
@@ -77,7 +77,7 @@ def ensure_windows_start_menu_shortcut():
         if not appdata:
             return
         programs_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs")
-        
+
         # Clean up legacy shortcut if present
         legacy_shortcut = os.path.join(programs_dir, "LANDrop.lnk")
         if os.path.exists(legacy_shortcut):
@@ -98,13 +98,20 @@ def ensure_windows_start_menu_shortcut():
             target = sys.executable
             icon_path = target
         else:
-            scripts_exe = os.path.join(os.path.dirname(sys.executable), "Scripts", "nearbeam.exe")
-            if not os.path.exists(scripts_exe):
-                scripts_exe = os.path.join(os.path.dirname(sys.executable), "Scripts", "landrop.exe")
-            if os.path.exists(scripts_exe):
-                target = scripts_exe
+            exe_dir = os.path.dirname(sys.executable)
+            candidates = (
+                os.path.join(exe_dir, "nearbeam-gui.exe"),
+                os.path.join(exe_dir, "Scripts", "nearbeam-gui.exe"),
+                os.path.join(exe_dir, "nearbeam.exe"),
+                os.path.join(exe_dir, "Scripts", "nearbeam.exe"),
+                os.path.join(exe_dir, "Scripts", "landrop.exe"),
+            )
+            found_exe = next((p for p in candidates if os.path.exists(p)), None)
+            if found_exe:
+                target = found_exe
             else:
-                target = sys.executable
+                pythonw = os.path.join(exe_dir, "pythonw.exe")
+                target = pythonw if os.path.exists(pythonw) else sys.executable
                 args = f'"{os.path.abspath(__file__)}"'
 
             possible_icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico")
@@ -112,19 +119,30 @@ def ensure_windows_start_menu_shortcut():
                 icon_path = possible_icon
 
         os.makedirs(programs_dir, exist_ok=True)
-        ps_cmd = (
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$s = $ws.CreateShortcut("{shortcut_path}"); '
-            f'$s.TargetPath = "{target}"; '
+        ps_script = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$s = $ws.CreateShortcut($env:NB_LNK); "
+            "$s.TargetPath = $env:NB_TARGET; "
+            "if ($env:NB_ARGS) { $s.Arguments = $env:NB_ARGS }; "
+            "if ($env:NB_ICON) { $s.IconLocation = $env:NB_ICON }; "
+            "$s.Save()"
         )
-        if args:
-            ps_cmd += f'$s.Arguments = \'{args}\'; '
-        if icon_path:
-            ps_cmd += f'$s.IconLocation = "{icon_path},0"; '
-        ps_cmd += '$s.Save()'
+        ps_env = {
+            **os.environ,
+            "NB_LNK": shortcut_path,
+            "NB_TARGET": target,
+            "NB_ARGS": args,
+            "NB_ICON": f"{icon_path},0" if icon_path else "",
+        }
 
         import subprocess
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd], capture_output=True, timeout=5)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            env=ps_env,
+            capture_output=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except Exception:
         pass
 
@@ -132,20 +150,27 @@ def ensure_windows_start_menu_shortcut():
 def send_paths_to_running_instance(paths: list[str], port: int = 5000) -> bool:
     """If NearBeam is already running locally, hand off shared paths via HTTP API."""
     import json
+    import socket
     import urllib.request
 
-    for candidate_port in (port, 5000, 5001, 5002):
+    candidate_ports = list(dict.fromkeys((port, 5000, 5001, 5002)))
+    payload = json.dumps({"paths": paths}).encode("utf-8")
+    for candidate_port in candidate_ports:
         try:
-             payload = json.dumps({"paths": paths}).encode("utf-8")
-             req = urllib.request.Request(
-                 f"http://127.0.0.1:{candidate_port}/api/shell-send",
-                 data=payload,
-                 headers={"Content-Type": "application/json"},
-                 method="POST",
-             )
-             with urllib.request.urlopen(req, timeout=2.0) as resp:
-                 if resp.status == 200:
-                     return True
+            with socket.create_connection(("127.0.0.1", candidate_port), timeout=0.2):
+                pass
+        except OSError:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{candidate_port}/api/shell-send",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    return True
         except Exception:
             continue
     return False
@@ -157,7 +182,7 @@ def main():
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     ensure_windows_start_menu_shortcut()
-    if sys.platform == "win32" and config.data.get("shell_integration_enabled", True):
+    if sys.platform == "win32" and config.data.get("shell_integration_enabled") is True:
         try:
             from core.shell_integration import is_shell_integration_enabled, set_shell_integration
             if not is_shell_integration_enabled():
@@ -199,35 +224,48 @@ def main():
 
     send_paths = [os.path.abspath(p) for p in (args.send + args.paths) if p and os.path.exists(p)]
 
-    if send_paths and send_paths_to_running_instance(send_paths, args.port):
-        return
-
     if args.headless:
+        if send_paths and send_paths_to_running_instance(send_paths, args.port):
+            return
         run_headless(args.port)
     else:
+        if send_paths:
+            # Prefer waking an existing desktop GUI via QLocalSocket; fall back to HTTP for a headless server.
+            try:
+                from gui import SINGLE_INSTANCE_KEY, hand_off_to_running_instance
+                if hand_off_to_running_instance(SINGLE_INSTANCE_KEY, {"show": True, "paths": send_paths}):
+                    return
+            except Exception:
+                pass
+            if send_paths_to_running_instance(send_paths, args.port):
+                return
         try:
             from gui import run_gui
             run_gui(start_minimized=args.minimized, send_paths=send_paths)
         except Exception as e:
             import traceback
             err_msg = traceback.format_exc()
+            log_path = user_config_path().parent / "nearbeam_error.log"
             try:
-                with open("nearbeam_error.log", "w", encoding="utf-8") as f:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "w", encoding="utf-8") as f:
                     f.write(err_msg)
             except Exception:
-                pass
-            print(f"Failed to launch GUI ({e}), falling back to headless CLI mode...\n")
+                log_path = Path("nearbeam_error.log")
+            if sys.stdout is not None:
+                print(f"Failed to launch GUI ({e}), falling back to headless CLI mode...\n")
             try:
                 import ctypes
                 ctypes.windll.user32.MessageBoxW(
                     0,
-                    f"NearBeam could not open the desktop window:\n\n{e}\n\nDetails saved to nearbeam_error.log",
+                    f"NearBeam could not open the desktop window:\n\n{e}\n\nDetails saved to {log_path}",
                     "NearBeam Launch Notice",
                     0x30,
                 )
             except Exception:
                 pass
-            run_headless(args.port)
+            if sys.stdout is not None:
+                run_headless(args.port)
 
 
 if __name__ == "__main__":

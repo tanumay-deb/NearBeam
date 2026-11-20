@@ -50,7 +50,7 @@ def _get_sendto_shortcut_path() -> str | None:
 
 
 def is_shell_integration_enabled() -> bool:
-    """Checks if 'Send with NearBeam' is registered in Windows Explorer context menu."""
+    """Checks if 'Send with NearBeam' is registered in Windows Explorer context menu with a valid target."""
     if not is_windows():
         return False
 
@@ -60,7 +60,19 @@ def is_shell_integration_enabled() -> bool:
             winreg.HKEY_CURRENT_USER, f"{FILE_SHELL_KEY}\\command", 0, winreg.KEY_READ
         ) as key:
             val, _ = winreg.QueryValueEx(key, "")
-            return bool(val)
+            if not isinstance(val, str) or not val.strip():
+                return False
+            expected_cmd, _ = _get_launch_command_and_icon()
+            if val.strip().lower() == expected_cmd.strip().lower():
+                return True
+            # Accept an existing command only if its referenced executable still exists
+            stripped = val.strip()
+            if stripped.startswith('"'):
+                end = stripped.find('"', 1)
+                exe = stripped[1:end] if end > 1 else ""
+            else:
+                exe = stripped.split(" ", 1)[0]
+            return bool(exe and os.path.exists(exe))
     except (FileNotFoundError, OSError):
         return False
 
@@ -128,18 +140,27 @@ def set_shell_integration(enabled: bool) -> bool:
                         args = f'"{main_py}" --send'
                         icon_loc = f"{icon_ico},0" if icon_ico.exists() else f"{target},0"
 
-                    ps_cmd = (
-                        f'$ws = New-Object -ComObject WScript.Shell; '
-                        f'$s = $ws.CreateShortcut("{sendto_path}"); '
-                        f'$s.TargetPath = "{target}"; '
-                        f'$s.Arguments = \'{args}\'; '
-                        f'$s.IconLocation = "{icon_loc}"; '
-                        f'$s.Save()'
+                    ps_script = (
+                        "$ws = New-Object -ComObject WScript.Shell; "
+                        "$s = $ws.CreateShortcut($env:NB_LNK); "
+                        "$s.TargetPath = $env:NB_TARGET; "
+                        "$s.Arguments = $env:NB_ARGS; "
+                        "$s.IconLocation = $env:NB_ICON; "
+                        "$s.Save()"
                     )
+                    ps_env = {
+                        **os.environ,
+                        "NB_LNK": sendto_path,
+                        "NB_TARGET": target,
+                        "NB_ARGS": args,
+                        "NB_ICON": icon_loc,
+                    }
                     subprocess.run(
-                        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                        env=ps_env,
                         capture_output=True,
                         timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                 except Exception:
                     pass

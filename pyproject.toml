@@ -7,7 +7,7 @@ name = "nearbeam"
 version = "1.6.3"
 description = "Ultra-Fast Local Wi-Fi File Sharing & Explorer with Multi-Device Mesh"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     { name = "Tanumay Goswami", email = "tanumaygoswami2001@gmail.com" }
 ]
