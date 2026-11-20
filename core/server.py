@@ -69,6 +69,7 @@ PRECOMPRESSED_EXTENSIONS = {
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"
 }
 
+from core.batches import BatchStore
 from core.config import config
 from core.mesh import MeshManager
 from core.network import (
@@ -301,6 +302,12 @@ class NearBeamServer:
         # Active background ZIP packaging jobs
         self.zip_jobs: Dict[str, Dict[str, Any]] = {}
         self.zip_jobs_lock = threading.Lock()
+
+        # Ephemeral PC -> Devices Send Batches (separate from permanent Safe List)
+        self.batch_store = BatchStore(
+            format_size_fn=format_size,
+            category_fn=get_file_type_category,
+        )
 
         # Recently finished uploads: a resent last chunk (its response got lost) gets the
         # same answer instead of a 409 or a second copy of the file.
@@ -725,6 +732,67 @@ class NearBeamServer:
                 if q in self.event_subscribers:
                     self.event_subscribers.remove(q)
 
+    def create_send_batch(
+        self,
+        paths: list[str],
+        source: str = "Drop zone",
+        merge_window: float = 0.0,
+    ) -> Optional[dict]:
+        """Creates (or merges) an ephemeral PC -> Devices Send Batch without touching Safe List."""
+        batch = self.batch_store.create_or_merge(paths, source=source, merge_window=merge_window)
+        if not batch:
+            return None
+        self.log_activity(
+            f"Ready for devices ({source}): {batch['label']} ({batch['formatted_size']})",
+            event_type="upload",
+        )
+        self.broadcast_event({
+            "type": "batches_updated",
+            "batch_id": batch["id"],
+            "label": batch["label"],
+            "file_count": batch["file_count"],
+        })
+        return batch
+
+    def _start_zip_job(self, folder_name: str, files_list: list, total_bytes: int) -> dict:
+        """Spawns an async background ZIP packaging job and returns its job metadata."""
+        self._cleanup_old_zip_jobs()
+        job_id = str(uuid.uuid4())
+        temp_zip_path = os.path.join(tempfile.gettempdir(), f"nearbeam_zip_{job_id}.zip")
+        cancel_event = threading.Event()
+
+        with self.zip_jobs_lock:
+            self.zip_jobs[job_id] = {
+                "job_id": job_id,
+                "folder_name": folder_name,
+                "temp_path": temp_zip_path,
+                "status": "processing",
+                "error": None,
+                "total_files": len(files_list),
+                "processed_files": 0,
+                "total_bytes": total_bytes,
+                "processed_bytes": 0,
+                "percent": 0.0,
+                "current_file": "Initializing...",
+                "created_at": time.time(),
+                "cancel_event": cancel_event,
+            }
+
+        worker_thread = threading.Thread(
+            target=self._run_zip_worker,
+            args=(job_id, "", temp_zip_path, files_list),
+            daemon=True,
+        )
+        worker_thread.start()
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "folder_name": folder_name,
+            "total_files": len(files_list),
+            "total_bytes": total_bytes,
+        }
+
     def _track_download(self, resp, filename: str):
         """Wraps a file response so the desktop app can show phone/browser downloads
         with live progress. Small files and non-file responses pass through untouched."""
@@ -1002,20 +1070,30 @@ class NearBeamServer:
                 is_file = os.path.isfile(folder_path)
                 exists = os.path.exists(folder_path)
                 item_count = 1 if is_file else 0
-                if exists and not is_file:
-                    try:
-                        item_count = len(os.listdir(folder_path))
-                    except Exception:
-                        item_count = 0
-
-                result.append({
+                entry = {
                     "id": folder["id"],
                     "name": folder["name"],
                     "path": folder_path,
                     "exists": exists,
                     "is_file": is_file,
                     "item_count": item_count,
-                })
+                }
+                if exists and is_file:
+                    try:
+                        st = os.stat(folder_path)
+                        entry["size"] = st.st_size
+                        entry["formatted_size"] = format_size(st.st_size)
+                        entry["modified"] = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        entry["category"] = get_file_type_category(folder["name"])
+                    except OSError:
+                        entry["category"] = get_file_type_category(folder["name"])
+                elif exists and not is_file:
+                    try:
+                        entry["item_count"] = len(os.listdir(folder_path))
+                    except Exception:
+                        entry["item_count"] = 0
+
+                result.append(entry)
             return jsonify({"folders": result})
 
         @app.route("/api/safelist/browse")
@@ -1189,10 +1267,11 @@ class NearBeamServer:
 
         @app.route("/api/safelist/prepare-zip", methods=["POST"])
         def api_safelist_prepare_zip():
-            """Starts background job to package a Safe List folder or subfolder into a ZIP."""
+            """Starts background job to package a Safe List folder, subfolder, or selected items into a ZIP."""
             data = request.get_json(silent=True) or request.form or {}
             folder_id = data.get("folder_id", "")
             subpath = data.get("subpath", "")
+            selected_items = data.get("items")
 
             try:
                 real_target = config.resolve_safe_path(folder_id, subpath)
@@ -1202,13 +1281,56 @@ class NearBeamServer:
             if not os.path.isdir(real_target):
                 return jsonify({"error": "Not a directory"}), 400
 
-            self._cleanup_old_zip_jobs()
-
             folder_name = os.path.basename(real_target) or "shared_folder"
-
-            # Pre-scan directory to determine total file count and byte size
             files_list = []
             total_bytes = 0
+
+            if isinstance(selected_items, list) and len(selected_items) > 0:
+                seen_files = set()
+                for item_sub in selected_items:
+                    if not isinstance(item_sub, str) or not item_sub.strip():
+                        continue
+                    try:
+                        item_real = config.resolve_safe_path(folder_id, item_sub)
+                    except PermissionError as pe:
+                        return jsonify({"error": str(pe)}), 403
+                    except Exception as e:
+                        return jsonify({"error": str(e)}), 404
+                    if not inside_folder(real_target, item_real):
+                        return jsonify({"error": "Access denied: item outside current folder"}), 403
+
+                    if os.path.isfile(item_real):
+                        if item_real not in seen_files:
+                            seen_files.add(item_real)
+                            try:
+                                f_size = os.path.getsize(item_real)
+                            except OSError:
+                                continue
+                            archive_name = os.path.relpath(item_real, real_target)
+                            files_list.append((item_real, archive_name, f_size))
+                            total_bytes += f_size
+                    elif os.path.isdir(item_real):
+                        for root, _, filenames in os.walk(item_real):
+                            for filename in filenames:
+                                file_path = os.path.join(root, filename)
+                                if not inside_folder(real_target, file_path):
+                                    continue
+                                real_f = os.path.realpath(file_path)
+                                if real_f in seen_files or not os.path.isfile(real_f):
+                                    continue
+                                seen_files.add(real_f)
+                                try:
+                                    f_size = os.path.getsize(real_f)
+                                except OSError:
+                                    continue
+                                archive_name = os.path.relpath(file_path, real_target)
+                                files_list.append((real_f, archive_name, f_size))
+                                total_bytes += f_size
+                if not files_list:
+                    return jsonify({"error": "No readable files in selection"}), 400
+                return jsonify(self._start_zip_job(f"{folder_name}-selected", files_list, total_bytes))
+
+            # Full folder scan
             for root, _, filenames in os.walk(real_target):
                 for filename in filenames:
                     file_path = os.path.join(root, filename)
@@ -1222,42 +1344,87 @@ class NearBeamServer:
                     files_list.append((file_path, archive_name, f_size))
                     total_bytes += f_size
 
-            job_id = str(uuid.uuid4())
-            temp_zip_path = os.path.join(tempfile.gettempdir(), f"nearbeam_zip_{job_id}.zip")
-            cancel_event = threading.Event()
+            return jsonify(self._start_zip_job(folder_name, files_list, total_bytes))
 
-            with self.zip_jobs_lock:
-                self.zip_jobs[job_id] = {
-                    "job_id": job_id,
-                    "folder_name": folder_name,
-                    "temp_path": temp_zip_path,
-                    "status": "processing",
-                    "error": None,
-                    "total_files": len(files_list),
-                    "processed_files": 0,
-                    "total_bytes": total_bytes,
-                    "processed_bytes": 0,
-                    "percent": 0.0,
-                    "current_file": "Initializing...",
-                    "created_at": time.time(),
-                    "cancel_event": cancel_event,
-                }
+        # --- Ephemeral PC -> Devices Send Batches Endpoints ---
 
-            # Spawn background thread to create the zip file with live progress tracking
-            worker_thread = threading.Thread(
-                target=self._run_zip_worker,
-                args=(job_id, real_target, temp_zip_path, files_list),
-                daemon=True,
+        @app.route("/api/batches")
+        def api_batches_list():
+            return jsonify({"batches": self.batch_store.list_batches()})
+
+        @app.route("/api/batches/<batch_id>/items")
+        def api_batches_items(batch_id):
+            res = self.batch_store.get_batch_items(batch_id)
+            if not res:
+                return jsonify({"error": "Batch not found"}), 404
+            summary, items = res
+            return jsonify({"batch": summary, "items": items})
+
+        @app.route("/api/batches/<batch_id>/download/<item_id>")
+        def api_batches_download_item(batch_id, item_id):
+            item = self.batch_store.get_item(batch_id, item_id)
+            if not item or not os.path.isfile(item["path"]):
+                return jsonify({"error": "File is no longer available on the PC"}), 404
+            self.batch_store.increment_downloads(batch_id)
+            self.broadcast_event({"type": "batches_updated", "batch_id": batch_id})
+            filename = item["name"]
+            self.log_activity(f"Batch file downloaded: {filename} from {request.remote_addr}")
+            return self._track_download(
+                send_file(item["path"], as_attachment=True, download_name=filename, conditional=True),
+                filename,
             )
-            worker_thread.start()
 
-            return jsonify({
-                "success": True,
-                "job_id": job_id,
-                "folder_name": folder_name,
-                "total_files": len(files_list),
-                "total_bytes": total_bytes,
-            })
+        @app.route("/api/batches/<batch_id>/preview/<item_id>")
+        def api_batches_preview_item(batch_id, item_id):
+            item = self.batch_store.get_item(batch_id, item_id)
+            if not item or not os.path.isfile(item["path"]):
+                return jsonify({"error": "File is no longer available on the PC"}), 404
+            mime_type, _ = mimetypes.guess_type(item["path"])
+            return send_file(item["path"], mimetype=mime_type or "application/octet-stream", conditional=True)
+
+        @app.route("/api/batches/<batch_id>/thumb/<item_id>")
+        def api_batches_thumb_item(batch_id, item_id):
+            item = self.batch_store.get_item(batch_id, item_id)
+            if not item or not os.path.isfile(item["path"]) or item.get("category") != "image":
+                return jsonify({"error": "No thumbnail"}), 404
+            try:
+                st = os.stat(item["path"])
+                data = make_thumbnail(item["path"], st.st_mtime_ns, st.st_size)
+            except Exception:
+                return jsonify({"error": "No thumbnail"}), 404
+            resp = send_file(io.BytesIO(data), mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "private, max-age=86400"
+            return resp
+
+        @app.route("/api/batches/<batch_id>/prepare-zip", methods=["POST"])
+        def api_batches_prepare_zip(batch_id):
+            data = request.get_json(silent=True) or request.form or {}
+            item_ids = data.get("item_ids")
+            if item_ids is not None and not isinstance(item_ids, list):
+                return jsonify({"error": "item_ids must be a list"}), 400
+            collected = self.batch_store.collect_zip_files(batch_id, item_ids or None)
+            if collected is None:
+                return jsonify({"error": "Batch not found"}), 404
+            label, files_list, total_bytes = collected
+            if not files_list:
+                return jsonify({"error": "Files are no longer available on the PC"}), 400
+            self.batch_store.increment_downloads(batch_id)
+            self.broadcast_event({"type": "batches_updated", "batch_id": batch_id})
+            return jsonify(self._start_zip_job(label, files_list, total_bytes))
+
+        @app.route("/api/batches/<batch_id>", methods=["DELETE"])
+        def api_batches_delete(batch_id):
+            removed = self.batch_store.delete_batch(batch_id)
+            if removed:
+                self.broadcast_event({"type": "batches_updated", "batch_id": batch_id})
+            return jsonify({"success": True, "removed": removed})
+
+        @app.route("/api/batches/clear", methods=["POST"])
+        def api_batches_clear():
+            cleared = self.batch_store.clear()
+            if cleared:
+                self.broadcast_event({"type": "batches_updated"})
+            return jsonify({"success": True, "cleared": cleared})
 
         @app.route("/api/safelist/zip-progress")
         def api_safelist_zip_progress():
@@ -1442,7 +1609,7 @@ class NearBeamServer:
             if "files" not in request.files and "file" not in request.files:
                 return jsonify({"error": "No file uploaded"}), 400
 
-            uploaded_files = request.files.getlist("files") or [request.files.get("file")]
+            uploaded_files = request.files.getlist("files") or request.files.getlist("file")
             saved_list = []
 
             for f in uploaded_files:
@@ -1575,10 +1742,9 @@ class NearBeamServer:
         @app.route("/api/shell-send", methods=["POST"])
         def api_shell_send():
             """
-            Handles files or folders sent from Windows Explorer right-click ('Send with NearBeam')
-            or desktop drag-and-drop.
+            Handles files or folders sent from Windows Explorer right-click ('Send with NearBeam').
+            Creates (or merges within 2s into) an ephemeral Send Batch without cluttering permanent Safe List.
             """
-            import shutil
             # Only the PC itself (Explorer "Send with NearBeam") may add paths: from the
             # network this would let anyone share, then download, any folder on the PC.
             if request.remote_addr not in ("127.0.0.1", "::1"):
@@ -1588,61 +1754,14 @@ class NearBeamServer:
             if not paths:
                 return jsonify({"error": "No paths provided"}), 400
 
-            staged_files = []
-            added_folders = []
-
-            for raw_path in paths:
-                if not raw_path or not os.path.exists(raw_path):
-                    continue
-                real_p = os.path.realpath(raw_path)
-                if os.path.isdir(real_p):
-                    entry = config.add_safe_folder(real_p)
-                    added_folders.append(entry)
-                    self.log_activity(f"Shared folder via Windows Shell: '{entry['name']}'", "info")
-                elif os.path.isfile(real_p):
-                    entry = config.add_safe_folder(real_p)
-                    added_folders.append(entry)
-                    fname = os.path.basename(real_p)
-                    save_dir_real = os.path.realpath(config.save_directory)
-                    if os.path.dirname(real_p) == save_dir_real:
-                        dest_path, final_name = real_p, fname
-                    else:
-                        dest_path, final_name = config.get_unique_filepath(fname)
-                        shutil.copy2(real_p, dest_path)
-
-                    total_bytes = os.path.getsize(dest_path)
-                    file_info = {
-                        "filename": final_name,
-                        "original_name": fname,
-                        "size": total_bytes,
-                        "formatted_size": format_size(total_bytes),
-                        "saved_path": dest_path,
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "category": get_file_type_category(final_name),
-                    }
-                    staged_files.append(file_info)
-                    self.received_files_history.insert(0, file_info)
-                    config.add_transfer_history({
-                        **file_info,
-                        "direction": "sent",
-                        "peer": "Shared from PC",
-                        "status": "completed",
-                    })
-                    self.log_activity(f"Shared '{final_name}' ({format_size(total_bytes)}) via NearBeam Shell", "upload")
-                    self.broadcast_event({
-                        "type": "file_received",
-                        "file": file_info,
-                        "source": "shell_send",
-                    })
-
-            if added_folders:
-                self.broadcast_event({"type": "safelist_updated"})
+            batch = self.create_send_batch(paths, source="Explorer", merge_window=2.0)
+            if not batch:
+                return jsonify({"error": "No readable files found in provided paths"}), 400
 
             return jsonify({
                 "success": True,
-                "added_count": len(added_folders),
-                "staged_files": staged_files,
-                "added_folders": added_folders,
+                "added_count": batch["file_count"],
+                "batch": batch,
             })
 
         @app.route("/api/received")

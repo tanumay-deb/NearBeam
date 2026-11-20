@@ -366,35 +366,156 @@ class TestLandrop(unittest.TestCase):
         self.assertEqual(clr_res.status_code, 200)
         self.assertEqual(len(self.client.get("/api/history").get_json()["history"]), 0)
 
-    # 13. REST API: Windows Shell Send & Single-File Safe List (NB-04 & NB-05)
-    def test_shell_send_file_and_folder(self):
-        single_file = os.path.join(self.test_dir, "direct_share.txt")
-        with open(single_file, "w") as f:
-            f.write("Shared from Windows Explorer right-click!")
+    # 13. REST API: Single-File Safe List Metadata & Download
+    def test_single_file_safelist_metadata_and_download(self):
+        single_file = os.path.join(self.test_dir, "direct_share.png")
+        with open(single_file, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\nfake_png_bytes")
+        self.cfg.add_safe_folder(single_file)
 
-        shell_res = self.client.post(
-            "/api/shell-send",
-            json={"paths": [single_file]},
-        )
-        self.assertEqual(shell_res.status_code, 200)
-        shell_data = shell_res.get_json()
-        self.assertTrue(shell_data["success"])
-        self.assertEqual(shell_data["added_count"], 1)
-
-        # Verify single file is browsable and downloadable via Safe List
         sl_res = self.client.get("/api/safelist").get_json()
-        file_entry = next((x for x in sl_res["folders"] if x["name"] == "direct_share.txt"), None)
+        file_entry = next((x for x in sl_res["folders"] if x["name"] == "direct_share.png"), None)
         self.assertIsNotNone(file_entry)
         self.assertTrue(file_entry["is_file"])
+        self.assertEqual(file_entry["category"], "image")
+        self.assertEqual(file_entry["size"], len(b"\x89PNG\r\n\x1a\nfake_png_bytes"))
+        self.assertTrue(file_entry["formatted_size"])
 
         browse_res = self.client.get(f"/api/safelist/browse?folder_id={file_entry['id']}").get_json()
         self.assertEqual(len(browse_res["items"]), 1)
-        self.assertEqual(browse_res["items"][0]["name"], "direct_share.txt")
+        self.assertEqual(browse_res["items"][0]["name"], "direct_share.png")
 
-        dl_res = self.client.get(f"/api/safelist/download?folder_id={file_entry['id']}&subpath=direct_share.txt")
+        dl_res = self.client.get(f"/api/safelist/download?folder_id={file_entry['id']}&subpath=")
         self.assertEqual(dl_res.status_code, 200)
-        self.assertEqual(dl_res.data, b"Shared from Windows Explorer right-click!")
+        self.assertEqual(dl_res.data, b"\x89PNG\r\n\x1a\nfake_png_bytes")
         dl_res.close()
+
+    # 13b. REST API: Windows Shell Send creates/merges ephemeral Send Batch (keeps Safe List clean)
+    def test_shell_send_creates_and_merges_batch_without_cluttering_safelist(self):
+        f1 = os.path.join(self.test_dir, "photo1.jpg")
+        f2 = os.path.join(self.test_dir, "photo2.jpg")
+        with open(f1, "wb") as f:
+            f.write(b"jpg1")
+        with open(f2, "wb") as f:
+            f.write(b"jpg2")
+
+        before_safe_count = len(self.cfg.get_safe_folders())
+        r1 = self.client.post("/api/shell-send", json={"paths": [f1]})
+        self.assertEqual(r1.status_code, 200)
+        d1 = r1.get_json()
+        self.assertTrue(d1["success"])
+        self.assertIn("batch", d1)
+
+        # Second rapid call merges into the same Explorer batch
+        r2 = self.client.post("/api/shell-send", json={"paths": [f2]})
+        self.assertEqual(r2.status_code, 200)
+        d2 = r2.get_json()
+        self.assertEqual(d1["batch"]["id"], d2["batch"]["id"])
+        self.assertEqual(d2["batch"]["file_count"], 2)
+
+        # Permanent Safe List stays untouched
+        self.assertEqual(len(self.cfg.get_safe_folders()), before_safe_count)
+
+    # 13c. REST API: Send Batches end-to-end (list, items, download, preview, selective ZIP, delete, clear)
+    def test_send_batches_api_end_to_end(self):
+        import time
+        import zipfile
+        f1 = os.path.join(self.test_dir, "doc1.txt")
+        f2 = os.path.join(self.test_dir, "doc2.txt")
+        with open(f1, "w") as f:
+            f.write("batch file one")
+        with open(f2, "w") as f:
+            f.write("batch file two")
+
+        batch = self.server.create_send_batch([f1, f2], source="Drop zone")
+        self.assertIsNotNone(batch)
+        bid = batch["id"]
+
+        listed = self.client.get("/api/batches").get_json()["batches"]
+        self.assertEqual(len(listed), 1)
+        items_res = self.client.get(f"/api/batches/{bid}/items").get_json()
+        self.assertEqual(len(items_res["items"]), 2)
+        item1 = next(it for it in items_res["items"] if it["name"] == "doc1.txt")
+        item2 = next(it for it in items_res["items"] if it["name"] == "doc2.txt")
+
+        # Single item download + preview + invalid item_id 404
+        dl = self.client.get(f"/api/batches/{bid}/download/{item1['id']}")
+        self.assertEqual(dl.status_code, 200)
+        self.assertEqual(dl.data, b"batch file one")
+        dl.close()
+        pv = self.client.get(f"/api/batches/{bid}/preview/{item1['id']}")
+        self.assertEqual(pv.status_code, 200)
+        self.assertEqual(pv.data, b"batch file one")
+        pv.close()
+        self.assertEqual(self.client.get(f"/api/batches/{bid}/download/bogus").status_code, 404)
+
+        # Selective ZIP of just item2
+        prep = self.client.post(f"/api/batches/{bid}/prepare-zip", json={"item_ids": [item2["id"]]})
+        self.assertEqual(prep.status_code, 200)
+        job_id = prep.get_json()["job_id"]
+        for _ in range(60):
+            if self.client.get(f"/api/safelist/zip-progress?job_id={job_id}").get_json()["status"] == "completed":
+                break
+            time.sleep(0.05)
+        zdl = self.client.get(f"/api/safelist/download-zip-file?job_id={job_id}")
+        self.assertEqual(zdl.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(zdl.data), "r") as zf:
+            self.assertEqual(zf.namelist(), ["doc2.txt"])
+            self.assertEqual(zf.read("doc2.txt"), b"batch file two")
+        zdl.close()
+
+        # Deleted source files return 404 on download and 400 on ZIP when none remain
+        os.remove(f1)
+        os.remove(f2)
+        self.assertEqual(self.client.get(f"/api/batches/{bid}/download/{item1['id']}").status_code, 404)
+        self.assertEqual(self.client.post(f"/api/batches/{bid}/prepare-zip", json={}).status_code, 400)
+
+        # Delete & clear
+        self.assertEqual(self.client.delete(f"/api/batches/{bid}").status_code, 200)
+        self.assertEqual(self.client.get("/api/batches").get_json()["batches"], [])
+        self.assertEqual(self.client.post("/api/batches/clear").status_code, 200)
+
+    # 13d. REST API: Selective Safe List ZIP + traversal rejection
+    def test_safelist_prepare_zip_selective_items_and_traversal(self):
+        import time
+        import zipfile
+        extra = os.path.join(self.safe_share_dir, "skip_me.txt")
+        with open(extra, "w") as f:
+            f.write("should not be in zip")
+        folder_id = self.safe_entry["id"]
+
+        bad = self.client.post(
+            "/api/safelist/prepare-zip",
+            json={"folder_id": folder_id, "subpath": "", "items": ["../test_config.json"]},
+        )
+        self.assertEqual(bad.status_code, 403)
+
+        prep = self.client.post(
+            "/api/safelist/prepare-zip",
+            json={"folder_id": folder_id, "subpath": "", "items": ["hello.txt", "subfolder"]},
+        )
+        self.assertEqual(prep.status_code, 200)
+        job_id = prep.get_json()["job_id"]
+        for _ in range(60):
+            if self.client.get(f"/api/safelist/zip-progress?job_id={job_id}").get_json()["status"] == "completed":
+                break
+            time.sleep(0.05)
+        zdl = self.client.get(f"/api/safelist/download-zip-file?job_id={job_id}")
+        self.assertEqual(zdl.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(zdl.data), "r") as zf:
+            names = {n.replace("\\", "/") for n in zf.namelist()}
+            self.assertEqual(names, {"hello.txt", "subfolder/nested.txt"})
+        zdl.close()
+
+    # 13e. REST API: Upload accepts multiple files under 'file' field (iOS Shortcuts compatibility)
+    def test_upload_multi_file_field(self):
+        res = self.client.post(
+            "/api/upload",
+            data={"file": [(io.BytesIO(b"one"), "a.txt"), (io.BytesIO(b"two"), "b.txt")]},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json()["saved_count"], 2)
 
     # 14. REST API: Rich Clipboard Sync (Screenshots & Copied Images NB-07)
     def test_rich_clipboard_image_sync(self):
