@@ -756,6 +756,40 @@ class TestLandrop(unittest.TestCase):
         finally:
             self.cfg.save = orig_save
 
+    # 20. Regression: batch prepare-zip rejects non-string item_ids and deduplicates repeated IDs
+    def test_review_fix_batch_zip_invalid_and_duplicate_item_ids(self):
+        f1 = os.path.join(self.test_dir, "dup.txt")
+        with open(f1, "w") as f:
+            f.write("dedupe me")
+        batch = self.server.create_send_batch([f1], source="Drop zone")
+        bid = batch["id"]
+        iid = batch["single_item"]["id"]
+
+        bad = self.client.post(f"/api/batches/{bid}/prepare-zip", json={"item_ids": [{}]})
+        self.assertEqual(bad.status_code, 400)
+
+        dup = self.client.post(f"/api/batches/{bid}/prepare-zip", json={"item_ids": [iid, iid]})
+        self.assertEqual(dup.status_code, 200)
+        self.assertEqual(dup.get_json()["total_files"], 1)
+
+    # 21. Regression: CSS tokens, fixed selection bar, badge-ios, and 0-folder batch guard
+    def test_review_fix_frontend_css_and_batch_guard(self):
+        r_css = self.client.get("/static/css/style.css")
+        r_js = self.client.get("/static/js/app.js")
+        r_html = self.client.get("/")
+        css_text = r_css.data.decode("utf-8")
+        js_text = r_js.data.decode("utf-8")
+        html_text = r_html.data.decode("utf-8")
+        r_css.close()
+        r_js.close()
+        r_html.close()
+
+        self.assertIn(".incoming-batches-card {\n  background: var(--surface-1);", css_text.replace("\r\n", "\n"))
+        self.assertIn(".btn-xs", css_text)
+        self.assertIn("z-index: 160", css_text)
+        self.assertNotIn("badge-apple", html_text)
+        self.assertIn("if (!currentBatchId)", js_text)
+
 
 if __name__ == "__main__":
     unittest.main()

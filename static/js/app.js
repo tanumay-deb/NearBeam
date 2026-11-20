@@ -673,8 +673,10 @@ async function fetchSafeFolders() {
       opt.value = "";
       opt.innerText = "No folders added to Safe List on PC";
       selectSafeFolder.appendChild(opt);
-      renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
-      if (btnSafeBack) btnSafeBack.style.display = "none";
+      if (!currentBatchId) {
+        renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
+        if (btnSafeBack) btnSafeBack.style.display = "none";
+      }
       return;
     }
 

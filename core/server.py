@@ -1400,8 +1400,8 @@ class NearBeamServer:
         def api_batches_prepare_zip(batch_id):
             data = request.get_json(silent=True) or request.form or {}
             item_ids = data.get("item_ids")
-            if item_ids is not None and not isinstance(item_ids, list):
-                return jsonify({"error": "item_ids must be a list"}), 400
+            if item_ids is not None and (not isinstance(item_ids, list) or not all(isinstance(x, str) for x in item_ids)):
+                return jsonify({"error": "item_ids must be a list of strings"}), 400
             collected = self.batch_store.collect_zip_files(batch_id, item_ids or None)
             if collected is None:
                 return jsonify({"error": "Batch not found"}), 404

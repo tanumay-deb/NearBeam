@@ -276,7 +276,12 @@ class BatchStore:
             if not b:
                 return None
             if item_ids:
-                chosen = [b["items_by_id"][iid] for iid in item_ids if iid in b["items_by_id"]]
+                seen_ids: set[str] = set()
+                chosen = []
+                for iid in item_ids:
+                    if isinstance(iid, str) and iid not in seen_ids and iid in b["items_by_id"]:
+                        seen_ids.add(iid)
+                        chosen.append(b["items_by_id"][iid])
                 label = f"{b['label']}-selected"
             else:
                 chosen = list(b["items"])
