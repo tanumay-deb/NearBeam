@@ -16,16 +16,13 @@ LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/lates
 
 
 def parse_version_tuple(v_str: str) -> tuple:
-    """Parses version strings like 'v1.1.0' or '1.0.0' into (1, 1, 0)."""
-    if not v_str:
+    """Parses version strings like 'v1.1.0' or 'v1.6.3-rc1' into (1, 6, 3)."""
+    if not isinstance(v_str, str) or not v_str.strip():
         return (0, 0, 0)
-    cleaned = re.sub(r"[^\d.]", "", v_str.strip())
-    parts = []
-    for part in cleaned.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            parts.append(0)
+    match = re.match(r"^[vV]?(\d+(?:\.\d+)*)", v_str.strip())
+    if not match:
+        return (0, 0, 0)
+    parts = [int(p) for p in match.group(1).split(".")]
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts[:3])
@@ -59,13 +56,17 @@ def check_for_updates(timeout_sec: float = 4.0) -> dict:
         with urllib.request.urlopen(req, timeout=timeout_sec) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode("utf-8"))
-                tag_name = data.get("tag_name", "")
+                if not isinstance(data, dict):
+                    data = {}
+                tag_name = data.get("tag_name") or ""
+                if not isinstance(tag_name, str):
+                    tag_name = str(tag_name)
                 remote_tuple = parse_version_tuple(tag_name)
 
-                result["latest_version"] = tag_name.lstrip("v")
-                result["release_url"] = data.get("html_url", f"{RELEASES_URL}/latest")
-                result["release_title"] = data.get("name", f"NearBeam {tag_name}")
-                result["release_notes"] = data.get("body", "")
+                result["latest_version"] = tag_name.lstrip("vV") or APP_VERSION
+                result["release_url"] = data.get("html_url") or f"{RELEASES_URL}/latest"
+                result["release_title"] = data.get("name") or f"NearBeam {tag_name}"
+                result["release_notes"] = data.get("body") or ""
 
                 if remote_tuple > current_tuple:
                     result["update_available"] = True

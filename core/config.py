@@ -81,7 +81,16 @@ class ConfigManager:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
+                if isinstance(loaded, dict):
                     self.data.update(loaded)
+                if not isinstance(self.data.get("safe_folders"), list):
+                    self.data["safe_folders"] = []
+                if not isinstance(self.data.get("transfer_history"), list):
+                    self.data["transfer_history"] = []
+                if not isinstance(self.data.get("save_directory"), str) or not self.data["save_directory"].strip():
+                    self.data["save_directory"] = self.default_save_dir
+                if not isinstance(self.data.get("port"), int) or isinstance(self.data.get("port"), bool):
+                    self.data["port"] = 5000
             except Exception as e:
                 print(f"Error loading config from {self.config_path}: {e}")
 
@@ -161,8 +170,9 @@ class ConfigManager:
     # --- Safe List (Shared Folders) Management ---
 
     def get_safe_folders(self) -> list[dict]:
-        """Returns the list of safe folders."""
-        return self.data.get("safe_folders", [])
+        """Returns a thread-safe shallow copy of the Safe List folders."""
+        with self._lock:
+            return list(self.data.get("safe_folders") or [])
 
     def add_safe_folder(self, folder_path: str, display_name: str = None) -> dict:
         """
@@ -260,6 +270,10 @@ class ConfigManager:
         if not os.path.exists(base_real):
             raise FileNotFoundError(f"Safe folder path does not exist: {base_real}")
 
+        if subpath is None:
+            subpath = ""
+        elif not isinstance(subpath, str):
+            raise PermissionError("Access denied: Invalid subpath type.")
         clean_subpath = subpath.replace("\\", "/").strip("/")
         if os.path.isfile(base_real):
             if not clean_subpath or clean_subpath == os.path.basename(base_real):
@@ -302,6 +316,8 @@ class ConfigManager:
             "status": entry.get("status", "completed"),
             "category": entry.get("category", "file"),
         }
+        if isinstance(entry.get("saved_path"), str) and entry["saved_path"]:
+            record["saved_path"] = entry["saved_path"]
         with self._lock:
             history = self.data.setdefault("transfer_history", [])
             history.insert(0, record)

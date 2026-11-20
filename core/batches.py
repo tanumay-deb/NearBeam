@@ -39,6 +39,13 @@ def _default_category(filename: str) -> str:
     return "file"
 
 
+def _format_mtime(ts: float) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
 def _inside_folder(root_real: str, path: str) -> bool:
     try:
         return os.path.commonpath([root_real, os.path.realpath(path)]) == root_real
@@ -98,7 +105,7 @@ class BatchStore:
         expanded: list[tuple[str, str]] = []
         valid_roots: list[str] = []
         for raw in paths or []:
-            if not raw or not os.path.exists(raw):
+            if not isinstance(raw, str) or not raw or not os.path.exists(raw):
                 continue
             real_root = os.path.realpath(raw)
             valid_roots.append(real_root)
@@ -106,7 +113,9 @@ class BatchStore:
                 expanded.append((real_root, os.path.basename(real_root)))
             elif os.path.isdir(real_root):
                 root_name = os.path.basename(real_root.rstrip("/\\")) or "folder"
-                for walk_root, _, filenames in os.walk(real_root):
+                for walk_root, dirnames, filenames in os.walk(real_root):
+                    # Prune external junctions / symlinks in-place so we never walk outside real_root
+                    dirnames[:] = [d for d in dirnames if _inside_folder(real_root, os.path.join(walk_root, d))]
                     for fname in filenames:
                         fpath = os.path.join(walk_root, fname)
                         if not _inside_folder(real_root, fpath):
@@ -132,7 +141,7 @@ class BatchStore:
             "rel_path": rel_path,
             "size": size,
             "formatted_size": self._format_size(size),
-            "modified": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "modified": _format_mtime(st.st_mtime),
             "mtime": st.st_mtime,
             "category": self._category(fname),
         }
@@ -187,6 +196,7 @@ class BatchStore:
             if target is not None:
                 seen_paths = target["seen_paths"]
                 used_rels = target["used_rels"]
+                added_any = False
                 for real_path, pref_rel in expanded:
                     if real_path in seen_paths:
                         continue
@@ -198,8 +208,12 @@ class BatchStore:
                     target["items"].append(item)
                     target["items_by_id"][item["id"]] = item
                     target["total_bytes"] += item["size"]
-                target["dropped_roots"].extend(valid_roots)
-                target["label"] = _build_batch_label(target["items"], target["dropped_roots"])
+                    added_any = True
+                if added_any:
+                    for vr in valid_roots:
+                        if vr not in target["dropped_roots"]:
+                            target["dropped_roots"].append(vr)
+                    target["label"] = _build_batch_label(target["items"], target["dropped_roots"])
                 target["created_ts"] = now_mono
                 self._batches.move_to_end(target["id"])
                 return self._summary(target)

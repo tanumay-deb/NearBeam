@@ -100,7 +100,31 @@ LAN_ORIGINS = [re.compile(
 )]
 
 _WINDOWS_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
-_WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+_WINDOWS_DEVICE_NAMES = {
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _format_mtime(ts: float) -> str:
+    """Formats a filesystem timestamp safely without failing on extreme/negative mtimes."""
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _parse_json_dict(allow_form: bool = False):
+    """Returns (dict_payload, error_response). Rejects valid non-object JSON payloads with 400."""
+    raw = request.get_json(silent=True)
+    if raw is not None:
+        if isinstance(raw, dict):
+            return raw, None
+        return None, (jsonify({"error": "JSON object required"}), 400)
+    if allow_form and request.form:
+        return request.form, None
+    return {}, None
 
 
 @lru_cache(maxsize=1)
@@ -112,9 +136,23 @@ def is_lan_host(host: str) -> bool:
     """True for names a LAN device uses to reach this PC: an IP, localhost, a bare or .local name.
     A website's own domain re-pointed at this PC (DNS rebinding) is not one."""
     name = (host or "").strip().lower()
+    if not name:
+        return False
     if name.startswith("["):
-        return True  # IPv6 literal
+        end = name.find("]")
+        if end == -1:
+            return False
+        rest = name[end + 1:]
+        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+            return False
+        addr = name[1:end].split("%", 1)[0]
+        try:
+            return isinstance(ipaddress.ip_address(addr), ipaddress.IPv6Address)
+        except ValueError:
+            return False
     name = name.split(":", 1)[0].rstrip(".")
+    if not name:
+        return False
     try:
         ipaddress.ip_address(name)
         return True
@@ -128,7 +166,7 @@ def safe_filename(name: str) -> str:
     (':' would otherwise hide the data in an NTFS stream; '?' fails after the whole upload.)"""
     name = os.path.basename((name or "").replace("\\", "/"))
     name = _WINDOWS_BAD_CHARS.sub("_", name).strip().rstrip(". ")
-    if name.split(".", 1)[0].upper() in _WINDOWS_DEVICE_NAMES:
+    if name.split(".", 1)[0].rstrip().upper() in _WINDOWS_DEVICE_NAMES:
         name = f"_{name}"
     return name or f"unnamed_file_{uuid.uuid4().hex[:8]}"
 
@@ -198,7 +236,7 @@ def remove_when_released(path: str, first_delay: float = 120, retry: float = 30,
             os.remove(path)
         except OSError:
             time.sleep(retry)
-    if on_removed:
+    if on_removed and not os.path.exists(path):
         on_removed()
 
 
@@ -268,6 +306,11 @@ class NearBeamServer:
         CORS(self.app, resources=CORS_RESOURCES, origins=LAN_ORIGINS)
 
         # In-memory shared state
+        self._clipboard_lock = threading.Lock()
+        self._events_lock = threading.Lock()
+        self._clients_lock = threading.Lock()
+        self._upload_state_lock = threading.Lock()
+        self._drop_zones_lock = threading.Lock()
         self.clipboard_content = ""
         self.clipboard_updated_at = None
         self.clipboard_image_bytes: Optional[bytes] = None
@@ -275,6 +318,7 @@ class NearBeamServer:
         self.clipboard_image_id: str = ""
         self.received_files_history = []
         self.connected_clients: Dict[str, Dict[str, Any]] = {}
+        self.active_drop_zones: Dict[str, Dict[str, Any]] = {}
         self.event_subscribers: list[queue.Queue] = []
         self.activity_callbacks = []
         self.clipboard_callbacks = []
@@ -312,6 +356,8 @@ class NearBeamServer:
         # Recently finished uploads: a resent last chunk (its response got lost) gets the
         # same answer instead of a 409 or a second copy of the file.
         self.finished_uploads: "OrderedDict[str, dict]" = OrderedDict()
+        self._session_locks: Dict[str, threading.Lock] = {}
+        self._cancelled_uploads: "OrderedDict[str, float]" = OrderedDict()
 
         self._stopping = threading.Event()
         self.current_ip = get_local_ip()
@@ -362,10 +408,11 @@ class NearBeamServer:
         if not ip:
             return
         now = time.time()
-        existing = self.connected_clients.get(ip)
-        is_new = existing is None or (now - existing.get("last_seen", 0) > 60)
         info = self._parse_client_info(ip, ua, custom_name)
-        self.connected_clients[ip] = info
+        with self._clients_lock:
+            existing = self.connected_clients.get(ip)
+            is_new = existing is None or (now - existing.get("last_seen", 0) > 60)
+            self.connected_clients[ip] = info
         if is_new:
             self.broadcast_event({
                 "type": "nearby_devices_changed",
@@ -418,16 +465,16 @@ class NearBeamServer:
             })
 
         now = time.time()
-        stale_ips = []
-        for ip, c in list(self.connected_clients.items()):
-            if now - c.get("last_seen", 0) > 900:
-                stale_ips.append(ip)
-                continue
-            if ip not in mesh_ips:
-                devices.append(c)
-
-        for ip in stale_ips:
-            self.connected_clients.pop(ip, None)
+        with self._clients_lock:
+            stale_ips = []
+            for ip, c in list(self.connected_clients.items()):
+                if now - c.get("last_seen", 0) > 900:
+                    stale_ips.append(ip)
+                    continue
+                if ip not in mesh_ips:
+                    devices.append(dict(c))
+            for ip in stale_ips:
+                self.connected_clients.pop(ip, None)
 
         return devices
 
@@ -466,6 +513,9 @@ class NearBeamServer:
         if hasattr(self, "zip_jobs_lock"):
             with self.zip_jobs_lock:
                 for job in self.zip_jobs.values():
+                    cancel_ev = job.get("cancel_event")
+                    if cancel_ev is not None:
+                        cancel_ev.set()
                     temp_path = job.get("temp_path")
                     if temp_path and os.path.exists(temp_path):
                         try:
@@ -500,6 +550,7 @@ class NearBeamServer:
                 compression=zipfile.ZIP_DEFLATED,
                 allowZip64=True,
                 compresslevel=1,
+                strict_timestamps=False,
             ) as zip_file:
                 for file_path, archive_name, f_size in files_list:
                     with self.zip_jobs_lock:
@@ -529,7 +580,7 @@ class NearBeamServer:
                                         job["percent"] = min(99.0, round((job["processed_files"] / job["total_files"]) * 100, 1))
                         else:
                             chunk_size = 4 * 1024 * 1024
-                            zinfo = zipfile.ZipInfo.from_file(file_path, archive_name)
+                            zinfo = zipfile.ZipInfo.from_file(file_path, archive_name, strict_timestamps=False)
                             zinfo.compress_type = compress_type
                             if compress_type == zipfile.ZIP_DEFLATED:
                                 zinfo._compresslevel = 1
@@ -563,22 +614,25 @@ class NearBeamServer:
                             if job.get("cancel_event", threading.Event()).is_set():
                                 break
 
+            cleanup_temp = False
             with self.zip_jobs_lock:
                 job = self.zip_jobs.get(job_id)
-                if job:
-                    if job.get("cancel_event", threading.Event()).is_set():
+                if not job or job.get("cancel_event", threading.Event()).is_set():
+                    if job:
                         job["status"] = "cancelled"
-                        try:
-                            if os.path.exists(temp_zip_path):
-                                os.remove(temp_zip_path)
-                        except Exception:
-                            pass
-                    else:
-                        job["status"] = "completed"
-                        job["percent"] = 100.0
-                        job["processed_files"] = len(files_list)
-                        job["processed_bytes"] = job["total_bytes"]
-                        job["current_file"] = "Complete"
+                    cleanup_temp = True
+                else:
+                    job["status"] = "completed"
+                    job["percent"] = 100.0
+                    job["processed_files"] = len(files_list)
+                    job["processed_bytes"] = job["total_bytes"]
+                    job["current_file"] = "Complete"
+            if cleanup_temp:
+                try:
+                    if os.path.exists(temp_zip_path):
+                        os.remove(temp_zip_path)
+                except Exception:
+                    pass
         except Exception as e:
             with self.zip_jobs_lock:
                 job = self.zip_jobs.get(job_id)
@@ -597,6 +651,8 @@ class NearBeamServer:
 
     def _on_mesh_role_change(self, role: str):
         """Triggered when role transitions between LEADER and NODE."""
+        if self._stopping.is_set():
+            return
         self.log_activity(f"Mesh role established: {role.upper()}", "info")
         if role == "leader":
             if hasattr(self, "broadcaster") and self.broadcaster and not self.broadcaster.zc:
@@ -631,19 +687,23 @@ class NearBeamServer:
 
     def _on_mesh_clipboard_received(self, text: str):
         """Triggered when clipboard text is received from peer mesh node."""
-        if text and text != self.clipboard_content:
+        if not isinstance(text, str) or not text:
+            return
+        with self._clipboard_lock:
+            if text == self.clipboard_content:
+                return
             self.clipboard_content = text
             self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
-            self.broadcast_event({
-                "type": "clipboard_updated",
-                "text": text,
-                "updated_at": self.clipboard_updated_at,
-            })
-            for cb in self.clipboard_callbacks:
-                try:
-                    cb(text)
-                except Exception:
-                    pass
+        state = self.get_clipboard_state()
+        self.broadcast_event({
+            "type": "clipboard_updated",
+            **state,
+        })
+        for cb in self.clipboard_callbacks:
+            try:
+                cb(text)
+            except Exception:
+                pass
 
     def add_activity_callback(self, callback):
         """Registers a callback for desktop GUI activity logging."""
@@ -659,15 +719,21 @@ class NearBeamServer:
 
     def get_clipboard_state(self) -> dict:
         """Returns current text + image metadata for the shared clipboard."""
-        has_img = bool(self.clipboard_image_bytes)
-        img_size = len(self.clipboard_image_bytes) if self.clipboard_image_bytes else 0
+        with self._clipboard_lock:
+            text = self.clipboard_content
+            updated_at = self.clipboard_updated_at
+            img_bytes = self.clipboard_image_bytes
+            img_id = self.clipboard_image_id
+            img_mime = self.clipboard_image_mime
+        has_img = bool(img_bytes)
+        img_size = len(img_bytes) if img_bytes else 0
         return {
-            "text": self.clipboard_content,
-            "updated_at": self.clipboard_updated_at,
+            "text": text,
+            "updated_at": updated_at,
             "has_image": has_img,
-            "image_id": self.clipboard_image_id if has_img else None,
-            "image_url": f"/api/clipboard/image?id={self.clipboard_image_id}" if has_img else None,
-            "image_mime": self.clipboard_image_mime if has_img else None,
+            "image_id": img_id if has_img else None,
+            "image_url": f"/api/clipboard/image?id={img_id}" if has_img else None,
+            "image_mime": img_mime if has_img else None,
             "image_size": img_size,
             "image_formatted_size": format_size(img_size) if has_img else None,
         }
@@ -683,10 +749,12 @@ class NearBeamServer:
         """Updates the shared clipboard image, broadcasts via SSE, and syncs across mesh/OS."""
         import base64
 
-        self.clipboard_image_bytes = image_bytes
-        self.clipboard_image_mime = mime_type or "image/png"
-        self.clipboard_image_id = uuid.uuid4().hex[:12]
-        self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+        clean_mime = mime_type.strip() if isinstance(mime_type, str) and mime_type.strip() else "image/png"
+        with self._clipboard_lock:
+            self.clipboard_image_bytes = image_bytes
+            self.clipboard_image_mime = clean_mime
+            self.clipboard_image_id = uuid.uuid4().hex[:12]
+            self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
 
         state = self.get_clipboard_state()
         self.broadcast_event({
@@ -697,17 +765,17 @@ class NearBeamServer:
         if notify_local_os:
             for cb in self.clipboard_image_callbacks:
                 try:
-                    cb(image_bytes, self.clipboard_image_mime)
+                    cb(image_bytes, clean_mime)
                 except Exception as e:
                     print(f"Error in clipboard image callback: {e}")
 
         if propagate_mesh and self.mesh and image_bytes:
             b64_str = base64.b64encode(image_bytes).decode("ascii")
             self.mesh.broadcast_clipboard_mesh(
-                text=self.clipboard_content,
+                text="",
                 source_node_id=source_node_id,
                 image_base64=b64_str,
-                image_mime=self.clipboard_image_mime,
+                image_mime=clean_mime,
             )
 
         return state
@@ -725,12 +793,19 @@ class NearBeamServer:
     def broadcast_event(self, event_data: dict):
         """Broadcasts an SSE event to all connected web clients."""
         payload = json.dumps(event_data)
-        for q in list(self.event_subscribers):
+        with self._events_lock:
+            subscribers = list(self.event_subscribers)
+        dead = []
+        for q in subscribers:
             try:
                 q.put_nowait(payload)
             except Exception:
-                if q in self.event_subscribers:
-                    self.event_subscribers.remove(q)
+                dead.append(q)
+        if dead:
+            with self._events_lock:
+                for q in dead:
+                    if q in self.event_subscribers:
+                        self.event_subscribers.remove(q)
 
     def create_send_batch(
         self,
@@ -801,7 +876,8 @@ class NearBeamServer:
             return resp
         full_file = resp.status_code == 200
         addr = request.remote_addr or ""
-        peer = self.connected_clients.get(addr, {}).get("name") or addr or "a device"
+        with self._clients_lock:
+            peer = self.connected_clients.get(addr, {}).get("name") or addr or "a device"
         download_id = f"dl:{uuid.uuid4().hex}"  # unique per download: same-named files can run at once
         inner = resp.response
         server = self
@@ -851,6 +927,29 @@ class NearBeamServer:
         resp.response = stream()
         return resp
 
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        with self._upload_state_lock:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                if len(self._session_locks) > 512:
+                    for key in list(self._session_locks.keys()):
+                        if not self._session_locks[key].locked():
+                            self._session_locks.pop(key, None)
+                            if len(self._session_locks) <= 256:
+                                break
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
+
+    def _is_upload_cancelled(self, session_id: str) -> bool:
+        with self._upload_state_lock:
+            return session_id in self._cancelled_uploads
+
+    def _prune_drop_zones_locked(self, now: float):
+        expired = [tok for tok, meta in self.active_drop_zones.items() if now > meta.get("expires_at", 0)]
+        for tok in expired:
+            self.active_drop_zones.pop(tok, None)
+
     def _receive_chunk(self, save_dir: str, peer: str, log_template: str):
         """Shared chunk receiver for host uploads and guest drops."""
         from urllib.parse import unquote
@@ -860,9 +959,6 @@ class NearBeamServer:
             return jsonify({"error": "Missing parameters"}), 400
         if not _SESSION_ID_RE.fullmatch(session_id):
             return jsonify({"error": "Invalid session id"}), 400
-        finished = self.finished_uploads.get(session_id)
-        if finished:
-            return jsonify({"success": True, "completed": True, "file": finished})
         try:
             chunk_index = int(request.headers.get("X-Chunk-Index", request.form.get("chunk_index", 0)))
             total_chunks = int(request.headers.get("X-Total-Chunks", request.form.get("total_chunks", 1)))
@@ -881,115 +977,140 @@ class NearBeamServer:
 
         dest_dir = save_dir
         if relative_dir:
-            dest_dir = os.path.normpath(os.path.join(save_dir, relative_dir))
-            root = os.path.realpath(save_dir)
-            try:
-                inside = os.path.commonpath([root, os.path.realpath(dest_dir)]) == root
-            except ValueError:  # different drive on Windows
-                inside = False
-            if not inside:
+            norm_rel = relative_dir.replace("\\", "/")
+            if norm_rel.startswith("/"):
                 return jsonify({"error": "Invalid relative directory"}), 400
-            # Folder names get the same clean-up as file names ('Trip: day 1' -> 'Trip_ day 1').
-            parts = os.path.relpath(dest_dir, save_dir).replace("\\", "/").split("/")
-            relative_dir = "/".join(safe_filename(p) for p in parts if p not in ("", "."))
-            dest_dir = os.path.join(save_dir, relative_dir) if relative_dir else save_dir
+            raw_parts = [p for p in norm_rel.split("/") if p not in ("", ".")]
+            if any(p == ".." for p in raw_parts) or (raw_parts and re.fullmatch(r"[A-Za-z]:", raw_parts[0])):
+                return jsonify({"error": "Invalid relative directory"}), 400
+            # Folder names get the same clean-up as file names ('Trip: day 1' -> 'Trip_ day 1')
+            # BEFORE os.path.join so names like 'D: notes' aren't parsed as Windows drive letters.
+            clean_parts = [safe_filename(p) for p in raw_parts]
+            relative_dir = "/".join(clean_parts)
+            dest_dir = os.path.join(save_dir, *clean_parts) if clean_parts else save_dir
+            root = os.path.realpath(save_dir)
+            if not inside_folder(root, dest_dir):
+                return jsonify({"error": "Invalid relative directory"}), 400
 
-        os.makedirs(save_dir, exist_ok=True)
-        temp_path = os.path.join(save_dir, f".{session_id}.tmp")
-        legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
-        if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
-            temp_path = legacy_temp
+        session_lock = self._get_session_lock(session_id)
+        with session_lock:
+            with self._upload_state_lock:
+                if session_id in self._cancelled_uploads:
+                    return jsonify({"success": False, "cancelled": True}), 499
+                finished = self.finished_uploads.get(session_id)
+                if finished:
+                    return jsonify({"success": True, "completed": True, "file": finished})
 
-        have = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
-        if offset is None:
-            # Legacy clients without X-Chunk-Offset: append-only.
-            mode = "ab" if chunk_index > 0 else "wb"
-            received = have if chunk_index > 0 else 0
-        else:
-            if offset > have:
-                return jsonify({"error": "Chunk offset beyond received data", "received_bytes": have}), 409
-            mode = "r+b" if have else "wb"
-            received = offset
+            os.makedirs(save_dir, exist_ok=True)
+            temp_path = os.path.join(save_dir, f".{session_id}.tmp")
+            legacy_temp = os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp")
+            if chunk_index > 0 and os.path.exists(legacy_temp) and not os.path.exists(temp_path):
+                temp_path = legacy_temp
 
-        # Older clients don't send X-File-Size; every chunk but the last is full-size.
-        total_bytes = file_size if file_size is not None else (request.content_length or 0) * total_chunks
-        from_addr = request.remote_addr
+            have = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+            if offset is None:
+                # Legacy clients without X-Chunk-Offset: append-only.
+                mode = "ab" if chunk_index > 0 else "wb"
+                received = have if chunk_index > 0 else 0
+            else:
+                if offset > have:
+                    return jsonify({"error": "Chunk offset beyond received data", "received_bytes": have}), 409
+                mode = "r+b" if have else "wb"
+                received = offset
 
-        def emit_progress():
-            # Live incoming progress for the desktop Transfers page and the host web app.
-            if total_bytes < 1024 * 1024:
-                return  # tiny files finish before a progress bar would help
-            self.broadcast_event({
-                "type": "upload_progress",
-                "session_id": session_id,
-                "filename": filename,
-                "relative_dir": relative_dir,
-                "chunk_index": chunk_index,
-                "total_chunks": total_chunks,
-                "percent": round(min(received / total_bytes, 1.0) * 100, 1),
-                "received_bytes": received,
-                "total_bytes": total_bytes,
-                "from_addr": from_addr,
+            # Older clients don't send X-File-Size; every chunk but the last is full-size.
+            total_bytes = file_size if file_size is not None else (request.content_length or 0) * total_chunks
+            from_addr = request.remote_addr
+
+            def emit_progress():
+                # Live incoming progress for the desktop Transfers page and the host web app.
+                if total_bytes < 1024 * 1024:
+                    return  # tiny files finish before a progress bar would help
+                self.broadcast_event({
+                    "type": "upload_progress",
+                    "session_id": session_id,
+                    "filename": filename,
+                    "relative_dir": relative_dir,
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                    "percent": round(min(received / total_bytes, 1.0) * 100, 1),
+                    "received_bytes": received,
+                    "total_bytes": total_bytes,
+                    "from_addr": from_addr,
+                })
+
+            # Small reads so a slow Wi-Fi upload still reports progress every ~0.5 s
+            # instead of once per 50 MB chunk; file writes stay buffered.
+            read_size = 64 * 1024
+            last_emit = time.monotonic()
+            cancelled = False
+            with open(temp_path, mode, buffering=8 * 1024 * 1024) as f:
+                if offset is not None:
+                    # A resent chunk overwrites its own range instead of being appended twice.
+                    f.seek(offset)
+                    f.truncate()
+                stream = request.files["file"].stream if request.files.get("file") else request.stream
+                while True:
+                    if self._is_upload_cancelled(session_id):
+                        cancelled = True
+                        break
+                    data = stream.read(read_size)
+                    if not data:
+                        break
+                    f.write(data)
+                    received += len(data)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.5:
+                        last_emit = now
+                        emit_progress()
+
+            if cancelled or self._is_upload_cancelled(session_id):
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+                return jsonify({"success": False, "cancelled": True}), 499
+
+            emit_progress()
+
+            if chunk_index < total_chunks - 1:
+                return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+
+            final_path = finalize_upload(temp_path, dest_dir, filename)
+            final_name = os.path.basename(final_path)
+            total_bytes = os.path.getsize(final_path)
+
+            file_info = {
+                "filename": final_name,
+                "original_name": filename,
+                "size": total_bytes,
+                "formatted_size": format_size(total_bytes),
+                "saved_path": final_path,
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "category": get_file_type_category(final_name),
+            }
+            with self._upload_state_lock:
+                self.finished_uploads[session_id] = file_info
+                if len(self.finished_uploads) > 200:
+                    self.finished_uploads.popitem(last=False)
+                self.received_files_history.insert(0, file_info)
+                if len(self.received_files_history) > 100:
+                    self.received_files_history.pop()
+            config.add_transfer_history({
+                **file_info,
+                "direction": "received",
+                "peer": peer,
+                "status": "completed",
             })
 
-        # Small reads so a slow Wi-Fi upload still reports progress every ~0.5 s
-        # instead of once per 50 MB chunk; file writes stay buffered.
-        read_size = 64 * 1024
-        last_emit = time.monotonic()
-        with open(temp_path, mode, buffering=8 * 1024 * 1024) as f:
-            if offset is not None:
-                # A resent chunk overwrites its own range instead of being appended twice.
-                f.seek(offset)
-                f.truncate()
-            stream = request.files["file"].stream if request.files.get("file") else request.stream
-            while True:
-                data = stream.read(read_size)
-                if not data:
-                    break
-                f.write(data)
-                received += len(data)
-                now = time.monotonic()
-                if now - last_emit >= 0.5:
-                    last_emit = now
-                    emit_progress()
-        emit_progress()
-
-        if chunk_index < total_chunks - 1:
-            return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
-
-        final_path = finalize_upload(temp_path, dest_dir, filename)
-        final_name = os.path.basename(final_path)
-        total_bytes = os.path.getsize(final_path)
-
-        file_info = {
-            "filename": final_name,
-            "original_name": filename,
-            "size": total_bytes,
-            "formatted_size": format_size(total_bytes),
-            "saved_path": final_path,
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "category": get_file_type_category(final_name),
-        }
-        self.finished_uploads[session_id] = file_info
-        if len(self.finished_uploads) > 200:
-            self.finished_uploads.popitem(last=False)
-        self.received_files_history.insert(0, file_info)
-        if len(self.received_files_history) > 100:
-            self.received_files_history.pop()
-        config.add_transfer_history({
-            **file_info,
-            "direction": "received",
-            "peer": peer,
-            "status": "completed",
-        })
-
-        self.log_activity(log_template.format(name=final_name, size=format_size(total_bytes)), event_type="upload")
-        self.broadcast_event({
-            "type": "file_received",
-            "file": file_info,
-            "session_id": session_id,
-        })
-        return jsonify({"success": True, "completed": True, "file": file_info})
+            self.log_activity(log_template.format(name=final_name, size=format_size(total_bytes)), event_type="upload")
+            self.broadcast_event({
+                "type": "file_received",
+                "file": file_info,
+                "session_id": session_id,
+            })
+            return jsonify({"success": True, "completed": True, "file": file_info})
 
     def _register_routes(self):
         app = self.app
@@ -1046,8 +1167,12 @@ class NearBeamServer:
 
         @app.route("/api/nearby/heartbeat", methods=["POST"])
         def api_nearby_heartbeat():
-            data = request.get_json(silent=True) or {}
+            data, err = _parse_json_dict()
+            if err:
+                return err
             device_name = data.get("device_name", "")
+            if not isinstance(device_name, str):
+                device_name = ""
             self.record_client_seen(
                 request.remote_addr,
                 request.headers.get("User-Agent", ""),
@@ -1083,7 +1208,7 @@ class NearBeamServer:
                         st = os.stat(folder_path)
                         entry["size"] = st.st_size
                         entry["formatted_size"] = format_size(st.st_size)
-                        entry["modified"] = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        entry["modified"] = _format_mtime(st.st_mtime)
                         entry["category"] = get_file_type_category(folder["name"])
                     except OSError:
                         entry["category"] = get_file_type_category(folder["name"])
@@ -1133,10 +1258,13 @@ class NearBeamServer:
                         "size": stat.st_size,
                         "formatted_size": format_size(stat.st_size),
                         "subpath": fname,
-                        "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        "modified": _format_mtime(stat.st_mtime),
                         "category": get_file_type_category(fname),
                     }],
                 })
+
+            if not os.path.exists(real_target):
+                return jsonify({"error": "Path not found"}), 404
 
             if not os.path.isdir(real_target):
                 return jsonify({"error": "Path is not a directory"}), 400
@@ -1163,7 +1291,7 @@ class NearBeamServer:
 
                             rel_entry_subpath = f"{norm_subpath}/{entry.name}" if norm_subpath else entry.name
                             stat = entry.stat()
-                            mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                            mtime = _format_mtime(stat.st_mtime)
 
                             if entry.is_dir(follow_symlinks=False):
                                 dirs.append({
@@ -1268,15 +1396,22 @@ class NearBeamServer:
         @app.route("/api/safelist/prepare-zip", methods=["POST"])
         def api_safelist_prepare_zip():
             """Starts background job to package a Safe List folder, subfolder, or selected items into a ZIP."""
-            data = request.get_json(silent=True) or request.form or {}
+            data, err = _parse_json_dict(allow_form=True)
+            if err:
+                return err
             folder_id = data.get("folder_id", "")
             subpath = data.get("subpath", "")
             selected_items = data.get("items")
 
+            if not isinstance(folder_id, str) or not isinstance(subpath, str):
+                return jsonify({"error": "Invalid folder_id or subpath"}), 400
+
             try:
                 real_target = config.resolve_safe_path(folder_id, subpath)
-            except Exception as e:
-                return jsonify({"error": str(e)}), 403
+            except PermissionError as pe:
+                return jsonify({"error": str(pe)}), 403
+            except (FileNotFoundError, KeyError) as fe:
+                return jsonify({"error": str(fe)}), 404
 
             if not os.path.isdir(real_target):
                 return jsonify({"error": "Not a directory"}), 400
@@ -1285,7 +1420,11 @@ class NearBeamServer:
             files_list = []
             total_bytes = 0
 
-            if isinstance(selected_items, list) and len(selected_items) > 0:
+            if selected_items is not None:
+                if not isinstance(selected_items, list):
+                    return jsonify({"error": "items must be a list of strings"}), 400
+                if len(selected_items) == 0:
+                    return jsonify({"error": "No items selected"}), 400
                 seen_files = set()
                 for item_sub in selected_items:
                     if not isinstance(item_sub, str) or not item_sub.strip():
@@ -1310,7 +1449,11 @@ class NearBeamServer:
                             files_list.append((item_real, archive_name, f_size))
                             total_bytes += f_size
                     elif os.path.isdir(item_real):
-                        for root, _, filenames in os.walk(item_real):
+                        for root, dirnames, filenames in os.walk(item_real):
+                            dirnames[:] = [
+                                d for d in dirnames
+                                if inside_folder(real_target, os.path.join(root, d))
+                            ]
                             for filename in filenames:
                                 file_path = os.path.join(root, filename)
                                 if not inside_folder(real_target, file_path):
@@ -1331,7 +1474,11 @@ class NearBeamServer:
                 return jsonify(self._start_zip_job(f"{folder_name}-selected", files_list, total_bytes))
 
             # Full folder scan
-            for root, _, filenames in os.walk(real_target):
+            for root, dirnames, filenames in os.walk(real_target):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if inside_folder(real_target, os.path.join(root, d))
+                ]
                 for filename in filenames:
                     file_path = os.path.join(root, filename)
                     if not inside_folder(real_target, file_path):
@@ -1398,11 +1545,16 @@ class NearBeamServer:
 
         @app.route("/api/batches/<batch_id>/prepare-zip", methods=["POST"])
         def api_batches_prepare_zip(batch_id):
-            data = request.get_json(silent=True) or request.form or {}
+            data, err = _parse_json_dict(allow_form=True)
+            if err:
+                return err
             item_ids = data.get("item_ids")
-            if item_ids is not None and (not isinstance(item_ids, list) or not all(isinstance(x, str) for x in item_ids)):
-                return jsonify({"error": "item_ids must be a list of strings"}), 400
-            collected = self.batch_store.collect_zip_files(batch_id, item_ids or None)
+            if item_ids is not None:
+                if not isinstance(item_ids, list) or not all(isinstance(x, str) for x in item_ids):
+                    return jsonify({"error": "item_ids must be a list of strings"}), 400
+                if len(item_ids) == 0:
+                    return jsonify({"error": "No items selected"}), 400
+            collected = self.batch_store.collect_zip_files(batch_id, item_ids)
             if collected is None:
                 return jsonify({"error": "Batch not found"}), 404
             label, files_list, total_bytes = collected
@@ -1451,8 +1603,12 @@ class NearBeamServer:
         @app.route("/api/safelist/cancel-zip", methods=["POST"])
         def api_safelist_cancel_zip():
             """Aborts an active packaging job and cleans up temp files."""
-            data = request.get_json(silent=True) or request.form or {}
+            data, err = _parse_json_dict(allow_form=True)
+            if err:
+                return err
             job_id = data.get("job_id", "")
+            if not isinstance(job_id, str):
+                return jsonify({"error": "Invalid job_id"}), 400
             with self.zip_jobs_lock:
                 job = self.zip_jobs.get(job_id)
                 if job:
@@ -1511,8 +1667,10 @@ class NearBeamServer:
 
             try:
                 real_target = config.resolve_safe_path(folder_id, subpath)
-            except Exception as e:
+            except PermissionError as e:
                 return jsonify({"error": str(e)}), 403
+            except (FileNotFoundError, KeyError) as e:
+                return jsonify({"error": str(e)}), 404
 
             if not os.path.isdir(real_target):
                 return jsonify({"error": "Not a directory"}), 400
@@ -1522,8 +1680,18 @@ class NearBeamServer:
             temp_zip.close()
 
             try:
-                with zipfile.ZipFile(temp_zip.name, "w", allowZip64=True, compresslevel=1) as zip_file:
-                    for root, _, filenames in os.walk(real_target):
+                with zipfile.ZipFile(
+                    temp_zip.name,
+                    "w",
+                    allowZip64=True,
+                    compresslevel=1,
+                    strict_timestamps=False,
+                ) as zip_file:
+                    for root, dirnames, filenames in os.walk(real_target):
+                        dirnames[:] = [
+                            d for d in dirnames
+                            if inside_folder(real_target, os.path.join(root, d))
+                        ]
                         for filename in filenames:
                             file_path = os.path.join(root, filename)
                             if not inside_folder(real_target, file_path):
@@ -1564,32 +1732,40 @@ class NearBeamServer:
 
         # --- Guest Drop Zone Endpoints ---
 
-        self.active_drop_zones = {}
-
         @app.route("/api/drop/create", methods=["POST"])
         def api_drop_create():
             if not config.auto_save_enabled:
                 return jsonify({"error": "Auto-Save is disabled on host"}), 403
             token = str(uuid.uuid4())
+            now = time.time()
             # Token valid for 24 hours
-            expires_at = time.time() + (24 * 3600)
-            self.active_drop_zones[token] = {"expires_at": expires_at}
-            
+            expires_at = now + (24 * 3600)
+            with self._drop_zones_lock:
+                self._prune_drop_zones_locked(now)
+                self.active_drop_zones[token] = {"expires_at": expires_at}
+
             urls = get_connection_urls(self.port)
             # nearbeam.local is the mesh leader; a link made on another PC must point here.
             is_leader = not self.mesh or self.mesh.role == "leader"
             drop_url = f"{urls['nearbeam_url'] if is_leader else urls['primary_url']}/drop/{token}"
             return jsonify({"success": True, "token": token, "url": drop_url})
 
+        def _is_valid_drop_token(token: str) -> bool:
+            now = time.time()
+            with self._drop_zones_lock:
+                self._prune_drop_zones_locked(now)
+                meta = self.active_drop_zones.get(token)
+                return bool(meta and now <= meta.get("expires_at", 0))
+
         @app.route("/drop/<token>")
         def drop_page(token):
-            if token not in self.active_drop_zones or time.time() > self.active_drop_zones[token]["expires_at"]:
+            if not _is_valid_drop_token(token):
                 return "Drop link expired or invalid", 404
             return render_template("drop.html", token=token)
 
         @app.route("/api/drop/<token>/upload/chunk", methods=["POST"])
         def api_drop_upload_chunk(token):
-            if token not in self.active_drop_zones or time.time() > self.active_drop_zones[token]["expires_at"]:
+            if not _is_valid_drop_token(token):
                 return jsonify({"error": "Drop link expired"}), 403
             return self._receive_chunk(
                 os.path.join(config.save_directory, "Guest Drops"),
@@ -1634,11 +1810,14 @@ class NearBeamServer:
                                 break
                             out_file.write(chunk)
                             total_bytes += len(chunk)
+                    dest_path = finalize_upload(temp_path, save_dir, clean_name)
                 except Exception:
                     if os.path.exists(temp_path):
-                        os.remove(temp_path)
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
                     raise
-                dest_path = finalize_upload(temp_path, save_dir, clean_name)
                 final_name = os.path.basename(dest_path)
 
                 file_info = {
@@ -1651,11 +1830,11 @@ class NearBeamServer:
                     "category": get_file_type_category(final_name),
                 }
                 saved_list.append(file_info)
-                self.received_files_history.insert(0, file_info)
-
-                # Keep history reasonable
-                if len(self.received_files_history) > 100:
-                    self.received_files_history.pop()
+                with self._upload_state_lock:
+                    self.received_files_history.insert(0, file_info)
+                    # Keep history reasonable
+                    if len(self.received_files_history) > 100:
+                        self.received_files_history.pop()
                 config.add_transfer_history({
                     **file_info,
                     "direction": "received",
@@ -1705,22 +1884,34 @@ class NearBeamServer:
 
         @app.route("/api/upload/cancel", methods=["POST"])
         def api_upload_cancel():
-            data = request.get_json(silent=True) or {}
+            data, err = _parse_json_dict()
+            if err:
+                return err
             session_id = data.get("session_id", "")
             removed_tmp = False
-            if session_id and _SESSION_ID_RE.fullmatch(session_id):
+            if isinstance(session_id, str) and session_id and _SESSION_ID_RE.fullmatch(session_id):
+                with self._upload_state_lock:
+                    self._cancelled_uploads[session_id] = time.time()
+                    if len(self._cancelled_uploads) > 500:
+                        self._cancelled_uploads.popitem(last=False)
                 candidates = [
                     os.path.join(config.save_directory, f".{session_id}.tmp"),
                     os.path.join(config.save_directory, "Guest Drops", f".{session_id}.tmp"),
                     os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
                 ]
-                for temp_path in candidates:
-                    if os.path.exists(temp_path):
-                        try:
-                            os.remove(temp_path)
-                            removed_tmp = True
-                        except OSError:
-                            pass
+                session_lock = self._get_session_lock(session_id)
+                acquired = session_lock.acquire(blocking=False)
+                try:
+                    for temp_path in candidates:
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                                removed_tmp = True
+                            except OSError:
+                                pass
+                finally:
+                    if acquired:
+                        session_lock.release()
                 self.broadcast_event({
                     "type": "upload_cancelled",
                     "session_id": session_id,
@@ -1736,33 +1927,53 @@ class NearBeamServer:
         def api_history_clear():
             """Clears persistent transfer history."""
             config.clear_transfer_history()
-            self.received_files_history.clear()
+            with self._upload_state_lock:
+                self.received_files_history.clear()
             return jsonify({"success": True})
 
         @app.route("/api/shell-send", methods=["POST"])
         def api_shell_send():
             """
             Handles files or folders sent from Windows Explorer right-click ('Send with NearBeam').
-            Creates (or merges within 2s into) an ephemeral Send Batch without cluttering permanent Safe List.
+            - Directories are added to permanent Shared Folders so Explorer folder-sharing works immediately.
+            - Files create (or merge within 2s into) an ephemeral Send Batch without cluttering Safe List.
             """
             # Only the PC itself (Explorer "Send with NearBeam") may add paths: from the
             # network this would let anyone share, then download, any folder on the PC.
             if request.remote_addr not in ("127.0.0.1", "::1"):
                 return jsonify({"error": "Only available on this PC"}), 403
-            data = request.get_json(silent=True) or {}
+            data, err = _parse_json_dict()
+            if err:
+                return err
             paths = data.get("paths", [])
-            if not paths:
+            if not isinstance(paths, list) or not paths:
                 return jsonify({"error": "No paths provided"}), 400
 
-            batch = self.create_send_batch(paths, source="Explorer", merge_window=2.0)
-            if not batch:
-                return jsonify({"error": "No readable files found in provided paths"}), 400
+            dir_paths = [p for p in paths if isinstance(p, str) and p.strip() and os.path.isdir(p)]
+            file_paths = [p for p in paths if isinstance(p, str) and p.strip() and os.path.isfile(p)]
 
-            return jsonify({
+            added_folders = []
+            if dir_paths:
+                added_folders = config.add_safe_folders(dir_paths)
+                for folder in added_folders:
+                    self.log_activity(f"Shared folder from Explorer: {folder['name']}", event_type="info")
+                self.broadcast_event({"type": "safelist_updated"})
+
+            batch = None
+            if file_paths:
+                batch = self.create_send_batch(file_paths, source="Explorer", merge_window=2.0)
+
+            if not dir_paths and not batch:
+                return jsonify({"error": "No readable files or folders found in provided paths"}), 400
+
+            resp = {
                 "success": True,
-                "added_count": batch["file_count"],
-                "batch": batch,
-            })
+                "added_count": len(added_folders) + (batch["file_count"] if batch else 0),
+                "added_folders": [f["name"] for f in added_folders],
+            }
+            if batch:
+                resp["batch"] = batch
+            return jsonify(resp)
 
         @app.route("/api/received")
         def api_received():
@@ -1780,7 +1991,7 @@ class NearBeamServer:
                                     "filename": entry.name,
                                     "size": size,
                                     "formatted_size": format_size(size),
-                                    "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                                    "modified": _format_mtime(stat.st_mtime),
                                     "category": get_file_type_category(entry.name),
                                 })
                 except Exception as e:
@@ -1817,36 +2028,46 @@ class NearBeamServer:
         @app.route("/api/clipboard", methods=["GET", "POST"])
         def api_clipboard():
             if request.method == "POST":
-                data = request.get_json(silent=True) or {}
+                data, err = _parse_json_dict()
+                if err:
+                    return err
                 text = data.get("text")
                 image_b64 = data.get("image_base64")
                 image_mime = data.get("image_mime", "image/png")
+                if not isinstance(image_mime, str) or not image_mime.strip():
+                    image_mime = "image/png"
 
-                if image_b64:
-                    import base64
-                    if "," in image_b64 and image_b64.startswith("data:"):
-                        header, image_b64 = image_b64.split(",", 1)
-                        if ";" in header and ":" in header:
-                            image_mime = header.split(":", 1)[1].split(";", 1)[0] or "image/png"
-                    try:
-                        img_bytes = base64.b64decode(image_b64)
-                    except Exception:
+                if image_b64 is not None:
+                    if not isinstance(image_b64, str):
                         return jsonify({"error": "Invalid base64 image payload"}), 400
-                    state = self.set_clipboard_image(
-                        img_bytes,
-                        mime_type=image_mime,
-                        notify_local_os=True,
-                        propagate_mesh=True,
-                    )
-                    self.log_activity(
-                        f"Clipboard image ({format_size(len(img_bytes))}) synced from {request.remote_addr}",
-                        "upload",
-                    )
-                    return jsonify({"success": True, **state})
+                    if image_b64:
+                        import base64
+                        if "," in image_b64 and image_b64.startswith("data:"):
+                            header, image_b64 = image_b64.split(",", 1)
+                            if ";" in header and ":" in header:
+                                image_mime = header.split(":", 1)[1].split(";", 1)[0] or "image/png"
+                        try:
+                            img_bytes = base64.b64decode(image_b64)
+                        except Exception:
+                            return jsonify({"error": "Invalid base64 image payload"}), 400
+                        state = self.set_clipboard_image(
+                            img_bytes,
+                            mime_type=image_mime,
+                            notify_local_os=True,
+                            propagate_mesh=True,
+                        )
+                        self.log_activity(
+                            f"Clipboard image ({format_size(len(img_bytes))}) synced from {request.remote_addr}",
+                            "upload",
+                        )
+                        return jsonify({"success": True, **state})
 
                 if text is not None:
-                    self.clipboard_content = text
-                    self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+                    if not isinstance(text, str):
+                        return jsonify({"error": "text must be a string"}), 400
+                    with self._clipboard_lock:
+                        self.clipboard_content = text
+                        self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
 
                     snippet = (text[:35] + "...") if len(text) > 35 else text
                     self.log_activity(f"Clipboard updated from {request.remote_addr}: '{snippet}'")
@@ -1861,7 +2082,7 @@ class NearBeamServer:
 
                     for cb in self.clipboard_callbacks:
                         try:
-                            cb(self.clipboard_content)
+                            cb(text)
                         except Exception as e:
                             print(f"Error in clipboard callback: {e}")
 
@@ -1885,10 +2106,16 @@ class NearBeamServer:
                     img_bytes = request.get_data()
                     mime_type = request.content_type.split(";")[0].strip()
                 else:
-                    data = request.get_json(silent=True) or {}
+                    data, err = _parse_json_dict()
+                    if err:
+                        return err
                     b64 = data.get("image_base64", "")
                     mime_type = data.get("image_mime", "image/png")
+                    if not isinstance(mime_type, str) or not mime_type.strip():
+                        mime_type = "image/png"
                     if b64:
+                        if not isinstance(b64, str):
+                            return jsonify({"error": "Invalid base64 image"}), 400
                         import base64
                         if "," in b64 and b64.startswith("data:"):
                             header, b64 = b64.split(",", 1)
@@ -1914,32 +2141,37 @@ class NearBeamServer:
                 )
                 return jsonify({"success": True, **state})
 
-            if not self.clipboard_image_bytes:
+            with self._clipboard_lock:
+                img_bytes = self.clipboard_image_bytes
+                img_mime = self.clipboard_image_mime or "image/png"
+                img_id = self.clipboard_image_id or "image"
+
+            if not img_bytes:
                 return jsonify({"error": "No image in clipboard"}), 404
 
-            import io
             ext = "png"
-            if "jpeg" in (self.clipboard_image_mime or "") or "jpg" in (self.clipboard_image_mime or ""):
+            if "jpeg" in img_mime or "jpg" in img_mime:
                 ext = "jpg"
-            elif "webp" in (self.clipboard_image_mime or ""):
+            elif "webp" in img_mime:
                 ext = "webp"
-            elif "gif" in (self.clipboard_image_mime or ""):
+            elif "gif" in img_mime:
                 ext = "gif"
 
             as_download = request.args.get("download") == "1"
             return send_file(
-                io.BytesIO(self.clipboard_image_bytes),
-                mimetype=self.clipboard_image_mime or "image/png",
+                io.BytesIO(img_bytes),
+                mimetype=img_mime,
                 as_attachment=as_download,
-                download_name=f"nearbeam_clipboard_{self.clipboard_image_id or 'image'}.{ext}",
+                download_name=f"nearbeam_clipboard_{img_id}.{ext}",
             )
 
         @app.route("/api/clipboard/image/clear", methods=["POST"])
         def api_clipboard_image_clear():
             """Clears the current image from the shared clipboard."""
-            self.clipboard_image_bytes = None
-            self.clipboard_image_id = ""
-            self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+            with self._clipboard_lock:
+                self.clipboard_image_bytes = None
+                self.clipboard_image_id = ""
+                self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
             state = self.get_clipboard_state()
             self.broadcast_event({
                 "type": "clipboard_updated",
@@ -1962,13 +2194,17 @@ class NearBeamServer:
         @app.route("/api/mesh/register", methods=["POST"])
         def api_mesh_register():
             """Secondary nodes register with Primary Leader."""
-            data = request.get_json(silent=True) or {}
-            if not data.get("node_id") or not data.get("ip"):
+            data, err = _parse_json_dict()
+            if err:
+                return err
+            node_id = data.get("node_id")
+            ip = data.get("ip")
+            if not isinstance(node_id, str) or not node_id.strip() or not isinstance(ip, str) or not ip.strip():
                 return jsonify({"error": "Invalid node registration data"}), 400
 
             if self.mesh:
                 self.mesh.register_node(data)
-                self.log_activity(f"Secondary Node joined cluster: {data.get('name')} ({data.get('ip')})", "info")
+                self.log_activity(f"Secondary Node joined cluster: {data.get('name')} ({ip})", "info")
                 self.broadcast_event({
                     "type": "mesh_nodes_changed",
                     "nodes": self.mesh.get_nodes_list(),
@@ -1983,9 +2219,11 @@ class NearBeamServer:
         @app.route("/api/mesh/heartbeat", methods=["POST"])
         def api_mesh_heartbeat():
             """Heartbeat ping from active secondary nodes."""
-            data = request.get_json(silent=True) or {}
+            data, err = _parse_json_dict()
+            if err:
+                return err
             node_id = data.get("node_id")
-            if not node_id:
+            if not isinstance(node_id, str) or not node_id.strip():
                 return jsonify({"error": "Missing node_id"}), 400
 
             if self.mesh:
@@ -1996,47 +2234,65 @@ class NearBeamServer:
         @app.route("/api/mesh/clipboard-sync", methods=["POST"])
         def api_mesh_clipboard_sync():
             """Receives cross-node clipboard text or image update."""
-            data = request.get_json(silent=True) or {}
+            data, err = _parse_json_dict()
+            if err:
+                return err
             text = data.get("text", "")
+            if not isinstance(text, str):
+                text = ""
             image_b64 = data.get("image_base64")
+            if not isinstance(image_b64, str):
+                image_b64 = None
             image_mime = data.get("image_mime", "image/png")
+            if not isinstance(image_mime, str) or not image_mime.strip():
+                image_mime = "image/png"
             source_node_id = data.get("source_node_id")
+            if not isinstance(source_node_id, str):
+                source_node_id = None
 
+            image_applied = False
             if image_b64:
                 import base64
                 try:
                     img_bytes = base64.b64decode(image_b64)
-                    self.set_clipboard_image(
-                        img_bytes,
-                        mime_type=image_mime,
-                        notify_local_os=True,
-                        propagate_mesh=(self.mesh is not None and self.mesh.role == "leader"),
-                        source_node_id=source_node_id,
-                    )
-                    self.log_activity(f"Clipboard image ({format_size(len(img_bytes))}) synced from peer host", "info")
+                    if img_bytes:
+                        self.set_clipboard_image(
+                            img_bytes,
+                            mime_type=image_mime,
+                            notify_local_os=True,
+                            propagate_mesh=(self.mesh is not None and self.mesh.role == "leader"),
+                            source_node_id=source_node_id,
+                        )
+                        image_applied = True
+                        self.log_activity(f"Clipboard image ({format_size(len(img_bytes))}) synced from peer host", "info")
                 except Exception:
                     pass
 
-            if text and text != self.clipboard_content:
-                self.clipboard_content = text
-                self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
-                snippet = (text[:30] + "...") if len(text) > 30 else text
-                self.log_activity(f"Clipboard synced from peer host: '{snippet}'", "info")
+            if text:
+                with self._clipboard_lock:
+                    changed = text != self.clipboard_content
+                    if changed:
+                        self.clipboard_content = text
+                        self.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+                if changed:
+                    snippet = (text[:30] + "...") if len(text) > 30 else text
+                    self.log_activity(f"Clipboard synced from peer host: '{snippet}'", "info")
 
-                self.broadcast_event({
-                    "type": "clipboard_updated",
-                    **self.get_clipboard_state(),
-                })
+                    self.broadcast_event({
+                        "type": "clipboard_updated",
+                        **self.get_clipboard_state(),
+                    })
 
-                for cb in self.clipboard_callbacks:
-                    try:
-                        cb(text)
-                    except Exception:
-                        pass
+                    if not image_applied:
+                        for cb in self.clipboard_callbacks:
+                            try:
+                                cb(text)
+                            except Exception:
+                                pass
 
-                # If Leader, forward to other secondary nodes
-                if self.mesh and self.mesh.role == "leader":
-                    self.mesh.broadcast_clipboard_mesh(text, source_node_id=source_node_id)
+                    # If Leader, forward to other secondary nodes
+                    if self.mesh and self.mesh.role == "leader":
+                        self.mesh.broadcast_clipboard_mesh(text, source_node_id=source_node_id)
 
             return jsonify({"success": True})
 
@@ -2046,8 +2302,9 @@ class NearBeamServer:
         def api_events():
             """Server-Sent Events endpoint for real-time reactivity."""
             def event_stream():
-                client_queue = queue.Queue()
-                self.event_subscribers.append(client_queue)
+                client_queue = queue.Queue(maxsize=256)
+                with self._events_lock:
+                    self.event_subscribers.append(client_queue)
                 try:
                     # Initial heartbeat
                     yield f"data: {json.dumps({'type': 'connected'})}\n\n"
@@ -2058,9 +2315,10 @@ class NearBeamServer:
                         except queue.Empty:
                             # Keep-alive heartbeat
                             yield f": heartbeat\n\n"
-                except GeneratorExit:
-                    if client_queue in self.event_subscribers:
-                        self.event_subscribers.remove(client_queue)
+                finally:
+                    with self._events_lock:
+                        if client_queue in self.event_subscribers:
+                            self.event_subscribers.remove(client_queue)
 
             return Response(
                 event_stream(),
@@ -2076,9 +2334,16 @@ class NearBeamServer:
 
         @app.route("/api/qr")
         def api_qr():
-            """Returns QR code image for connection URL."""
+            """Returns QR code image for connection URL (or a Guest Drop Zone link when ?drop=<token> is set)."""
             urls = get_connection_urls(self.port)
-            target_url = urls["primary_url"]
+            drop_token = request.args.get("drop", "").strip()
+            if drop_token:
+                if not _is_valid_drop_token(drop_token):
+                    return jsonify({"error": "Drop link expired or invalid"}), 404
+                is_leader = not self.mesh or self.mesh.role == "leader"
+                target_url = f"{urls['nearbeam_url'] if is_leader else urls['primary_url']}/drop/{drop_token}"
+            else:
+                target_url = urls["primary_url"]
             png_bytes = generate_qr_png_bytes(target_url)
             if png_bytes:
                 return Response(png_bytes, mimetype="image/png")
