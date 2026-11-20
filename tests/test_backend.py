@@ -691,9 +691,22 @@ class TestLandrop(unittest.TestCase):
             "failedTransfersCard",
             "btnRetryAllFailed",
             "btnClearHistory",
+            "incomingBatchesSection",
+            "incomingBatchesList",
+            "btnClearAllBatches",
+            "btnToggleThumbs",
+            "btnToggleSelect",
+            "selectionActionBar",
+            "btnDownloadSelected",
+            "btnSelectAllVisible",
+            "btnCancelSelect",
+            "btnCopyShortcutUrl",
         ]
         for dom_id in required_ids:
             self.assertIn(f'id="{dom_id}"', index_html, f"Missing DOM element #{dom_id} in index.html")
+        for sort_val in ('value="newest"', 'value="oldest"', 'value="size-desc"', 'value="size-asc"', 'value="name-asc"', 'value="name-desc"'):
+            self.assertIn(sort_val, index_html)
+        self.assertIn("Send to PC (NearBeam)", index_html)
 
         from core.shell_integration import _get_launch_command_and_icon
         cmd, icon = _get_launch_command_and_icon()

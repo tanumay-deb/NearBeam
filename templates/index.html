@@ -181,6 +181,19 @@
       </div>
     </section>
 
+    <!-- INCOMING SEND BATCHES FROM PC (Ephemeral PC -> Devices transfers) -->
+    <section class="incoming-batches-card hidden" id="incomingBatchesSection">
+      <div class="incoming-batches-header">
+        <div class="incoming-batches-title-wrap">
+          <span class="mesh-dot"></span>
+          <h3 class="incoming-batches-title">Incoming from PC</h3>
+          <span class="nearby-role-tag" id="incomingBatchesCountBadge">0</span>
+        </div>
+        <button type="button" class="card-action-btn" id="btnClearAllBatches">Clear all</button>
+      </div>
+      <div class="incoming-batches-list" id="incomingBatchesList"></div>
+    </section>
+
     <!-- TAB 1: BROWSE SAFE LIST FOLDERS -->
     <section class="tab-pane active" id="tab-safelist">
       <div class="section-card">
@@ -236,14 +249,26 @@
           <input type="text" id="safeSearchInput" placeholder="Search this folder" aria-label="Search this folder" />
         </div>
 
-        <!-- Type filters, sort and list/grid switch (shown inside a folder) -->
+        <!-- Type filters, sort, thumbnails, select mode and list/grid switch -->
         <div class="browse-toolbar" id="browseToolbar" hidden>
           <div class="type-chips" id="typeChips" role="group" aria-label="Show only"></div>
           <div class="browse-tools">
             <select class="sort-select" id="safeSortSelect" aria-label="Sort files">
               <option value="newest">Newest first</option>
-              <option value="name">Name A–Z</option>
+              <option value="oldest">Oldest first</option>
+              <option value="size-desc">Largest first</option>
+              <option value="size-asc">Smallest first</option>
+              <option value="name-asc">Name A–Z</option>
+              <option value="name-desc">Name Z–A</option>
             </select>
+            <button type="button" class="tool-toggle-btn" id="btnToggleThumbs" aria-pressed="true" title="Show or hide photo thumbnails">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+              <span>Thumbs</span>
+            </button>
+            <button type="button" class="tool-toggle-btn" id="btnToggleSelect" aria-pressed="false" title="Select multiple files to download as one ZIP">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+              <span>Select</span>
+            </button>
             <div class="view-toggle" role="group" aria-label="View">
               <button type="button" class="view-btn" data-view="list" aria-label="List view" aria-pressed="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="9" y1="6" x2="20" y2="6"></line><line x1="9" y1="12" x2="20" y2="12"></line><line x1="9" y1="18" x2="20" y2="18"></line><line x1="4" y1="6" x2="4.01" y2="6"></line><line x1="4" y1="12" x2="4.01" y2="12"></line><line x1="4" y1="18" x2="4.01" y2="18"></line></svg>
@@ -252,6 +277,18 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg>
               </button>
             </div>
+          </div>
+        </div>
+
+        <!-- Sticky Selection Bar (shown when Select Mode is active) -->
+        <div class="selection-bar hidden" id="selectionActionBar" role="region" aria-label="Selected files actions">
+          <div class="selection-bar-info">
+            <span id="selectionCountLabel">0 selected</span>
+          </div>
+          <div class="selection-bar-actions">
+            <button type="button" class="card-action-btn" id="btnSelectAllVisible">Select all</button>
+            <button type="button" class="card-action-btn" id="btnCancelSelect">Cancel</button>
+            <button type="button" class="primary-btn btn-xs" id="btnDownloadSelected" disabled>Download</button>
           </div>
         </div>
 
@@ -615,6 +652,32 @@
                 <li><strong>Guest Wi-Fi:</strong> If your PC is on your main Wi-Fi and your phone is on "Guest Wi-Fi", the router isolates them. Connect both to the main network.</li>
                 <li><strong>AP Isolation:</strong> Log in to your router's admin page (usually <code>192.168.1.1</code>) and ensure "AP Isolation" / "Client Isolation" is turned <strong>Disabled</strong>.</li>
               </ul>
+            </div>
+          </div>
+
+          <!-- FAQ Item: iPhone / iPad Share Sheet Shortcut -->
+          <div class="faq-item">
+            <div class="faq-question">
+              <div class="faq-q-left">
+                <span class="faq-badge badge-apple">iPhone / iPad</span>
+                <span class="faq-title-text">Send files directly from the iOS Share Sheet ("Send to PC (NearBeam)" Shortcut)</span>
+              </div>
+              <span class="faq-toggle">▼</span>
+            </div>
+            <div class="faq-answer">
+              <p>Create a one-time Apple Shortcut to send photos, videos, or any file straight from Photos, Files, or Safari to your PC without opening a browser:</p>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 12px;">
+                <code class="code-pill" id="shortcutUploadUrl">http://nearbeam.local:5000/api/upload</code>
+                <button type="button" class="card-action-btn" id="btnCopyShortcutUrl">Copy Upload URL</button>
+              </div>
+              <ol class="faq-points">
+                <li>Open the <strong>Shortcuts</strong> app on your iPhone/iPad and tap <strong>+</strong>.</li>
+                <li>Tap <strong>ⓘ</strong> (Info) &rarr; turn on <strong>Show in Share Sheet</strong>.</li>
+                <li>Keep <em>Receive Any input from Share Sheet</em>, and set <em>If there's no input</em> to <strong>Ask For: Files</strong>.</li>
+                <li>Add <strong>Repeat with Each</strong> (input: <em>Shortcut Input</em>).</li>
+                <li>Inside the loop, add <strong>Get Contents of URL</strong> with the upload URL above, Method: <strong>POST</strong>, Request Body: <strong>Form</strong>, add File field Key <code>files</code> = <em>Repeat Item</em>.</li>
+                <li>After <em>End Repeat</em>, add <strong>Show Notification</strong> (<code>Sent to PC via NearBeam!</code>) and name it <strong>Send to PC (NearBeam)</strong>.</li>
+              </ol>
             </div>
           </div>
 

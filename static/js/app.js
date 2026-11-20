@@ -7,9 +7,15 @@
 // State
 let currentFolderId = "";
 let currentSubpath = "";
+let currentBatchId = "";
+let currentBatchMeta = null;
+let activeBatches = [];
 let safeItemsCache = [];
+let lastRenderedItems = [];
 let browseType = "all"; // type chip: all | image | video | document | audio | other
-const browsePrefs = loadBrowsePrefs(); // list/grid + sort, remembered on this device
+const browsePrefs = loadBrowsePrefs(); // list/grid + sort + thumbs, remembered on this device
+let selectMode = false;
+const selectedKeys = new Set();
 let cachedSafeFolders = [];
 let serverInfo = null;
 let meshNodes = [];
@@ -31,6 +37,17 @@ const badgeSafeCount = document.getElementById("badgeSafeCount");
 const browseToolbar = document.getElementById("browseToolbar");
 const typeChips = document.getElementById("typeChips");
 const safeSortSelect = document.getElementById("safeSortSelect");
+const btnToggleThumbs = document.getElementById("btnToggleThumbs");
+const btnToggleSelect = document.getElementById("btnToggleSelect");
+const selectionActionBar = document.getElementById("selectionActionBar");
+const selectionCountLabel = document.getElementById("selectionCountLabel");
+const btnSelectAllVisible = document.getElementById("btnSelectAllVisible");
+const btnCancelSelect = document.getElementById("btnCancelSelect");
+const btnDownloadSelected = document.getElementById("btnDownloadSelected");
+const incomingBatchesSection = document.getElementById("incomingBatchesSection");
+const incomingBatchesList = document.getElementById("incomingBatchesList");
+const incomingBatchesCountBadge = document.getElementById("incomingBatchesCountBadge");
+const btnClearAllBatches = document.getElementById("btnClearAllBatches");
 
 // Upload DOM Elements
 const dropzone = document.getElementById("dropzone");
@@ -122,6 +139,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupHeroDashboardActions();
   setupGlobalDragAndDrop();
   fetchServerInfo();
+  fetchSendBatches(false);
   fetchSafeFolders();
   fetchClipboard();
   fetchMeshNodes();
@@ -254,12 +272,32 @@ async function fetchServerInfo() {
       faqDirectIp.innerText = serverInfo.primary_url;
     }
 
+    const shortcutUrlEl = document.getElementById("shortcutUploadUrl");
+    if (shortcutUrlEl) {
+      const base = (serverInfo.nearbeam_url || serverInfo.primary_url || "http://nearbeam.local:5000").replace(/\/+$/, "");
+      shortcutUrlEl.innerText = `${base}/api/upload`;
+    }
+
     if (serverInfo.nearby_devices) {
       renderNearbyDevicesDashboard(serverInfo.nearby_devices);
     }
   } catch (e) {
     hostNameDisplay.innerText = "Offline / Connection Error";
   }
+}
+
+const btnCopyShortcutUrl = document.getElementById("btnCopyShortcutUrl");
+if (btnCopyShortcutUrl) {
+  btnCopyShortcutUrl.addEventListener("click", async () => {
+    const shortcutUrlEl = document.getElementById("shortcutUploadUrl");
+    const url = shortcutUrlEl ? shortcutUrlEl.innerText : "http://nearbeam.local:5000/api/upload";
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast("✓ Copied Shortcut upload URL!", "success");
+    } catch (e) {
+      showToast(url, "info");
+    }
+  });
 }
 
 // Click on host pill copies the permanent URL
@@ -286,6 +324,9 @@ function getParentSubpath(subpath) {
 function showAllSafeFolders(pushHistory = true) {
   currentFolderId = "";
   currentSubpath = "";
+  currentBatchId = "";
+  currentBatchMeta = null;
+  setSelectMode(false, false);
   if (selectSafeFolder) selectSafeFolder.value = "";
   if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
   if (btnSafeBack) btnSafeBack.style.display = "none";
@@ -312,8 +353,24 @@ function showAllSafeFolders(pushHistory = true) {
     top.className = "file-card-top";
 
     const iconDiv = document.createElement("div");
-    iconDiv.className = "file-icon folder";
-    iconDiv.innerHTML = categoryIcons.folder;
+    if (f.is_file) {
+      const cat = f.category || "file";
+      iconDiv.className = `file-icon ${cat}`;
+      iconDiv.innerHTML = categoryIcons[cat] || categoryIcons.file;
+      if (browsePrefs.thumbs && cat === "image") {
+        const thumb = document.createElement("img");
+        thumb.className = "file-thumb";
+        thumb.alt = "";
+        thumb.loading = "lazy";
+        thumb.decoding = "async";
+        thumb.src = `/api/safelist/thumb?folder_id=${encodeURIComponent(f.id)}&subpath=`;
+        thumb.addEventListener("error", () => thumb.remove());
+        iconDiv.appendChild(thumb);
+      }
+    } else {
+      iconDiv.className = "file-icon folder";
+      iconDiv.innerHTML = categoryIcons.folder;
+    }
 
     const details = document.createElement("div");
     details.className = "file-details";
@@ -325,7 +382,11 @@ function showAllSafeFolders(pushHistory = true) {
 
     const meta = document.createElement("div");
     meta.className = "file-meta";
-    meta.innerText = `${f.item_count || 0} items • Shared PC Folder`;
+    if (f.is_file) {
+      meta.innerText = f.formatted_size ? `${f.formatted_size} · Shared file` : "Shared file";
+    } else {
+      meta.innerText = `${f.item_count || 0} items · Shared PC Folder`;
+    }
 
     details.appendChild(name);
     details.appendChild(meta);
@@ -335,26 +396,266 @@ function showAllSafeFolders(pushHistory = true) {
 
     const actions = document.createElement("div");
     actions.className = "file-card-actions";
-    const openBtn = document.createElement("button");
-    openBtn.className = "card-action-btn";
-    openBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg><span>Browse Folder</span>`;
-    actions.appendChild(openBtn);
-    actions.appendChild(
-      f.is_file
-        ? downloadButton(`Download ${f.name}`, () => {
-            window.location.href = `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`;
-          })
-        : downloadButton(`Download ${f.name} as ZIP`, () => startFolderZipDownload(f.id, ""))
-    );
+    if (f.is_file) {
+      const previewBtn = document.createElement("button");
+      previewBtn.type = "button";
+      previewBtn.className = "card-action-btn btn-preview";
+      previewBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg><span>Preview</span>`;
+      previewBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openPreviewModal(
+          f.name,
+          f.category || "file",
+          `/api/safelist/preview?folder_id=${encodeURIComponent(f.id)}&subpath=`,
+          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`
+        );
+      });
+      actions.appendChild(previewBtn);
+      actions.appendChild(
+        downloadButton(`Download ${f.name}`, () => {
+          window.location.href = `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`;
+        })
+      );
+      card.addEventListener("click", () => {
+        openPreviewModal(
+          f.name,
+          f.category || "file",
+          `/api/safelist/preview?folder_id=${encodeURIComponent(f.id)}&subpath=`,
+          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`
+        );
+      });
+    } else {
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "card-action-btn";
+      openBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg><span>Browse Folder</span>`;
+      actions.appendChild(openBtn);
+      actions.appendChild(
+        downloadButton(`Download ${f.name} as ZIP`, () => startFolderZipDownload(f.id, ""))
+      );
+      card.addEventListener("click", () => {
+        selectSafeFolder.value = f.id;
+        browseSafeFolder(f.id, "");
+      });
+    }
     card.appendChild(actions);
-
-    card.addEventListener("click", () => {
-      selectSafeFolder.value = f.id;
-      browseSafeFolder(f.id, "");
-    });
 
     safeFilesContainer.appendChild(card);
   });
+}
+
+// --- Incoming Send Batches (PC -> Devices ephemeral bundles) ---
+
+async function fetchSendBatches(showNewToast = false) {
+  try {
+    const prevIds = new Set(activeBatches.map((b) => b.id));
+    const res = await fetch("/api/batches");
+    if (!res.ok) return;
+    const data = await res.json();
+    activeBatches = data.batches || [];
+    renderIncomingBatches();
+
+    if (showNewToast && activeBatches.length > 0 && !prevIds.has(activeBatches[0].id)) {
+      showToast(`📥 Incoming from PC: ${activeBatches[0].label} (${activeBatches[0].formatted_size})`, "info");
+    }
+    // If currently inspecting a batch that was dismissed/cleared, return to Safe List root
+    if (currentBatchId && !activeBatches.some((b) => b.id === currentBatchId)) {
+      showAllSafeFolders(false);
+    }
+  } catch (e) {
+    // Ignore transient errors
+  }
+}
+
+function renderIncomingBatches() {
+  if (!incomingBatchesSection || !incomingBatchesList) return;
+  if (!activeBatches || activeBatches.length === 0) {
+    incomingBatchesSection.classList.add("hidden");
+    incomingBatchesList.innerHTML = "";
+    if (incomingBatchesCountBadge) incomingBatchesCountBadge.innerText = "0";
+    return;
+  }
+
+  incomingBatchesSection.classList.remove("hidden");
+  if (incomingBatchesCountBadge) {
+    incomingBatchesCountBadge.innerText = `${activeBatches.length} Ready`;
+  }
+  incomingBatchesList.innerHTML = "";
+
+  activeBatches.forEach((batch) => {
+    const row = document.createElement("div");
+    row.className = "incoming-batch-row";
+
+    const info = document.createElement("div");
+    info.className = "incoming-batch-info";
+
+    const title = document.createElement("div");
+    title.className = "incoming-batch-label";
+    title.innerText = batch.label;
+
+    const meta = document.createElement("div");
+    meta.className = "incoming-batch-meta";
+    const filesLabel = batch.file_count === 1 ? "1 file" : `${batch.file_count} files`;
+    meta.innerText = `${filesLabel} · ${batch.formatted_size} · Sent ${batch.created_at}`;
+
+    info.appendChild(title);
+    info.appendChild(meta);
+
+    if (browsePrefs.thumbs && Array.isArray(batch.preview_thumbs) && batch.preview_thumbs.length > 0) {
+      const strip = document.createElement("div");
+      strip.className = "batch-mini-thumbs";
+      batch.preview_thumbs.forEach((iid) => {
+        const img = document.createElement("img");
+        img.className = "batch-mini-thumb";
+        img.alt = "";
+        img.loading = "lazy";
+        img.src = `/api/batches/${encodeURIComponent(batch.id)}/thumb/${encodeURIComponent(iid)}`;
+        img.addEventListener("error", () => img.remove());
+        strip.appendChild(img);
+      });
+      info.appendChild(strip);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "incoming-batch-actions";
+
+    if (batch.file_count === 1 && batch.single_item) {
+      const item = batch.single_item;
+      const dlBtn = document.createElement("button");
+      dlBtn.type = "button";
+      dlBtn.className = "primary-btn btn-xs";
+      dlBtn.innerText = "Download";
+      dlBtn.addEventListener("click", () => {
+        window.location.href = `/api/batches/${encodeURIComponent(batch.id)}/download/${encodeURIComponent(item.id)}`;
+      });
+      actions.appendChild(dlBtn);
+
+      const pvBtn = document.createElement("button");
+      pvBtn.type = "button";
+      pvBtn.className = "secondary-btn btn-xs";
+      pvBtn.innerText = "Preview";
+      pvBtn.addEventListener("click", () => {
+        openPreviewModal(
+          item.name,
+          item.category || "file",
+          `/api/batches/${encodeURIComponent(batch.id)}/preview/${encodeURIComponent(item.id)}`,
+          `/api/batches/${encodeURIComponent(batch.id)}/download/${encodeURIComponent(item.id)}`
+        );
+      });
+      actions.appendChild(pvBtn);
+    } else {
+      const zipBtn = document.createElement("button");
+      zipBtn.type = "button";
+      zipBtn.className = "primary-btn btn-xs";
+      zipBtn.innerText = "Download All (ZIP)";
+      zipBtn.addEventListener("click", () => {
+        startBatchZipDownload(batch.id, batch.label);
+      });
+      actions.appendChild(zipBtn);
+
+      const viewBtn = document.createElement("button");
+      viewBtn.type = "button";
+      viewBtn.className = "secondary-btn btn-xs";
+      viewBtn.innerText = "View / Pick files";
+      viewBtn.addEventListener("click", () => {
+        openSendBatch(batch.id);
+      });
+      actions.appendChild(viewBtn);
+    }
+
+    const dismissBtn = document.createElement("button");
+    dismissBtn.type = "button";
+    dismissBtn.className = "card-action-btn";
+    dismissBtn.innerText = "Dismiss";
+    dismissBtn.addEventListener("click", () => {
+      dismissSendBatch(batch.id);
+    });
+    actions.appendChild(dismissBtn);
+
+    row.appendChild(info);
+    row.appendChild(actions);
+    incomingBatchesList.appendChild(row);
+  });
+}
+
+async function openSendBatch(batchId, pushHistory = true) {
+  if (!batchId) return;
+  activateTab("tab-safelist");
+  currentBatchId = batchId;
+  currentFolderId = "";
+  currentSubpath = "";
+  setSelectMode(false, false);
+
+  if (selectSafeFolder) selectSafeFolder.value = "";
+  if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "inline-flex";
+  if (btnSafeBack) {
+    btnSafeBack.style.display = "inline-flex";
+    if (safeBackBtnLabel) safeBackBtnLabel.innerText = "All Folders";
+  }
+  if (pushHistory) {
+    window.history.pushState({ view: "send_batch", batchId }, "", window.location.pathname);
+  }
+
+  try {
+    const res = await fetch(`/api/batches/${encodeURIComponent(batchId)}/items`);
+    if (!res.ok) {
+      renderSafeEmptyState("This send batch is no longer available.");
+      return;
+    }
+    const data = await res.json();
+    currentBatchMeta = data.batch || null;
+    safeItemsCache = data.items || [];
+    browseType = "all";
+    renderBreadcrumbs([{ name: `Incoming: ${currentBatchMeta ? currentBatchMeta.label : "Files"}`, subpath: "" }]);
+    if (browseToolbar) browseToolbar.hidden = false;
+    applyBrowseView();
+  } catch (e) {
+    renderSafeEmptyState("Error loading send batch: " + e.message);
+  }
+}
+
+async function dismissSendBatch(batchId) {
+  try {
+    await fetch(`/api/batches/${encodeURIComponent(batchId)}`, { method: "DELETE" });
+    if (currentBatchId === batchId) showAllSafeFolders(false);
+    fetchSendBatches(false);
+  } catch (e) {}
+}
+
+async function clearAllSendBatches() {
+  try {
+    await fetch("/api/batches/clear", { method: "POST" });
+    if (currentBatchId) showAllSafeFolders(false);
+    fetchSendBatches(false);
+  } catch (e) {}
+}
+
+if (btnClearAllBatches) {
+  btnClearAllBatches.addEventListener("click", clearAllSendBatches);
+}
+
+async function startBatchZipDownload(batchId, label, itemIds = null) {
+  const archiveTitle = itemIds && itemIds.length > 0 ? `${label} (${itemIds.length} selected)` : label;
+  openZipProgressModal(archiveTitle);
+  try {
+    const body = itemIds && itemIds.length > 0 ? { item_ids: itemIds } : {};
+    const res = await fetch(`/api/batches/${encodeURIComponent(batchId)}/prepare-zip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      showZipError(data.error || "Failed to prepare ZIP archive");
+      return;
+    }
+    activeZipJobId = data.job_id;
+    if (zipFilesCount) zipFilesCount.innerText = `0 / ${data.total_files} files`;
+    if (zipBytesCount) zipBytesCount.innerText = `0 B / ${formatBytes(data.total_bytes)}`;
+    pollZipProgress(data.job_id, data.folder_name || label, data.total_files, data.total_bytes);
+  } catch (err) {
+    showZipError("Network error starting ZIP preparation");
+  }
 }
 
 async function fetchSafeFolders() {
@@ -389,9 +690,12 @@ async function fetchSafeFolders() {
       selectSafeFolder.appendChild(opt);
     });
 
-    // Auto-select folder or show root list
+    // Auto-select folder or show root list (don't disrupt an active Send Batch view)
+    if (currentBatchId) {
+      return;
+    }
     if (!currentFolderId) {
-      if (cachedSafeFolders.length === 1) {
+      if (cachedSafeFolders.length === 1 && !cachedSafeFolders[0].is_file) {
         currentFolderId = cachedSafeFolders[0].id;
         currentSubpath = "";
         selectSafeFolder.value = currentFolderId;
@@ -409,6 +713,8 @@ async function fetchSafeFolders() {
 }
 
 selectSafeFolder.addEventListener("change", (e) => {
+  currentBatchId = "";
+  currentBatchMeta = null;
   currentFolderId = e.target.value;
   currentSubpath = "";
   if (currentFolderId) {
@@ -419,16 +725,23 @@ selectSafeFolder.addEventListener("change", (e) => {
 });
 
 btnRefreshSafe.addEventListener("click", () => {
-  if (currentFolderId) {
+  if (currentBatchId) {
+    openSendBatch(currentBatchId, false);
+  } else if (currentFolderId) {
     browseSafeFolder(currentFolderId, currentSubpath);
   } else {
     fetchSafeFolders();
+    fetchSendBatches(false);
   }
 });
 
 // --- Safe List Folder ZIP Packaging with Live Progress Circle ---
 
 btnDownloadFolderZip.addEventListener("click", () => {
+  if (currentBatchId) {
+    startBatchZipDownload(currentBatchId, currentBatchMeta ? currentBatchMeta.label : "Files");
+    return;
+  }
   if (!currentFolderId) return;
   startFolderZipDownload(currentFolderId, currentSubpath);
 });
@@ -487,7 +800,7 @@ async function cancelZipDownload() {
   showToast("ZIP preparation cancelled", "info");
 }
 
-async function startFolderZipDownload(folderId, subpath) {
+async function startFolderZipDownload(folderId, subpath, selectedItems = null) {
   let folderName = "Folder";
   if (subpath) {
     folderName = subpath.split(/[\\/]/).filter(Boolean).pop() || "Folder";
@@ -496,13 +809,20 @@ async function startFolderZipDownload(folderId, subpath) {
     if (match && match.name) folderName = match.name;
   }
 
-  openZipProgressModal(folderName);
+  const displayTitle = selectedItems && selectedItems.length > 0
+    ? `${folderName} (${selectedItems.length} selected)`
+    : folderName;
+  openZipProgressModal(displayTitle);
 
   try {
+    const payload = { folder_id: folderId, subpath: subpath };
+    if (selectedItems && selectedItems.length > 0) {
+      payload.items = selectedItems;
+    }
     const res = await fetch("/api/safelist/prepare-zip", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folder_id: folderId, subpath: subpath }),
+      body: JSON.stringify(payload),
     });
 
     const data = await res.json();
@@ -519,7 +839,7 @@ async function startFolderZipDownload(folderId, subpath) {
       if (zipBytesCount) zipBytesCount.innerText = `0 B / ${formatBytes(data.total_bytes)}`;
     }
 
-    pollZipProgress(data.job_id, folderName, data.total_files, data.total_bytes);
+    pollZipProgress(data.job_id, data.folder_name || folderName, data.total_files, data.total_bytes);
   } catch (err) {
     showZipError("Network error starting ZIP preparation");
   }
@@ -651,6 +971,8 @@ window.addEventListener("popstate", (e) => {
   if (e.state) {
     if (e.state.view === "safelist_folder" && e.state.folderId) {
       browseSafeFolder(e.state.folderId, e.state.subpath || "", false);
+    } else if (e.state.view === "send_batch" && e.state.batchId) {
+      openSendBatch(e.state.batchId, false);
     } else if (e.state.view === "safelist_root") {
       showAllSafeFolders(false);
     }
@@ -663,8 +985,11 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
     return;
   }
 
+  currentBatchId = "";
+  currentBatchMeta = null;
   currentFolderId = folderId;
   currentSubpath = subpath;
+  setSelectMode(false, false);
   if (selectSafeFolder) selectSafeFolder.value = folderId;
   if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "inline-flex";
 
@@ -747,14 +1072,19 @@ const TYPE_CHIPS = [
   ["other", "Other"],
 ];
 
+const VALID_SORTS = new Set(["newest", "oldest", "size-desc", "size-asc", "name-asc", "name-desc"]);
+
 function loadBrowsePrefs() {
   try {
+    let rawSort = localStorage.getItem("nearbeam.browseSort") || "newest";
+    if (rawSort === "name") rawSort = "name-asc";
     return {
       view: localStorage.getItem("nearbeam.browseView") === "grid" ? "grid" : "list",
-      sort: localStorage.getItem("nearbeam.browseSort") === "name" ? "name" : "newest",
+      sort: VALID_SORTS.has(rawSort) ? rawSort : "newest",
+      thumbs: localStorage.getItem("nearbeam.showThumbs") !== "false",
     };
   } catch (e) {
-    return { view: "list", sort: "newest" };
+    return { view: "list", sort: "newest", thumbs: true };
   }
 }
 
@@ -762,6 +1092,7 @@ function saveBrowsePrefs() {
   try {
     localStorage.setItem("nearbeam.browseView", browsePrefs.view);
     localStorage.setItem("nearbeam.browseSort", browsePrefs.sort);
+    localStorage.setItem("nearbeam.showThumbs", String(browsePrefs.thumbs));
   } catch (e) {
     /* private mode / blocked storage: the choice just isn't remembered */
   }
@@ -775,10 +1106,21 @@ function typeGroup(item) {
 function compareBrowseItems(a, b) {
   if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1; // folders first
   const byName = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
-  if (browsePrefs.sort === "newest") {
-    return (b.modified || "").localeCompare(a.modified || "") || byName;
+  switch (browsePrefs.sort) {
+    case "newest":
+      return (b.modified || "").localeCompare(a.modified || "") || byName;
+    case "oldest":
+      return (a.modified || "").localeCompare(b.modified || "") || byName;
+    case "size-desc":
+      return ((b.size || 0) - (a.size || 0)) || byName;
+    case "size-asc":
+      return ((a.size || 0) - (b.size || 0)) || byName;
+    case "name-desc":
+      return -byName;
+    case "name-asc":
+    default:
+      return byName;
   }
-  return byName;
 }
 
 function formatModified(stamp) {
@@ -787,6 +1129,59 @@ function formatModified(stamp) {
   if (isNaN(d)) return stamp || "";
   const sameYear = d.getFullYear() === new Date().getFullYear();
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: sameYear ? undefined : "numeric" });
+}
+
+function itemSelectionKey(item) {
+  return currentBatchId ? item.id : item.subpath;
+}
+
+function setSelectMode(on, rerender = true) {
+  selectMode = Boolean(on);
+  if (!selectMode) {
+    selectedKeys.clear();
+  }
+  if (btnToggleSelect) {
+    btnToggleSelect.setAttribute("aria-pressed", String(selectMode));
+  }
+  if (selectionActionBar) {
+    selectionActionBar.classList.toggle("hidden", !selectMode);
+  }
+  updateSelectionBar();
+  if (rerender && (currentFolderId || currentBatchId)) {
+    applyBrowseView();
+  }
+}
+
+function updateSelectionBar() {
+  if (!selectionActionBar) return;
+  const count = selectedKeys.size;
+  let totalBytes = 0;
+  let hasDir = false;
+  safeItemsCache.forEach((it) => {
+    if (selectedKeys.has(itemSelectionKey(it))) {
+      if (it.is_dir) hasDir = true;
+      else totalBytes += Number(it.size || 0);
+    }
+  });
+  if (selectionCountLabel) {
+    const sizeText = totalBytes > 0 ? ` · ${formatBytes(totalBytes)}` : "";
+    selectionCountLabel.innerText = `${count} selected${sizeText}`;
+  }
+  if (btnDownloadSelected) {
+    btnDownloadSelected.disabled = count === 0;
+    if (count === 0) {
+      btnDownloadSelected.innerText = "Download";
+    } else if (count === 1 && !hasDir) {
+      btnDownloadSelected.innerText = "Download (1)";
+    } else {
+      btnDownloadSelected.innerText = `Download ZIP (${count})`;
+    }
+  }
+  if (btnSelectAllVisible) {
+    const visibleKeys = lastRenderedItems.map(itemSelectionKey);
+    const allSelected = visibleKeys.length > 0 && visibleKeys.every((k) => selectedKeys.has(k));
+    btnSelectAllVisible.innerText = allSelected ? "Deselect all" : "Select all";
+  }
 }
 
 function renderTypeChips(counts) {
@@ -822,21 +1217,81 @@ function applyBrowseView() {
     .filter((item) => !query || item.name.toLowerCase().includes(query))
     .filter((item) => browseType === "all" || typeGroup(item) === browseType)
     .sort(compareBrowseItems);
+  lastRenderedItems = items;
 
   safeFilesContainer.classList.toggle("view-grid", browsePrefs.view === "grid");
   safeFilesContainer.classList.toggle("view-list", browsePrefs.view !== "grid");
   if (safeSortSelect) safeSortSelect.value = browsePrefs.sort;
+  if (btnToggleThumbs) btnToggleThumbs.setAttribute("aria-pressed", String(browsePrefs.thumbs));
+  if (btnToggleSelect) btnToggleSelect.setAttribute("aria-pressed", String(selectMode));
   document.querySelectorAll(".view-btn").forEach((btn) => {
     btn.setAttribute("aria-pressed", String(btn.dataset.view === browsePrefs.view));
   });
   renderSafeItems(items, Boolean(query) || browseType !== "all");
+  updateSelectionBar();
 }
 
 if (safeSortSelect) {
   safeSortSelect.addEventListener("change", () => {
-    browsePrefs.sort = safeSortSelect.value === "name" ? "name" : "newest";
+    browsePrefs.sort = VALID_SORTS.has(safeSortSelect.value) ? safeSortSelect.value : "newest";
     saveBrowsePrefs();
     applyBrowseView();
+  });
+}
+if (btnToggleThumbs) {
+  btnToggleThumbs.addEventListener("click", () => {
+    browsePrefs.thumbs = !browsePrefs.thumbs;
+    saveBrowsePrefs();
+    btnToggleThumbs.setAttribute("aria-pressed", String(browsePrefs.thumbs));
+    renderIncomingBatches();
+    if (currentFolderId || currentBatchId) {
+      applyBrowseView();
+    } else {
+      showAllSafeFolders(false);
+    }
+  });
+}
+if (btnToggleSelect) {
+  btnToggleSelect.addEventListener("click", () => {
+    setSelectMode(!selectMode, true);
+  });
+}
+if (btnCancelSelect) {
+  btnCancelSelect.addEventListener("click", () => {
+    setSelectMode(false, true);
+  });
+}
+if (btnSelectAllVisible) {
+  btnSelectAllVisible.addEventListener("click", () => {
+    const visibleKeys = lastRenderedItems.map(itemSelectionKey);
+    const allSelected = visibleKeys.length > 0 && visibleKeys.every((k) => selectedKeys.has(k));
+    if (allSelected) {
+      visibleKeys.forEach((k) => selectedKeys.delete(k));
+    } else {
+      visibleKeys.forEach((k) => selectedKeys.add(k));
+    }
+    applyBrowseView();
+  });
+}
+if (btnDownloadSelected) {
+  btnDownloadSelected.addEventListener("click", () => {
+    const keys = Array.from(selectedKeys);
+    if (keys.length === 0) return;
+    if (keys.length === 1) {
+      const single = safeItemsCache.find((it) => itemSelectionKey(it) === keys[0]);
+      if (single && !single.is_dir) {
+        window.location.href = safeItemUrl("download", single);
+        setSelectMode(false, true);
+        return;
+      }
+    }
+    if (currentBatchId) {
+      const label = currentBatchMeta ? currentBatchMeta.label : "Files";
+      startBatchZipDownload(currentBatchId, label, keys);
+    } else if (currentFolderId) {
+      startFolderZipDownload(currentFolderId, currentSubpath, keys);
+    }
+    setSelectMode(false, true);
   });
 }
 document.querySelectorAll(".view-btn").forEach((btn) => {
@@ -864,6 +1319,9 @@ function downloadButton(label, onClick) {
 }
 
 function safeItemUrl(kind, item) {
+  if (currentBatchId) {
+    return `/api/batches/${encodeURIComponent(currentBatchId)}/${kind}/${encodeURIComponent(item.id)}`;
+  }
   return `/api/safelist/${kind}?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`;
 }
 
@@ -871,7 +1329,7 @@ function renderSafeItems(items, filtered = false) {
   safeFilesContainer.innerHTML = "";
 
   // Add Parent Directory item at top if inside a subfolder
-  if (currentSubpath) {
+  if (currentSubpath && !currentBatchId) {
     const parentCard = document.createElement("div");
     parentCard.className = "file-card parent-dir-card";
 
@@ -927,8 +1385,20 @@ function renderSafeItems(items, filtered = false) {
   }
 
   items.forEach((item) => {
+    const selKey = itemSelectionKey(item);
+    const isSelected = selectMode && selectedKeys.has(selKey);
+
     const card = document.createElement("div");
-    card.className = "file-card";
+    card.className = "file-card" + (selectMode ? " selectable" : "") + (isSelected ? " selected" : "");
+    if (selectMode) {
+      card.setAttribute("aria-selected", String(isSelected));
+      const checkBadge = document.createElement("span");
+      checkBadge.className = "select-check-badge";
+      checkBadge.innerHTML = isSelected
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>`
+        : "";
+      card.appendChild(checkBadge);
+    }
 
     const top = document.createElement("div");
     top.className = "file-card-top";
@@ -936,7 +1406,7 @@ function renderSafeItems(items, filtered = false) {
     const iconDiv = document.createElement("div");
     iconDiv.className = `file-icon ${item.category || "file"}`;
     iconDiv.innerHTML = categoryIcons[item.category] || categoryIcons.file;
-    if (item.category === "image") {
+    if (browsePrefs.thumbs && item.category === "image") {
       const thumb = document.createElement("img");
       thumb.className = "file-thumb";
       thumb.alt = "";
@@ -969,7 +1439,25 @@ function renderSafeItems(items, filtered = false) {
     const actions = document.createElement("div");
     actions.className = "file-card-actions";
 
-    if (item.is_dir) {
+    if (selectMode) {
+      card.addEventListener("click", () => {
+        if (selectedKeys.has(selKey)) {
+          selectedKeys.delete(selKey);
+        } else {
+          selectedKeys.add(selKey);
+        }
+        const nowSel = selectedKeys.has(selKey);
+        card.classList.toggle("selected", nowSel);
+        card.setAttribute("aria-selected", String(nowSel));
+        const badge = card.querySelector(".select-check-badge");
+        if (badge) {
+          badge.innerHTML = nowSel
+            ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>`
+            : "";
+        }
+        updateSelectionBar();
+      });
+    } else if (item.is_dir) {
       const openBtn = document.createElement("button");
       openBtn.className = "card-action-btn";
       openBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg><span>Open Folder</span>`;
@@ -980,22 +1468,24 @@ function renderSafeItems(items, filtered = false) {
         browseSafeFolder(currentFolderId, item.subpath);
       });
     } else {
-      // Preview button for media/documents
+      const previewUrl = safeItemUrl("preview", item);
+      const downloadUrl = safeItemUrl("download", item);
+
       const previewBtn = document.createElement("button");
       previewBtn.className = "card-action-btn btn-preview";
       previewBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg><span>Preview</span>`;
       previewBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        openPreviewModal(item.name, item.category, `/api/safelist/preview?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`, `/api/safelist/download?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`);
+        openPreviewModal(item.name, item.category, previewUrl, downloadUrl);
       });
       actions.appendChild(previewBtn);
 
       actions.appendChild(downloadButton(`Download ${item.name}`, () => {
-        window.location.href = safeItemUrl("download", item);
+        window.location.href = downloadUrl;
       }));
 
       card.addEventListener("click", () => {
-        openPreviewModal(item.name, item.category, `/api/safelist/preview?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`, `/api/safelist/download?folder_id=${encodeURIComponent(currentFolderId)}&subpath=${encodeURIComponent(item.subpath)}`);
+        openPreviewModal(item.name, item.category, previewUrl, downloadUrl);
       });
     }
 
@@ -1021,7 +1511,7 @@ function renderSafeEmptyState(msg) {
 // Search Filter
 if (safeSearchInput) {
   safeSearchInput.addEventListener("input", () => {
-    if (currentFolderId) applyBrowseView(); // the all-folders overview has nothing to filter
+    if (currentFolderId || currentBatchId) applyBrowseView();
   });
 }
 
@@ -2354,8 +2844,10 @@ function setupSSE() {
       } else if (data.type === "upload_cancelled") {
         removeIncomingProgress(data.session_id);
       } else if (data.type === "safelist_updated") {
-        fetchSafelist();
+        fetchSafeFolders();
         showToast(data.message || "Shared items updated on PC", "info");
+      } else if (data.type === "batches_updated") {
+        fetchSendBatches(true);
       } else if (data.type === "nearby_devices_changed") {
         if (Array.isArray(data.devices)) {
           nearbyDevices = data.devices;

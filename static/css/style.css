@@ -2995,3 +2995,234 @@ body.theme-light .zip-circle-wrap .progress-ring-track {
     font-size: 0.75rem;
   }
 }
+
+
+/* ==========================================================================
+   Incoming Send Batches, Thumbnail & Select Mode Controls
+   ========================================================================== */
+.incoming-batches-card {
+  background: var(--surface-card);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 8px 28px rgba(14, 165, 233, 0.12);
+}
+
+.incoming-batches-card.hidden {
+  display: none;
+}
+
+.incoming-batches-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.incoming-batches-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.incoming-batches-title {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.incoming-batches-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.incoming-batch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+
+.incoming-batch-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 200px;
+}
+
+.incoming-batch-label {
+  font-weight: 700;
+  font-size: 0.94rem;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.incoming-batch-meta {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.batch-mini-thumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.batch-mini-thumb {
+  width: 38px;
+  height: 38px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: 1px solid var(--border-subtle);
+}
+
+.incoming-batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.tool-toggle-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.tool-toggle-btn:hover {
+  border-color: var(--border-hover);
+  color: var(--text-main);
+}
+
+.tool-toggle-btn[aria-pressed="true"] {
+  background: rgba(56, 189, 248, 0.15);
+  border-color: rgba(56, 189, 248, 0.55);
+  color: var(--accent-cyan);
+}
+
+.tool-toggle-btn:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.file-card.selectable {
+  position: relative;
+  cursor: pointer;
+  user-select: none;
+}
+
+.file-card.selectable.selected {
+  border-color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.1);
+}
+
+#safeFilesContainer.view-grid .file-card.selectable.selected .file-icon {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.45);
+}
+
+.select-check-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 2px solid var(--border-hover);
+  background: rgba(8, 12, 20, 0.72);
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.file-card.selectable.selected .select-check-badge {
+  background: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  color: #080c14;
+}
+
+.select-check-badge svg {
+  width: 14px;
+  height: 14px;
+}
+
+.selection-bar {
+  position: sticky;
+  bottom: 12px;
+  z-index: 25;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: rgba(15, 23, 42, 0.94);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.selection-bar.hidden {
+  display: none;
+}
+
+.selection-bar-info {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.selection-bar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+body.theme-light .selection-bar {
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
+}
+
+@media (max-width: 640px) {
+  .tool-toggle-btn span {
+    display: none;
+  }
+
+  .selection-bar {
+    bottom: 72px;
+  }
+}
