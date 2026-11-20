@@ -580,6 +580,48 @@ class TestLandrop(unittest.TestCase):
         self.assertIn('"%1"', cmd)
         self.assertTrue(len(icon) > 0)
 
+    # 19. Config: Bulk Safe Folder Add & Remove
+    def test_bulk_add_and_remove_safe_folders(self):
+        dir_a = os.path.join(self.test_dir, "bulk_a")
+        dir_b = os.path.join(self.test_dir, "bulk_b")
+        file_c = os.path.join(self.test_dir, "bulk_c.txt")
+        os.makedirs(dir_a, exist_ok=True)
+        os.makedirs(dir_b, exist_ok=True)
+        with open(file_c, "w") as f:
+            f.write("bulk file")
+
+        save_calls = []
+        orig_save = self.cfg.save
+        self.cfg.save = lambda: (save_calls.append(1), orig_save())
+        try:
+            added = self.cfg.add_safe_folders([
+                dir_a,
+                dir_b,
+                dir_a,  # duplicate within batch
+                file_c,
+                os.path.join(self.test_dir, "does_not_exist"),
+                self.safe_share_dir,  # already in safe_folders
+            ])
+            self.assertEqual(len(added), 3)
+            self.assertEqual(len(save_calls), 1)
+
+            ids = [e["id"] for e in added]
+            removed = self.cfg.remove_safe_folders([ids[0], ids[2], "nonexistent_id"])
+            self.assertEqual(removed, 2)
+            self.assertEqual(len(save_calls), 2)
+
+            remaining_ids = {f["id"] for f in self.cfg.get_safe_folders()}
+            self.assertNotIn(ids[0], remaining_ids)
+            self.assertIn(ids[1], remaining_ids)
+            self.assertNotIn(ids[2], remaining_ids)
+
+            # Removing no matching IDs must not write disk
+            removed_zero = self.cfg.remove_safe_folders(["still_missing"])
+            self.assertEqual(removed_zero, 0)
+            self.assertEqual(len(save_calls), 2)
+        finally:
+            self.cfg.save = orig_save
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -200,6 +200,45 @@ class ConfigManager:
                 return True
         return False
 
+    def add_safe_folders(self, paths: list[str]) -> list[dict]:
+        """Adds multiple folders or files to the Safe List in a single atomic config save."""
+        added = []
+        with self._lock:
+            folders = self.data.setdefault("safe_folders", [])
+            existing_paths = {os.path.realpath(item["path"]) for item in folders if item.get("path")}
+            for raw_path in paths or []:
+                if not raw_path or not os.path.exists(raw_path):
+                    continue
+                abs_path = os.path.realpath(raw_path)
+                if abs_path in existing_paths:
+                    continue
+                name = os.path.basename(abs_path) or abs_path
+                entry = {
+                    "id": uuid.uuid4().hex[:12],
+                    "name": name,
+                    "path": abs_path,
+                }
+                folders.append(entry)
+                existing_paths.add(abs_path)
+                added.append(entry)
+            if added:
+                self.save()
+        return added
+
+    def remove_safe_folders(self, folder_ids: list[str]) -> int:
+        """Removes multiple Safe List entries by ID in a single atomic config save."""
+        id_set = {fid for fid in (folder_ids or []) if fid}
+        if not id_set:
+            return 0
+        with self._lock:
+            folders = self.get_safe_folders()
+            kept = [f for f in folders if f.get("id") not in id_set]
+            removed = len(folders) - len(kept)
+            if removed > 0:
+                self.data["safe_folders"] = kept
+                self.save()
+            return removed
+
     def get_safe_folder_by_id(self, folder_id: str) -> dict | None:
         """Retrieves a safe folder by its ID."""
         for item in self.get_safe_folders():
