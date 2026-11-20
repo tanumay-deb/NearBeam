@@ -25,6 +25,7 @@ from ui.widgets import (
     button,
     clear_layout,
     icon,
+    icon_button,
     icon_label,
     label,
 )
@@ -86,7 +87,7 @@ class HomePage(Page):
         drop.setSpacing(8)
         drop.addWidget(icon_label("upload", theme.ACCENT, 36), 0, Qt.AlignHCenter)
         drop.addWidget(label("Drop files here"), 0, Qt.AlignHCenter)
-        hint = label("They're sent to a nearby PC, or shared so your phone can download them.", "dim", wrap=True)
+        hint = label("Drop files to send to a nearby PC or share as a 1-tap bundle for your phone.", "dim", wrap=True)
         hint.setAlignment(Qt.AlignCenter)
         drop.addWidget(hint)
         actions = QHBoxLayout()
@@ -99,6 +100,18 @@ class HomePage(Page):
         drop.addSpacing(6)
         drop.addLayout(actions)
         self.body.addWidget(self.drop_zone)
+
+        self.batches_section = QWidget()
+        batches_outer = QVBoxLayout(self.batches_section)
+        batches_outer.setContentsMargins(0, 0, 0, 0)
+        batches_outer.setSpacing(8)
+        self.btn_clear_batches = button("Clear all", kind="linkBtn")
+        batches_outer.addLayout(section_header("Ready for your devices", self.btn_clear_batches))
+        self.batches_box = QVBoxLayout()
+        self.batches_box.setSpacing(8)
+        batches_outer.addLayout(self.batches_box)
+        self.batches_section.hide()
+        self.body.addWidget(self.batches_section)
 
         self.btn_view_all = button("View all", kind="linkBtn")
         self.body.addLayout(section_header("Recent transfers", self.btn_view_all))
@@ -122,6 +135,35 @@ class HomePage(Page):
             self.devices_grid.addWidget(card, i // cols, i % cols)
         for c in range(cols):
             self.devices_grid.setColumnStretch(c, 1)
+
+    def set_batches(self, batches: list[dict], on_clear):
+        clear_layout(self.batches_box)
+        if not batches:
+            self.batches_section.hide()
+            return
+        self.batches_section.show()
+        for batch in batches:
+            card = Card(padding=14, spacing=4)
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addWidget(icon_label("send", theme.ACCENT, 18), 0, Qt.AlignVCenter)
+            info = QVBoxLayout()
+            info.setSpacing(2)
+            info.addWidget(label(batch.get("label", "Files")))
+            fcount = batch.get("file_count", 0)
+            fword = "1 file" if fcount == 1 else f"{fcount} files"
+            dl = int(batch.get("download_count") or 0)
+            dl_part = f" · Downloaded {dl}×" if dl > 0 else ""
+            meta_txt = f"{fword} · {batch.get('formatted_size', '0 B')} · Sent {batch.get('created_at', '')}{dl_part}"
+            info.addWidget(label(meta_txt, "dim"))
+            row.addLayout(info, 1)
+            clear_btn = icon_button("x", f"Remove {batch.get('label', 'batch')}")
+            clear_btn.setFixedSize(28, 28)
+            bid = batch.get("id", "")
+            clear_btn.clicked.connect(lambda _=False, batch_id=bid: on_clear(batch_id))
+            row.addWidget(clear_btn, 0, Qt.AlignVCenter)
+            card.body.addLayout(row)
+            self.batches_box.addWidget(card)
 
 
 class TransfersPage(Page):
@@ -175,7 +217,10 @@ class TransfersPage(Page):
 
 class SharedFoldersPage(Page):
     def __init__(self):
-        super().__init__("Shared folders", "Devices on your Wi-Fi can browse and download only what's listed here.")
+        super().__init__(
+            "Shared folders",
+            "Devices on your Wi-Fi can browse and download only what's listed here. Drag & drop multiple folders or files here to add them at once.",
+        )
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Name", "Location on this PC"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
@@ -185,15 +230,24 @@ class SharedFoldersPage(Page):
         self.table.setShowGrid(False)
         self.table.setIconSize(QSize(16, 16))
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setMinimumHeight(260)
         self.body.addWidget(self.table, 1)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.btn_add = button("Add folder", "plus", "primaryBtn")
         row.addWidget(self.btn_add)
-        self.btn_remove = button("Remove", "trash", "dangerBtn")
+        self.btn_add_files = button("Add files...", "file")
+        row.addWidget(self.btn_add_files)
+        self.btn_select_all = button("Select all", "check")
+        row.addWidget(self.btn_select_all)
+        self.btn_remove = button("Remove selected", "trash", "dangerBtn")
+        self.btn_remove.setEnabled(False)
         row.addWidget(self.btn_remove)
         row.addStretch()
+        self.btn_clear_all = button("Clear all", kind="linkBtn")
+        self.btn_clear_all.setEnabled(False)
+        row.addWidget(self.btn_clear_all)
         self.body.addLayout(row)
 
 

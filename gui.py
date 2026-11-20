@@ -32,8 +32,10 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -398,6 +400,7 @@ class MainWindow(QMainWindow):
         self.home.btn_send.clicked.connect(self._send_file_to_node_dialog)
         self.home.btn_received.clicked.connect(self._open_save_folder)
         self.home.btn_view_all.clicked.connect(lambda: self._go(1))
+        self.home.btn_clear_batches.clicked.connect(self._clear_all_batches)
 
         # Transfers
         self.log_view = self.transfers_page.log_view
@@ -406,7 +409,12 @@ class MainWindow(QMainWindow):
         # Shared folders
         self.safe_table = self.shared_page.table
         self.shared_page.btn_add.clicked.connect(self._add_safe_folder)
+        self.shared_page.btn_add_files.clicked.connect(self._add_safe_files)
+        self.shared_page.btn_select_all.clicked.connect(self.safe_table.selectAll)
         self.shared_page.btn_remove.clicked.connect(self._remove_safe_folder)
+        self.shared_page.btn_clear_all.clicked.connect(lambda: self._clear_safe_folders(confirm=True))
+        self.safe_table.itemSelectionChanged.connect(self._update_safe_selection_buttons)
+        QShortcut(QKeySequence(Qt.Key_Delete), self.safe_table, self._remove_safe_folder)
 
         # Clipboard (two switches, one setting)
         self.clipboard_page.copy_clicked.connect(self._copy_last_clipboard)
@@ -859,33 +867,35 @@ class MainWindow(QMainWindow):
             self._send_to_device(target, file_paths)
 
     def _handle_shared_paths(self, paths: list[str], source: str = "Drag & Drop", send_to_peers: bool = True):
-        """Stages dropped/shared files & folders in Safe List and optionally beams to online peer computers."""
+        """Creates an ephemeral Send Batch for phones/browsers (without cluttering Safe List) and optionally pushes to peer PCs."""
         valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
         if not valid_paths:
             return
 
-        added_items = []
-        file_only_paths = []
-        for p in valid_paths:
-            try:
-                entry = config.add_safe_folder(p)
-                added_items.append(entry["name"])
-            except Exception:
-                pass
-            if os.path.isfile(p):
-                file_only_paths.append(p)
+        file_only_paths = [p for p in valid_paths if os.path.isfile(p)]
 
-        self._refresh_safe_table()
+        batch = None
         if hasattr(self, "server_instance") and self.server_instance:
-            self.server_instance.broadcast_event({
-                "type": "safelist_updated",
-                "items": added_items,
-                "message": f"Shared via {source}: {', '.join(added_items)}",
-            })
+            merge_window = 2.0 if source == "Explorer" else 0.0
+            batch = self.server_instance.create_send_batch(
+                valid_paths, source=source, merge_window=merge_window
+            )
+            self._refresh_batches_ui()
 
-        self._append_log(f"Shared {len(valid_paths)} item(s) via {source}: {', '.join(added_items)}", "upload")
-        if hasattr(self, "tray_icon") and self.tray_icon and not send_to_peers:
-            self.tray_icon.showMessage("Ready on your phone", f"{len(valid_paths)} item(s) are now in Shared folders.", QSystemTrayIcon.Information, 2500)
+        if batch:
+            self._append_log(
+                f"Ready for devices via {source}: {batch['label']} ({batch['formatted_size']})",
+                "upload",
+            )
+            if hasattr(self, "tray_icon") and self.tray_icon and not send_to_peers:
+                self.tray_icon.showMessage(
+                    "Ready on your devices",
+                    f"{batch['label']} ({batch['formatted_size']}) ready to download.",
+                    QSystemTrayIcon.Information,
+                    2500,
+                )
+        else:
+            self._append_log(f"No readable files found in dropped item(s) ({source}).", "warning")
 
         # If a peer NearBeam computer is online and files were selected, offer/send directly
         peers = [n for n in getattr(self, "current_mesh_nodes", []) if not n.get("is_self")]
@@ -903,6 +913,24 @@ class MainWindow(QMainWindow):
                 target_node = selected_box[0]
             self._start_outgoing(f"{target_node['url']}/api/upload", target_node["name"], file_only_paths)
 
+    def _refresh_batches_ui(self):
+        if not hasattr(self, "home") or not getattr(self, "server_instance", None):
+            return
+        batches = self.server_instance.batch_store.list_batches()
+        self.home.set_batches(batches, self._dismiss_batch)
+
+    def _dismiss_batch(self, batch_id: str):
+        if getattr(self, "server_instance", None):
+            if self.server_instance.batch_store.delete_batch(batch_id):
+                self.server_instance.broadcast_event({"type": "batches_updated", "batch_id": batch_id})
+        self._refresh_batches_ui()
+
+    def _clear_all_batches(self):
+        if getattr(self, "server_instance", None):
+            if self.server_instance.batch_store.clear():
+                self.server_instance.broadcast_event({"type": "batches_updated"})
+        self._refresh_batches_ui()
+
     def dragEnterEvent(self, event):
         """Accept files and folders dragged anywhere onto the NearBeam desktop window (NB-04)."""
         if event.mimeData() and event.mimeData().hasUrls():
@@ -911,7 +939,7 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def dropEvent(self, event):
-        """Handle files and folders dropped anywhere onto the NearBeam desktop window (NB-04)."""
+        """Handle files and folders dropped onto the window: Shared folders page bulk-adds permanent entries; other pages create a Send Batch."""
         if not event.mimeData() or not event.mimeData().hasUrls():
             return
         dropped_paths = []
@@ -921,7 +949,10 @@ class MainWindow(QMainWindow):
                 dropped_paths.append(local_path)
         if dropped_paths:
             event.acceptProposedAction()
-            self._handle_shared_paths(dropped_paths, source="Window Drag & Drop")
+            if hasattr(self, "stack") and self.stack.currentWidget() is self.shared_page:
+                self._add_safe_paths(dropped_paths)
+            else:
+                self._handle_shared_paths(dropped_paths, source="Window Drag & Drop")
 
     # ------------------------------------------------------------------
     # Transfers
@@ -1001,6 +1032,7 @@ class MainWindow(QMainWindow):
         """Turns the server's live events into transfer rows, history and the shared folders list."""
         changed_history = False
         changed_folders = False
+        changed_batches = False
         changed_network = False
         while True:
             try:
@@ -1066,14 +1098,17 @@ class MainWindow(QMainWindow):
                         entry["row"].set_finished(False, "Stopped")
                         QTimer.singleShot(3000, lambda t=did: self._remove_active_row(t))
             elif etype == "safelist_updated":
-                # e.g. Explorer "Send with NearBeam" while this window runs (via /api/shell-send)
                 changed_folders = True
+            elif etype == "batches_updated":
+                changed_batches = True
             elif etype == "network_changed":
                 changed_network = True
         if changed_history:
             self._refresh_history()
         if changed_folders:
             self._refresh_safe_table()
+        if changed_batches:
+            self._refresh_batches_ui()
         if changed_network:
             self._update_addresses()
             self._refresh_nearby_devices_ui()
@@ -1323,40 +1358,100 @@ class MainWindow(QMainWindow):
         for row, folder in enumerate(folders):
             p = folder.get("path", "")
             name_item = QTableWidgetItem(icon("file" if (p and os.path.isfile(p)) else "folder", theme.ACCENT, 16), folder.get("name", "Unnamed"))
+            name_item.setData(Qt.UserRole, folder.get("id"))
             path_item = QTableWidgetItem(p)
             name_item.setFlags(name_item.flags() ^ Qt.ItemIsEditable)
             path_item.setFlags(path_item.flags() ^ Qt.ItemIsEditable)
             self.safe_table.setItem(row, 0, name_item)
             self.safe_table.setItem(row, 1, path_item)
+        self._update_safe_selection_buttons()
+
+    def _update_safe_selection_buttons(self):
+        selected_rows = {idx.row() for idx in self.safe_table.selectedIndexes()}
+        count = len(selected_rows)
+        total = self.safe_table.rowCount()
+        if hasattr(self, "shared_page"):
+            self.shared_page.btn_remove.setEnabled(count > 0)
+            self.shared_page.btn_remove.setText(f"Remove selected ({count})" if count > 0 else "Remove selected")
+            self.shared_page.btn_clear_all.setEnabled(total > 0)
+            self.shared_page.btn_select_all.setEnabled(total > 0)
+
+    def _broadcast_safelist_updated(self, message: str = ""):
+        if hasattr(self, "server_instance") and self.server_instance:
+            payload = {"type": "safelist_updated"}
+            if message:
+                payload["message"] = message
+            self.server_instance.broadcast_event(payload)
+
+    def _add_safe_paths(self, paths: list[str]):
+        added = config.add_safe_folders(paths)
+        if added:
+            self._refresh_safe_table()
+            self._broadcast_safelist_updated(f"Added {len(added)} item(s) to Shared folders")
+            names = ", ".join(e["name"] for e in added[:5])
+            suffix = f" +{len(added) - 5} more" if len(added) > 5 else ""
+            self._append_log(f"Added {len(added)} item(s) to Shared folders: {names}{suffix}", "info")
 
     def _add_safe_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder to Add to Safe List")
         if folder_path:
-            try:
-                entry = config.add_safe_folder(folder_path)
-                self._refresh_safe_table()
-                self._append_log(f"Added '{entry['name']}' to Safe List.", "info")
-            except Exception as e:
-                QMessageBox.warning(self, "Add Folder Error", str(e))
+            self._add_safe_paths([folder_path])
+
+    def _add_safe_files(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select File(s) to Add to Shared Folders", "", "All Files (*.*)")
+        if file_paths:
+            self._add_safe_paths(file_paths)
 
     def _remove_safe_folder(self):
-        current_row = self.safe_table.currentRow()
-        if current_row < 0:
-            QMessageBox.information(self, "Selection Required", "Please select a folder from the table to remove.")
+        self._remove_selected_safe_rows(confirm=True)
+
+    def _remove_selected_safe_rows(self, confirm: bool = True):
+        selected_rows = sorted({idx.row() for idx in self.safe_table.selectedIndexes()})
+        if not selected_rows:
+            if confirm:
+                QMessageBox.information(self, "Selection Required", "Please select one or more items from the table to remove.")
             return
 
-        folders = config.get_safe_folders()
-        if 0 <= current_row < len(folders):
-            folder = folders[current_row]
-            confirm = QMessageBox.question(
-                self,
-                "Confirm Removal",
-                f"Remove '{folder['name']}' from the Safe List?\n(No files on your computer will be deleted).",
+        ids_to_remove = []
+        names = []
+        for row in selected_rows:
+            item = self.safe_table.item(row, 0)
+            if item:
+                fid = item.data(Qt.UserRole)
+                if fid:
+                    ids_to_remove.append(fid)
+                    names.append(item.text())
+        if not ids_to_remove:
+            return
+
+        if confirm:
+            prompt = (
+                f"Remove '{names[0]}' from Shared folders?\n(No files on your computer will be deleted.)"
+                if len(ids_to_remove) == 1
+                else f"Remove {len(ids_to_remove)} selected items from Shared folders?\n(No files on your computer will be deleted.)"
             )
-            if confirm == QMessageBox.Yes:
-                config.remove_safe_folder(folder["id"])
-                self._refresh_safe_table()
-                self._append_log(f"Removed '{folder['name']}' from Safe List.", "info")
+            if QMessageBox.question(self, "Confirm Removal", prompt) != QMessageBox.Yes:
+                return
+
+        removed = config.remove_safe_folders(ids_to_remove)
+        if removed:
+            self._refresh_safe_table()
+            self._broadcast_safelist_updated(f"Removed {removed} item(s) from Shared folders")
+            self._append_log(f"Removed {removed} item(s) from Shared folders.", "info")
+
+    def _clear_safe_folders(self, confirm: bool = True):
+        folders = config.get_safe_folders()
+        if not folders:
+            return
+        if confirm:
+            prompt = f"Remove all {len(folders)} item(s) from Shared folders?\n(No files on your computer will be deleted.)"
+            if QMessageBox.question(self, "Clear Shared Folders", prompt) != QMessageBox.Yes:
+                return
+        removed = config.remove_safe_folders([f["id"] for f in folders if f.get("id")])
+        if removed:
+            self._refresh_safe_table()
+            self._broadcast_safelist_updated("Cleared Shared folders")
+            self._append_log(f"Cleared all {removed} item(s) from Shared folders.", "info")
 
     def _clean_exit(self):
         if self.server_instance:
