@@ -164,7 +164,7 @@ def is_lan_host(host: str) -> bool:
 def safe_filename(name: str) -> str:
     """A name Windows can store: no folder parts, reserved characters or device names.
     (':' would otherwise hide the data in an NTFS stream; '?' fails after the whole upload.)"""
-    name = os.path.basename((name or "").replace("\\", "/"))
+    name = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
     name = _WINDOWS_BAD_CHARS.sub("_", name).strip().rstrip(". ")
     if name.split(".", 1)[0].rstrip().upper() in _WINDOWS_DEVICE_NAMES:
         name = f"_{name}"
