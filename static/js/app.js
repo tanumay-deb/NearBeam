@@ -19,12 +19,17 @@ const selectedKeys = new Set();
 let cachedSafeFolders = [];
 let serverInfo = null;
 let meshNodes = [];
+let nearbyDevices = [];
 let selectedTargetNodeId = "self";
 
 // DOM Elements
+const hostPill = document.getElementById("hostPill");
 const hostNameDisplay = document.getElementById("hostNameDisplay");
 const meshClusterPill = document.getElementById("meshClusterPill");
 const meshClusterText = document.getElementById("meshClusterText");
+const globalDropOverlay = document.getElementById("globalDropOverlay");
+const nearbyDevicesList = document.getElementById("nearbyDevicesList");
+const nearbyDevicesCountBadge = document.getElementById("nearbyDevicesCountBadge");
 const selectSafeFolder = document.getElementById("selectSafeFolder");
 const safeFilesContainer = document.getElementById("safeFilesContainer");
 const breadcrumbBar = document.getElementById("breadcrumbBar");
@@ -65,6 +70,8 @@ const progressBarFill = document.getElementById("progressBarFill");
 const progressTransferred = document.getElementById("progressTransferred");
 const progressEta = document.getElementById("progressEta");
 const sentList = document.getElementById("sentList");
+const btnRetryAllFailed = document.getElementById("btnRetryAllFailed");
+const btnClearHistory = document.getElementById("btnClearHistory");
 
 // Received DOM Elements
 const receivedFilesContainer = document.getElementById("receivedFilesContainer");
@@ -97,6 +104,7 @@ const qrModal = document.getElementById("qrModal");
 const btnQrModal = document.getElementById("btnQrModal");
 const btnCloseQr = document.getElementById("btnCloseQr");
 const qrUrlText = document.getElementById("qrUrlText");
+const qrImage = document.getElementById("qrImage");
 
 // ZIP Download Progress Modal DOM Elements
 const zipProgressModal = document.getElementById("zipProgressModal");
@@ -135,9 +143,13 @@ const categoryIcons = {
 
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
+  setupGlobalDragAndDrop();
+  setupUploadEvents();
+  if (window.NEARBEAM_GUEST_DROP) {
+    return;
+  }
   setupTabs();
   setupHeroDashboardActions();
-  setupGlobalDragAndDrop();
   fetchServerInfo();
   fetchSendBatches(false);
   fetchSafeFolders();
@@ -146,7 +158,6 @@ document.addEventListener("DOMContentLoaded", () => {
   fetchNearbyDevices();
   loadTransferHistory();
   setupClipboardSync();
-  setupUploadEvents();
   setupSSE();
   setupModalEvents();
   setupFaqEvents();
@@ -172,8 +183,6 @@ function setupHeroDashboardActions() {
   const btnSend = document.getElementById("btnHeroSendFiles");
   const btnSafe = document.getElementById("btnHeroSharedFolders");
   const btnClip = document.getElementById("btnHeroClipboard");
-  const btnClearHist = document.getElementById("btnClearHistory");
-  const btnRetryAll = document.getElementById("btnRetryAllFailed");
 
   if (btnSend) {
     btnSend.addEventListener("click", () => {
@@ -192,12 +201,6 @@ function setupHeroDashboardActions() {
       activateTab("tab-clipboard");
     });
   }
-  if (btnClearHist) {
-    btnClearHist.addEventListener("click", clearTransferHistory);
-  }
-  if (btnRetryAll) {
-    btnRetryAll.addEventListener("click", () => transferManager.retryAllFailed());
-  }
 }
 
 // --- Theme Toggle ---
@@ -208,6 +211,7 @@ function initTheme() {
     document.body.classList.remove("theme-dark");
     document.body.classList.add("theme-light");
   }
+  if (!btnThemeToggle) return;
   btnThemeToggle.addEventListener("click", () => {
     if (document.body.classList.contains("theme-light")) {
       document.body.classList.remove("theme-light");
@@ -237,6 +241,7 @@ function setupTabs() {
 
 function showToast(message, type = "info") {
   const container = document.getElementById("toastContainer");
+  if (!container) return;
   const toast = document.createElement("div");
   toast.className = `toast ${type}`;
   toast.innerText = message;
@@ -301,15 +306,17 @@ if (btnCopyShortcutUrl) {
 }
 
 // Click on host pill copies the permanent URL
-hostPill.addEventListener("click", async () => {
-  const url = serverInfo?.nearbeam_url || serverInfo?.landrop_url || "http://nearbeam.local:5000";
-  try {
-    await navigator.clipboard.writeText(url);
-    showToast("✓ Copied " + url + " to clipboard!", "success");
-  } catch (e) {
-    showToast(url, "info");
-  }
-});
+if (hostPill) {
+  hostPill.addEventListener("click", async () => {
+    const url = serverInfo?.nearbeam_url || serverInfo?.landrop_url || "http://nearbeam.local:5000";
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast("✓ Copied " + url + " to clipboard!", "success");
+    } catch (e) {
+      showToast(url, "info");
+    }
+  });
+}
 
 // --- Safe List Folder Explorer ---
 
@@ -458,9 +465,18 @@ async function fetchSendBatches(showNewToast = false) {
     if (showNewToast && activeBatches.length > 0 && !prevIds.has(activeBatches[0].id)) {
       showToast(`📥 Incoming from PC: ${activeBatches[0].label} (${activeBatches[0].formatted_size})`, "info");
     }
-    // If currently inspecting a batch that was dismissed/cleared, return to Safe List root
-    if (currentBatchId && !activeBatches.some((b) => b.id === currentBatchId)) {
-      showAllSafeFolders(false);
+    // If currently inspecting a batch: exit if dismissed, or refresh if Explorer merged more files into it
+    if (currentBatchId) {
+      const updated = activeBatches.find((b) => b.id === currentBatchId);
+      if (!updated) {
+        showAllSafeFolders(false);
+      } else if (
+        !currentBatchMeta ||
+        updated.file_count !== currentBatchMeta.file_count ||
+        updated.total_bytes !== currentBatchMeta.total_bytes
+      ) {
+        openSendBatch(currentBatchId, false);
+      }
     }
   } catch (e) {
     // Ignore transient errors
@@ -599,6 +615,10 @@ async function openSendBatch(batchId, pushHistory = true) {
   try {
     const res = await fetch(`/api/batches/${encodeURIComponent(batchId)}/items`);
     if (!res.ok) {
+      safeItemsCache = [];
+      currentBatchMeta = null;
+      if (browseToolbar) browseToolbar.hidden = true;
+      if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
       renderSafeEmptyState("This send batch is no longer available.");
       return;
     }
@@ -674,8 +694,15 @@ async function fetchSafeFolders() {
       opt.innerText = "No folders added to Safe List on PC";
       selectSafeFolder.appendChild(opt);
       if (!currentBatchId) {
-        renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
+        currentFolderId = "";
+        currentSubpath = "";
+        safeItemsCache = [];
+        setSelectMode(false, false);
+        if (browseToolbar) browseToolbar.hidden = true;
+        if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
         if (btnSafeBack) btnSafeBack.style.display = "none";
+        if (safeFilesContainer) safeFilesContainer.classList.remove("view-list", "view-grid");
+        renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
       }
       return;
     }
@@ -701,8 +728,18 @@ async function fetchSafeFolders() {
         currentFolderId = cachedSafeFolders[0].id;
         currentSubpath = "";
         selectSafeFolder.value = currentFolderId;
+        if (!window.history.state) {
+          window.history.replaceState(
+            { view: "safelist_folder", folderId: currentFolderId, subpath: "" },
+            "",
+            window.location.pathname
+          );
+        }
         browseSafeFolder(currentFolderId, "", false);
       } else {
+        if (!window.history.state) {
+          window.history.replaceState({ view: "safelist_root" }, "", window.location.pathname);
+        }
         showAllSafeFolders(false);
       }
     } else {
@@ -714,39 +751,45 @@ async function fetchSafeFolders() {
   }
 }
 
-selectSafeFolder.addEventListener("change", (e) => {
-  currentBatchId = "";
-  currentBatchMeta = null;
-  currentFolderId = e.target.value;
-  currentSubpath = "";
-  if (currentFolderId) {
-    browseSafeFolder(currentFolderId, "");
-  } else {
-    showAllSafeFolders();
-  }
-});
+if (selectSafeFolder) {
+  selectSafeFolder.addEventListener("change", (e) => {
+    currentBatchId = "";
+    currentBatchMeta = null;
+    currentFolderId = e.target.value;
+    currentSubpath = "";
+    if (currentFolderId) {
+      browseSafeFolder(currentFolderId, "");
+    } else {
+      showAllSafeFolders();
+    }
+  });
+}
 
-btnRefreshSafe.addEventListener("click", () => {
-  if (currentBatchId) {
-    openSendBatch(currentBatchId, false);
-  } else if (currentFolderId) {
-    browseSafeFolder(currentFolderId, currentSubpath);
-  } else {
-    fetchSafeFolders();
-    fetchSendBatches(false);
-  }
-});
+if (btnRefreshSafe) {
+  btnRefreshSafe.addEventListener("click", () => {
+    if (currentBatchId) {
+      openSendBatch(currentBatchId, false);
+    } else if (currentFolderId) {
+      browseSafeFolder(currentFolderId, currentSubpath);
+    } else {
+      fetchSafeFolders();
+      fetchSendBatches(false);
+    }
+  });
+}
 
 // --- Safe List Folder ZIP Packaging with Live Progress Circle ---
 
-btnDownloadFolderZip.addEventListener("click", () => {
-  if (currentBatchId) {
-    startBatchZipDownload(currentBatchId, currentBatchMeta ? currentBatchMeta.label : "Files");
-    return;
-  }
-  if (!currentFolderId) return;
-  startFolderZipDownload(currentFolderId, currentSubpath);
-});
+if (btnDownloadFolderZip) {
+  btnDownloadFolderZip.addEventListener("click", () => {
+    if (currentBatchId) {
+      startBatchZipDownload(currentBatchId, currentBatchMeta ? currentBatchMeta.label : "Files");
+      return;
+    }
+    if (!currentFolderId) return;
+    startFolderZipDownload(currentFolderId, currentSubpath);
+  });
+}
 
 function openZipProgressModal(folderName) {
   if (zipModalFolderText) zipModalFolderText.innerText = folderName;
@@ -970,14 +1013,14 @@ if (btnSafeBack) {
 
 // Browser back/forward navigation support
 window.addEventListener("popstate", (e) => {
-  if (e.state) {
-    if (e.state.view === "safelist_folder" && e.state.folderId) {
-      browseSafeFolder(e.state.folderId, e.state.subpath || "", false);
-    } else if (e.state.view === "send_batch" && e.state.batchId) {
-      openSendBatch(e.state.batchId, false);
-    } else if (e.state.view === "safelist_root") {
-      showAllSafeFolders(false);
-    }
+  if (window.NEARBEAM_GUEST_DROP) return;
+  activateTab("tab-safelist");
+  if (!e.state || e.state.view === "safelist_root") {
+    showAllSafeFolders(false);
+  } else if (e.state.view === "safelist_folder" && e.state.folderId) {
+    browseSafeFolder(e.state.folderId, e.state.subpath || "", false);
+  } else if (e.state.view === "send_batch" && e.state.batchId) {
+    openSendBatch(e.state.batchId, false);
   }
 });
 
@@ -1015,8 +1058,15 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
     const url = `/api/safelist/browse?folder_id=${encodeURIComponent(folderId)}&subpath=${encodeURIComponent(subpath)}`;
     const res = await fetch(url);
     if (!res.ok) {
-      const err = await res.json();
-      renderSafeEmptyState(err.error || "Unable to open folder");
+      safeItemsCache = [];
+      if (browseToolbar) browseToolbar.hidden = true;
+      if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
+      let errMsg = "Unable to open folder";
+      try {
+        const err = await res.json();
+        if (err && err.error) errMsg = err.error;
+      } catch (parseErr) {}
+      renderSafeEmptyState(errMsg);
       return;
     }
 
@@ -1525,27 +1575,26 @@ async function extractDroppedFilesAndDirs(dt) {
   if (!dt) return { files, dirs };
 
   if (dt.items && dt.items.length > 0) {
+    // Capture entries/files synchronously BEFORE any await — browsers clear DataTransferItemList
+    // across async ticks, which otherwise drops items 2..N on multi-file drags.
+    const captured = [];
     for (let i = 0; i < dt.items.length; i++) {
       const item = dt.items[i];
-      if (item.kind === "file") {
-        if (typeof item.webkitGetAsEntry === "function") {
-          const entry = item.webkitGetAsEntry();
-          if (entry) {
-            await traverseFileTree(entry, "", files, dirs);
-          } else {
-            const f = item.getAsFile();
-            if (f) {
-              files.push(f);
-              dirs.push("");
-            }
-          }
-        } else {
-          const f = item.getAsFile();
-          if (f) {
-            files.push(f);
-            dirs.push("");
-          }
-        }
+      if (item.kind !== "file") continue;
+      const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+      if (entry) {
+        captured.push({ entry });
+      } else {
+        const f = item.getAsFile();
+        if (f) captured.push({ file: f });
+      }
+    }
+    for (const item of captured) {
+      if (item.entry) {
+        await traverseFileTree(item.entry, "", files, dirs);
+      } else if (item.file) {
+        files.push(item.file);
+        dirs.push("");
       }
     }
   } else if (dt.files && dt.files.length > 0) {
@@ -1711,7 +1760,7 @@ function setupGlobalDragAndDrop() {
 
     const { files, dirs } = await extractDroppedFilesAndDirs(e.dataTransfer);
     if (files.length > 0) {
-      activateTab("tab-upload", false);
+      if (!window.NEARBEAM_GUEST_DROP) activateTab("tab-upload", false);
       uploadFiles(files, dirs);
     }
   });
@@ -2100,17 +2149,23 @@ class TransferManager {
     }
   }
 
+  getCancelBaseUrl(uploadUrl) {
+    return (uploadUrl || "").replace(/\/api\/(?:upload|drop\/[^/]+\/upload)$/, "");
+  }
+
   cancelTransfer(sessionId) {
     myUploadSessions.delete(sessionId);
     const t = this.activeTransfers.get(sessionId);
     let cancelBaseUrl = "";
     if (t) {
       t.cancelled = true;
-      cancelBaseUrl = t.uploadUrl.replace(/\/api\/upload$/, "");
+      cancelBaseUrl = this.getCancelBaseUrl(t.uploadUrl);
       if (t.xhr) t.xhr.abort();
       if (t.card) t.card.remove();
       this.activeTransfers.delete(sessionId);
     } else {
+      const queued = this.queue.find((x) => x.sessionId === sessionId);
+      if (queued) cancelBaseUrl = this.getCancelBaseUrl(queued.uploadUrl);
       this.queue = this.queue.filter((x) => x.sessionId !== sessionId);
       this.updateQueueHeader();
     }
@@ -2201,7 +2256,7 @@ class TransferManager {
     this.failedTransfers.delete(sessionId);
     myUploadSessions.delete(sessionId);
     if (item) {
-      const cancelBaseUrl = item.uploadUrl.replace(/\/api\/upload$/, "");
+      const cancelBaseUrl = this.getCancelBaseUrl(item.uploadUrl);
       fetch(`${cancelBaseUrl}/api/upload/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2228,7 +2283,7 @@ class TransferManager {
     const chunk = t.file.slice(start, end);
 
     t.xhr = new XMLHttpRequest();
-    const chunkUrl = t.uploadUrl.replace("/api/upload", "/api/upload/chunk");
+    const chunkUrl = t.uploadUrl.replace(/\/upload$/, "/upload/chunk");
     t.xhr.open("POST", chunkUrl);
     t.xhr.setRequestHeader("Content-Type", "application/octet-stream");
     t.xhr.setRequestHeader("X-Session-Id", t.sessionId);
@@ -2287,12 +2342,13 @@ class TransferManager {
         if (resp.completed) {
           if (t.card) t.card.remove();
           this.activeTransfers.delete(sessionId);
-          myUploadSessions.delete(sessionId);
+          // Keep sessionId marked briefly so the matching SSE file_received event doesn't double-toast/duplicate history.
+          setTimeout(() => myUploadSessions.delete(sessionId), 5000);
           this.checkIfDone();
           try {
             showToast(`Uploaded ${t.filename}`, "success");
-            if (resp.file) addSentHistoryItem(resp.file, true);
-            if (typeof fetchReceivedFiles === "function") fetchReceivedFiles();
+            if (resp.file) addSentHistoryItem(resp.file, !window.NEARBEAM_GUEST_DROP);
+            if (!window.NEARBEAM_GUEST_DROP && typeof fetchReceivedFiles === "function") fetchReceivedFiles();
           } catch (e) {
             console.error("Post-upload UI update failed:", e);
           }
@@ -2328,7 +2384,9 @@ function uploadFiles(files, relativeDirs = [], explicitTargets = null) {
 
   let targets = explicitTargets;
   if (!targets) {
-    if (selectedTargetNodeId === "all" && meshNodes.length > 0) {
+    if (window.NEARBEAM_GUEST_DROP && window.NEARBEAM_DROP_TOKEN) {
+      targets = [{ url: `/api/drop/${encodeURIComponent(window.NEARBEAM_DROP_TOKEN)}/upload`, name: "Host PC" }];
+    } else if (selectedTargetNodeId === "all" && meshNodes.length > 0) {
       targets = meshNodes.map((n) => ({ url: `${n.url}/api/upload`, name: n.name }));
     } else if (selectedTargetNodeId !== "self" && meshNodes.length > 0) {
       const targetNode = meshNodes.find((n) => n.id === selectedTargetNodeId);
@@ -2446,11 +2504,14 @@ async function clearTransferHistory() {
 // --- Received Files Tab ---
 
 async function fetchReceivedFiles() {
+  if (!receivedFilesContainer) return;
   try {
     const res = await fetch("/api/received");
     if (!res.ok) return;
     const data = await res.json();
-    receivedPathDesc.innerText = data.save_directory || "Downloads/NearBeam_Received";
+    if (receivedPathDesc) {
+      receivedPathDesc.innerText = data.save_directory || "Downloads/NearBeam_Received";
+    }
     renderReceivedFiles(data.files || []);
   } catch (e) {
     receivedFilesContainer.innerHTML = `<div class="empty-state"><p>Error loading received files</p></div>`;
@@ -2663,9 +2724,17 @@ async function uploadClipboardImageBlob(blob) {
       }
       showToast("✓ Screenshot / image synced to PC & all devices!", "success");
     } else {
+      if (syncLiveStatus) {
+        syncLiveStatus.className = "sync-live-status disabled";
+        syncLiveStatus.innerText = "⚠️ Sync Error";
+      }
       showToast("Failed to sync clipboard image", "error");
     }
   } catch (err) {
+    if (syncLiveStatus) {
+      syncLiveStatus.className = "sync-live-status disabled";
+      syncLiveStatus.innerText = "⚠️ Sync Error";
+    }
     showToast("Error syncing clipboard image", "error");
   }
 }
@@ -2684,13 +2753,14 @@ function clipboardPreviewImg() {
 }
 
 function renderClipboardImageState(data) {
+  if (!data || !("has_image" in data)) return;
   const card = document.getElementById("clipboardImageCard");
   const previewImg = clipboardPreviewImg();
   const metaEl = document.getElementById("clipboardImageMeta");
   const dlBtn = document.getElementById("btnDownloadClipboardImage");
   if (!card || !previewImg) return;
 
-  if (data && data.has_image && data.image_url) {
+  if (data.has_image && data.image_url) {
     card.classList.remove("hidden");
     previewImg.src = data.image_url;
     if (dlBtn) {
@@ -2765,6 +2835,14 @@ async function sendClipboardData(text, showToastNotification = true) {
       if (showToastNotification) {
         showToast("✓ Clipboard synced to PC & all devices!", "success");
       }
+    } else {
+      if (syncLiveStatus) {
+        syncLiveStatus.className = "sync-live-status disabled";
+        syncLiveStatus.innerText = "⚠️ Sync Error";
+      }
+      if (showToastNotification) {
+        showToast("Failed to sync clipboard", "error");
+      }
     }
   } catch (e) {
     if (syncLiveStatus) {
@@ -2833,11 +2911,13 @@ function setupSSE() {
       const data = JSON.parse(e.data);
       if (data.type === "file_received") {
         removeIncomingProgress(data.session_id);
-        if (!myUploadSessions.has(data.session_id) && data.file) {
-          addSentHistoryItem(data.file, true);
+        if (!myUploadSessions.has(data.session_id)) {
+          if (data.file) {
+            addSentHistoryItem(data.file, true);
+            showToast(`Incoming file auto-saved: ${data.file.filename}`, "info");
+          }
+          fetchReceivedFiles();
         }
-        showToast(`Incoming file auto-saved: ${data.file.filename}`, "info");
-        fetchReceivedFiles();
       } else if (data.type === "upload_progress") {
         // Live progress for a transfer arriving from another device.
         if (!myUploadSessions.has(data.session_id)) {
@@ -2942,18 +3022,42 @@ function removeIncomingProgress(sessionId) {
 
 // --- Modals Setup ---
 
+function closePreviewModal() {
+  if (!previewModal) return;
+  previewModal.classList.add("hidden");
+  if (previewModalBody) {
+    previewModalBody.querySelectorAll("video, audio").forEach((el) => {
+      try {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      } catch (e) {}
+    });
+    previewModalBody.innerHTML = "";
+  }
+}
+
 function setupModalEvents() {
   // Preview Modal
   if (btnClosePreview && previewModal) {
-    btnClosePreview.addEventListener("click", () => previewModal.classList.add("hidden"));
+    btnClosePreview.addEventListener("click", closePreviewModal);
     previewModal.addEventListener("click", (e) => {
-      if (e.target === previewModal) previewModal.classList.add("hidden");
+      if (e.target === previewModal) closePreviewModal();
     });
   }
 
   // QR Modal
   if (btnQrModal && qrModal) {
-    btnQrModal.addEventListener("click", () => qrModal.classList.remove("hidden"));
+    btnQrModal.addEventListener("click", () => {
+      const defaultUrl =
+        serverInfo?.nearbeam_url ||
+        serverInfo?.landrop_url ||
+        serverInfo?.primary_url ||
+        window.location.origin;
+      if (qrUrlText) qrUrlText.innerText = defaultUrl;
+      if (qrImage) qrImage.src = "/api/qr";
+      qrModal.classList.remove("hidden");
+    });
   }
   if (btnCloseQr && qrModal) {
     btnCloseQr.addEventListener("click", () => qrModal.classList.add("hidden"));
@@ -2974,7 +3078,9 @@ function setupModalEvents() {
   // ESC key closes modals
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      if (previewModal) previewModal.classList.add("hidden");
+      if (previewModal && !previewModal.classList.contains("hidden")) {
+        closePreviewModal();
+      }
       if (qrModal) qrModal.classList.add("hidden");
       if (zipProgressModal && !zipProgressModal.classList.contains("hidden")) {
         cancelZipDownload();
@@ -3077,10 +3183,11 @@ if (btnCreateDropZone) {
       }
       const data = await res.json();
       
-      // Update QR Modal to show the drop zone URL
+      // Update QR Modal to show the drop zone URL and matching QR code
       if (qrUrlText) qrUrlText.innerText = data.url;
-      // You could theoretically update the QR image src here, but it's fine for now
-      // Let's just show a toast and open the QR modal
+      if (qrImage && data.token) {
+        qrImage.src = `/api/qr?drop=${encodeURIComponent(data.token)}`;
+      }
       showToast("Drop Zone created! Token valid for 24h", "success");
       
       if (qrModal) qrModal.classList.remove("hidden");

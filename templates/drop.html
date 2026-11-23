@@ -13,21 +13,21 @@
       align-items: center;
       justify-content: center;
       min-height: 100vh;
-      background: var(--bg);
+      background: var(--bg-gradient);
       padding: 1rem;
     }
     .drop-container {
-      background: var(--surface);
-      border: 1px solid var(--border);
+      background: var(--surface-1);
+      border: 1px solid var(--border-glass);
       border-radius: 12px;
       padding: 2rem;
       width: 100%;
       max-width: 600px;
       text-align: center;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+      box-shadow: var(--glow-card);
     }
     .dropzone {
-      border: 2px dashed var(--border);
+      border: 2px dashed var(--border-glass);
       border-radius: 8px;
       padding: 3rem 2rem;
       margin: 1.5rem 0;
@@ -36,7 +36,7 @@
     }
     .dropzone.drag-over {
       border-color: var(--accent-cyan);
-      background: var(--surface-hover);
+      background: var(--surface-2);
     }
     .drop-container h2 { font-size: 1.5rem; }
     .drop-container h3 { font-size: 1.15rem; }
@@ -46,7 +46,7 @@
       border: none;
       padding: 0.75rem 1.5rem;
       border-radius: 8px;
-      font-weight: 500;
+      font-weight: 600;
       cursor: pointer;
       margin-top: 1rem;
     }
@@ -54,7 +54,7 @@
 </head>
 <body class="theme-dark">
   <div id="globalDropOverlay" class="global-drop-overlay hidden">
-    <div class="global-drop-overlay-inner">
+    <div class="global-drop-box">
       <div class="global-drop-icon">⚡</div>
       <h2>Drop files or folders anywhere to beam</h2>
       <p>Folder structure is preserved automatically • Zero cloud</p>
@@ -77,7 +77,7 @@
       </svg>
       <h3>Drag & Drop Files or Folders Anywhere</h3>
       <input type="file" id="fileInput" multiple style="display:none;">
-      <button class="btn-select" id="btnSelect">Select Files</button>
+      <button class="btn-select" id="btnSelect" type="button">Select Files</button>
     </div>
 
     <div class="transfer-manager hidden" id="transferManagerCard" style="text-align:left;">
@@ -86,15 +86,15 @@
     </div>
 
     <div class="transfer-manager failed-transfers-card hidden" id="failedTransfersCard" style="text-align:left;">
-      <div class="transfer-section-header">
-        <h4 class="subheading failed-heading">⚠️ Failed Transfers</h4>
-        <button id="btnRetryAllFailed" class="btn-secondary btn-xs" type="button">↻ Retry All</button>
+      <div class="transfer-manager-header">
+        <h4 class="subheading failed-heading" style="color: var(--accent-rose);">⚠️ Failed Transfers</h4>
+        <button id="btnRetryAllFailed" class="secondary-btn btn-xs" type="button">↻ Retry All</button>
       </div>
       <div id="failedTransfersList" class="transfers-list"></div>
     </div>
 
     <div class="sent-history" id="completedHistoryCard" style="text-align:left;margin-top:1rem;">
-      <div class="transfer-section-header">
+      <div class="transfer-manager-header">
         <h4 class="subheading">✓ Completed Transfers</h4>
       </div>
       <div id="sentList" class="sent-list">
@@ -103,39 +103,33 @@
     </div>
   </div>
 
+  <script>
+    window.NEARBEAM_GUEST_DROP = true;
+    window.NEARBEAM_DROP_TOKEN = {{ token|tojson }};
+  </script>
   <script src="/static/js/app.js"></script>
   <script>
-    // Minimal script to override targetUrl for drops
-    const token = "{{ token }}";
-    const dropUploadUrl = `/api/drop/${token}/upload`;
-
     const dropzoneEl = document.getElementById("dropzone");
     const fileInputEl = document.getElementById("fileInput");
     const btnSelectEl = document.getElementById("btnSelect");
 
-    btnSelectEl.addEventListener("click", (e) => {
-      e.stopPropagation();
-      fileInputEl.click();
-    });
-
-    fileInputEl.addEventListener("change", () => {
-      if (fileInputEl.files.length > 0) {
-        uploadFilesOverride(Array.from(fileInputEl.files));
-        fileInputEl.value = "";
-      }
-    });
-
-    function uploadFilesOverride(files, relativeDirs = []) {
-      if (!files || files.length === 0) return;
-      files.forEach((file, idx) => {
-        const sessionId = uuidv4();
-        const relDir = relativeDirs[idx] || "";
-        transferManager.addTransfer(sessionId, file.name, file, dropUploadUrl, "Host PC", relDir);
+    if (dropzoneEl && fileInputEl) {
+      dropzoneEl.addEventListener("click", () => fileInputEl.click());
+    }
+    if (btnSelectEl && fileInputEl) {
+      btnSelectEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        fileInputEl.click();
       });
     }
-
-    // Replace the global uploadFiles from app.js so drag-and-drop uses our override
-    window.uploadFiles = uploadFilesOverride;
+    if (fileInputEl) {
+      fileInputEl.addEventListener("change", () => {
+        if (fileInputEl.files.length > 0) {
+          uploadFiles(Array.from(fileInputEl.files));
+          fileInputEl.value = "";
+        }
+      });
+    }
   </script>
 </body>
 </html>

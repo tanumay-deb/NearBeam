@@ -280,18 +280,6 @@
           </div>
         </div>
 
-        <!-- Sticky Selection Bar (shown when Select Mode is active) -->
-        <div class="selection-bar hidden" id="selectionActionBar" role="region" aria-label="Selected files actions">
-          <div class="selection-bar-info">
-            <span id="selectionCountLabel">0 selected</span>
-          </div>
-          <div class="selection-bar-actions">
-            <button type="button" class="card-action-btn" id="btnSelectAllVisible">Select all</button>
-            <button type="button" class="card-action-btn" id="btnCancelSelect">Cancel</button>
-            <button type="button" class="primary-btn btn-xs" id="btnDownloadSelected" disabled>Download</button>
-          </div>
-        </div>
-
         <!-- File Items Grid / List -->
         <div class="files-container" id="safeFilesContainer">
           <div class="empty-state">
@@ -787,6 +775,18 @@
         </div>
         <p class="qr-subhint">Scan with iPhone Camera or visit on your phone's browser.</p>
       </div>
+    </div>
+  </div>
+
+  <!-- Sticky Selection Bar (outside .section-card so backdrop-filter doesn't trap fixed positioning) -->
+  <div class="selection-bar hidden" id="selectionActionBar" role="region" aria-label="Selected files actions">
+    <div class="selection-bar-info">
+      <span id="selectionCountLabel">0 selected</span>
+    </div>
+    <div class="selection-bar-actions">
+      <button type="button" class="card-action-btn" id="btnSelectAllVisible">Select all</button>
+      <button type="button" class="card-action-btn" id="btnCancelSelect">Cancel</button>
+      <button type="button" class="primary-btn btn-xs" id="btnDownloadSelected" disabled>Download</button>
     </div>
   </div>
 
