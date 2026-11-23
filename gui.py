@@ -93,6 +93,18 @@ from ui.widgets import (
 )
 
 
+def _qimage_to_png_bytes(qimg: QImage) -> bytes:
+    """Encodes a QImage to canonical PNG bytes for cross-device clipboard hashing & sync."""
+    if qimg is None or qimg.isNull():
+        return b""
+    byte_array = QByteArray()
+    buffer = QBuffer(byte_array)
+    buffer.open(QIODevice.WriteOnly)
+    qimg.save(buffer, "PNG")
+    buffer.close()
+    return bytes(byte_array)
+
+
 def is_private_clipboard(mime) -> bool:
     """Password managers tag secrets with these Windows clipboard formats so that clipboard
     monitors and sync tools leave them alone."""
@@ -362,7 +374,7 @@ class MainWindow(QMainWindow):
         self.events_timer.start(250)
 
         if self.initial_send_paths:
-            QTimer.singleShot(400, lambda: self._handle_shared_paths(self.initial_send_paths, source="Explorer"))
+            QTimer.singleShot(400, self, lambda: self._handle_shared_paths(self.initial_send_paths, source="Explorer"))
 
     # ------------------------------------------------------------------
     # Layout
@@ -551,15 +563,18 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _bring_to_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _on_other_instance(self, msg: dict):
         """A second launch (Start menu, desktop icon, Explorer "Send with") reached this window."""
         paths = [p for p in msg.get("paths") or [] if isinstance(p, str)]
         if paths:
             self._handle_shared_paths(paths, source="Explorer")
         if msg.get("show") or paths:
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
+            self._bring_to_front()
 
     def _go(self, index: int):
         self.nav_buttons[index].setChecked(True)
@@ -575,7 +590,7 @@ class MainWindow(QMainWindow):
 
         tray_menu = QMenu(self)
         show_action = QAction("Open NearBeam Control Panel", self)
-        show_action.triggered.connect(self.showNormal)
+        show_action.triggered.connect(self._bring_to_front)
         open_web_action = QAction("Open Web App in Browser", self)
         open_web_action.triggered.connect(self._open_browser)
         update_action = QAction(f"Check for Updates (v{APP_VERSION})...", self)
@@ -638,6 +653,12 @@ class MainWindow(QMainWindow):
             # Check for updates in background
             self._check_updates_async(manual=False)
         except Exception as e:
+            if self.server_instance:
+                try:
+                    self.server_instance.shutdown()
+                except Exception:
+                    pass
+                self.server_instance = None
             self.live_dot.set_color(theme.DANGER)
             self.status_label.setText("Server offline")
             self.status_label.setProperty("role", "warning")
@@ -762,7 +783,7 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(url)
         btn = self.addr_copy_buttons[key]
         btn.setIcon(icon("check", theme.SUCCESS, 16))
-        QTimer.singleShot(1200, lambda: btn.setIcon(icon("copy", theme.MUTED, 16)))
+        QTimer.singleShot(1200, btn, lambda b=btn: b.setIcon(icon("copy", theme.MUTED, 16)))
         self._append_log(f"Copied URL {url} to clipboard.", "info")
 
     def _open_browser(self):
@@ -810,7 +831,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "tray_icon") and self.tray_icon:
             self.tray_icon.setToolTip(f"NearBeam v{APP_VERSION} — {count} device{'s' if count != 1 else ''} online")
 
-        signature = tuple((d.get("id"), d.get("name"), d.get("kind")) for d in devices)
+        signature = tuple(
+            (d.get("id"), d.get("name"), d.get("kind"), d.get("url"), bool(d.get("is_leader")))
+            for d in devices
+        )
         if signature == self._device_signature:
             return
         self._device_signature = signature
@@ -957,24 +981,35 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Transfers
     # ------------------------------------------------------------------
+    def _cancel_outgoing(self, tx: OutgoingTransfer):
+        tx.cancel()
+        if not tx._started:
+            tx._emit_done(False, "Cancelled")
+
     def _start_outgoing(self, upload_url: str, target_name: str, file_paths: list[str]):
         """Queues files to a peer PC; they're sent one after another on a worker thread."""
         batch = []
         for fp in file_paths:
-            tx = OutgoingTransfer(
-                upload_url,
-                target_name,
-                fp,
-            )
+            try:
+                tx = OutgoingTransfer(
+                    upload_url,
+                    target_name,
+                    fp,
+                )
+            except OSError as e:
+                self._append_log(f"Skipped '{os.path.basename(fp)}': {e}", "warning")
+                continue
             tid = tx.id
             tx.on_progress = lambda sent, total, bps, tid=tid: self.bridge.transfer_progress.emit(tid, sent, total, bps)
             tx.on_done = lambda ok, msg, tid=tid: self.bridge.transfer_done.emit(tid, ok, msg)
             row = TransferRow(tx.filename, "sent", target_name, tx.total, controls=True)
             row.set_queued()
             row.pause_toggled.connect(lambda paused, t=tx: t.pause() if paused else t.resume())
-            row.cancel_clicked.connect(tx.cancel)
+            row.cancel_clicked.connect(lambda _=False, t=tx: self._cancel_outgoing(t))
             self._add_active_row(tid, row, tx=tx)
             batch.append(tx)
+        if not batch:
+            return
         self._append_log(f"Sending {len(batch)} file(s) to {target_name}...", "info")
         threading.Thread(target=lambda: [tx.run() for tx in batch], daemon=True).start()
 
@@ -1020,7 +1055,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"Sent '{tx.filename}' to {tx.target_name}.", "upload")
         elif status == "failed":
             self._append_log(f"Failed sending '{tx.filename}' to {tx.target_name}: {msg}", "error")
-        QTimer.singleShot(1500 if ok else 3000, lambda: (self._remove_active_row(tid), self._refresh_history()))
+        QTimer.singleShot(1500 if ok else 3000, self, lambda t=tid: (self._remove_active_row(t), self._refresh_history()))
 
     def _peer_name(self, ip: str) -> str:
         for d in self._nearby_devices():
@@ -1063,7 +1098,7 @@ class MainWindow(QMainWindow):
                 entry = self.active_transfers.get(tid)
                 if entry:
                     entry["row"].set_finished(True, "Received")
-                    QTimer.singleShot(1500, lambda t=tid: self._remove_active_row(t))
+                    QTimer.singleShot(1500, self, lambda t=tid: self._remove_active_row(t))
                 changed_history = True
             elif etype == "upload_cancelled":
                 self._remove_active_row(tid)
@@ -1088,7 +1123,7 @@ class MainWindow(QMainWindow):
                 if ev.get("completed"):
                     if entry:
                         entry["row"].set_finished(True, "Downloaded")
-                        QTimer.singleShot(1500, lambda t=did: self._remove_active_row(t))
+                        QTimer.singleShot(1500, self, lambda t=did: self._remove_active_row(t))
                     changed_history = True
                 elif entry:
                     # Video players stream in ranges; a stopped range isn't a failure.
@@ -1096,7 +1131,7 @@ class MainWindow(QMainWindow):
                         self._remove_active_row(did)
                     else:
                         entry["row"].set_finished(False, "Stopped")
-                        QTimer.singleShot(3000, lambda t=did: self._remove_active_row(t))
+                        QTimer.singleShot(3000, self, lambda t=did: self._remove_active_row(t))
             elif etype == "safelist_updated":
                 changed_folders = True
             elif etype == "batches_updated":
@@ -1122,7 +1157,7 @@ class MainWindow(QMainWindow):
             if entry.get("tx") is None and "last" in entry and not entry.get("stalled") and now - entry["last"][0] > max_idle:
                 entry["stalled"] = True
                 entry["row"].set_finished(False, "Stopped responding")
-                QTimer.singleShot(3000, lambda t=tid: self._remove_active_row(t))
+                QTimer.singleShot(3000, self, lambda t=tid: self._remove_active_row(t))
 
     def _history_row(self, rec: dict):
         direction = "sent" if rec.get("direction") == "sent" else "received"
@@ -1132,7 +1167,9 @@ class MainWindow(QMainWindow):
         row.set_finished(status == "completed", when if status == "completed" else f"{status.capitalize()} · {when}")
         row.bar.hide()
         row.pct.hide()
-        row.open_clicked.connect(lambda name=rec.get("filename", ""): self._reveal_received(name))
+        row.open_clicked.connect(
+            lambda name=rec.get("filename", ""), saved=rec.get("saved_path", ""): self._reveal_received(name, saved)
+        )
         return row
 
     def _refresh_history(self):
@@ -1151,7 +1188,10 @@ class MainWindow(QMainWindow):
         config.clear_transfer_history()
         self._refresh_history()
 
-    def _reveal_received(self, filename: str):
+    def _reveal_received(self, filename: str, saved_path: str = ""):
+        if saved_path and os.path.exists(saved_path):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(saved_path)])
+            return
         path = os.path.join(config.save_directory, filename)
         if filename and os.path.exists(path):
             subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
@@ -1199,14 +1239,25 @@ class MainWindow(QMainWindow):
     def _copy_last_clipboard(self):
         if not self._clip_last:
             return
+        import hashlib
         kind, value = self._clip_last
-        self._ignore_clipboard_until = time.monotonic() + 1.0
+        self._ignore_clipboard_until = time.monotonic() + 0.35
         if kind == "text":
+            self._last_synced_clipboard = value
             QApplication.clipboard().setText(value)
         else:
+            png_bytes = _qimage_to_png_bytes(value)
+            if png_bytes:
+                self._last_synced_image_hash = hashlib.sha256(png_bytes).hexdigest()
             QApplication.clipboard().setImage(value)
         self.clipboard_page.btn_copy.setText("Copied")
-        QTimer.singleShot(1200, lambda: self.clipboard_page.btn_copy.setText("Copy text" if kind == "text" else "Copy image"))
+
+        def _restore_copy_label():
+            current_kind = self._clip_last[0] if self._clip_last else kind
+            self.clipboard_page.btn_copy.setText("Copy text" if current_kind == "text" else "Copy image")
+
+        QTimer.singleShot(1200, self, _restore_copy_label)
+
     def _on_local_clipboard_changed(self):
         """Called whenever text or a screenshot/image is copied anywhere on Windows (Ctrl+C / Win+Shift+S)."""
         if not getattr(self, "chk_clipboard_sync", None) or not self.chk_clipboard_sync.isChecked():
@@ -1223,31 +1274,25 @@ class MainWindow(QMainWindow):
             # 1. Check for copied screenshot or image first (NB-07)
             if mime_data and mime_data.hasImage():
                 qimg = clipboard.image()
-                if not qimg.isNull():
-                    byte_array = QByteArray()
-                    buffer = QBuffer(byte_array)
-                    buffer.open(QIODevice.WriteOnly)
-                    qimg.save(buffer, "PNG")
-                    buffer.close()
-                    png_bytes = bytes(byte_array)
-                    if png_bytes:
-                        import hashlib
-                        img_hash = hashlib.sha256(png_bytes).hexdigest()
-                        if img_hash != getattr(self, "_last_synced_image_hash", ""):
-                            self._last_synced_image_hash = img_hash
-                            if hasattr(self, "server_instance") and self.server_instance:
-                                self.server_instance.set_clipboard_image(
-                                    png_bytes,
-                                    mime_type="image/png",
-                                    notify_local_os=False,
-                                    propagate_mesh=True,
-                                )
-                                kb = len(png_bytes) / 1024.0
-                                self._append_log(
-                                    f"Auto-synced Windows screenshot/image ({kb:.1f} KB) to shared clipboard",
-                                    "upload",
-                                )
-                                self._show_clip("image", qimg, "From this PC")
+                png_bytes = _qimage_to_png_bytes(qimg)
+                if png_bytes:
+                    import hashlib
+                    img_hash = hashlib.sha256(png_bytes).hexdigest()
+                    if img_hash != getattr(self, "_last_synced_image_hash", ""):
+                        self._last_synced_image_hash = img_hash
+                        if hasattr(self, "server_instance") and self.server_instance:
+                            self.server_instance.set_clipboard_image(
+                                png_bytes,
+                                mime_type="image/png",
+                                notify_local_os=False,
+                                propagate_mesh=True,
+                            )
+                            kb = len(png_bytes) / 1024.0
+                            self._append_log(
+                                f"Auto-synced Windows screenshot/image ({kb:.1f} KB) to shared clipboard",
+                                "upload",
+                            )
+                            self._show_clip("image", qimg, "From this PC")
                 return
 
             # 2. Check for copied text
@@ -1255,9 +1300,14 @@ class MainWindow(QMainWindow):
             if text and text != getattr(self, "_last_synced_clipboard", ""):
                 self._last_synced_clipboard = text
                 if hasattr(self, "server_instance") and self.server_instance:
-                    import datetime
-                    self.server_instance.clipboard_content = text
-                    self.server_instance.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+                    lock = getattr(self.server_instance, "_clipboard_lock", None)
+                    if lock is not None:
+                        with lock:
+                            self.server_instance.clipboard_content = text
+                            self.server_instance.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
+                    else:
+                        self.server_instance.clipboard_content = text
+                        self.server_instance.clipboard_updated_at = datetime.datetime.now().strftime("%H:%M:%S")
                     self.server_instance.broadcast_event({
                         "type": "clipboard_updated",
                         **self.server_instance.get_clipboard_state(),
@@ -1278,7 +1328,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._ignore_clipboard_until = time.monotonic() + 1.0
+            self._ignore_clipboard_until = time.monotonic() + 0.35
             self._last_synced_clipboard = text
             QApplication.clipboard().setText(text)
             snippet = (text[:30] + "...") if len(text) > 30 else text
@@ -1296,16 +1346,17 @@ class MainWindow(QMainWindow):
 
         try:
             import hashlib
-            img_hash = hashlib.sha256(img_bytes).hexdigest()
-            if img_hash == getattr(self, "_last_synced_image_hash", ""):
-                return
-
             qimg = QImage.fromData(img_bytes)
             if qimg.isNull():
                 return
 
-            self._ignore_clipboard_until = time.monotonic() + 1.0
-            self._last_synced_image_hash = img_hash
+            canonical_png = _qimage_to_png_bytes(qimg)
+            canonical_hash = hashlib.sha256(canonical_png).hexdigest() if canonical_png else hashlib.sha256(img_bytes).hexdigest()
+            if canonical_hash == getattr(self, "_last_synced_image_hash", ""):
+                return
+
+            self._ignore_clipboard_until = time.monotonic() + 0.35
+            self._last_synced_image_hash = canonical_hash
             QApplication.clipboard().setImage(qimg)
             kb = len(img_bytes) / 1024.0
             self._append_log(
@@ -1318,14 +1369,15 @@ class MainWindow(QMainWindow):
 
     def _toggle_shell_integration(self, checked: bool):
         success = set_shell_integration(checked)
-        config.data["shell_integration_enabled"] = bool(checked)
-        config.save()
         if success:
+            config.data["shell_integration_enabled"] = bool(checked)
+            config.save()
             state_str = "ENABLED" if checked else "DISABLED"
             self._append_log(f"Windows Explorer 'Send with NearBeam' context menu: {state_str}", "info")
         else:
             self.chk_shell_menu.blockSignals(True)
             self.chk_shell_menu.setChecked(not checked)
+            self.chk_shell_menu._animate(not checked)
             self.chk_shell_menu.blockSignals(False)
             QMessageBox.warning(self, "Explorer Menu Error", "Could not update Windows Explorer context menu registry.")
 
@@ -1335,7 +1387,10 @@ class MainWindow(QMainWindow):
             state_str = "ENABLED" if checked else "DISABLED"
             self._append_log(f"Windows startup autostart: {state_str}", "info")
         else:
+            self.chk_autostart.blockSignals(True)
             self.chk_autostart.setChecked(not checked)
+            self.chk_autostart._animate(not checked)
+            self.chk_autostart.blockSignals(False)
             QMessageBox.warning(self, "Startup Error", "Could not update Windows startup registry.")
 
     def _choose_save_directory(self):
@@ -1454,6 +1509,22 @@ class MainWindow(QMainWindow):
             self._append_log(f"Cleared all {removed} item(s) from Shared folders.", "info")
 
     def _clean_exit(self):
+        if getattr(self, "nearby_timer", None):
+            self.nearby_timer.stop()
+        if getattr(self, "events_timer", None):
+            self.events_timer.stop()
+        for entry in list(self.active_transfers.values()):
+            tx = entry.get("tx")
+            if tx is not None:
+                try:
+                    tx.cancel()
+                except Exception:
+                    pass
+        if getattr(self, "tray_icon", None):
+            try:
+                self.tray_icon.hide()
+            except Exception:
+                pass
         if self.server_instance:
             self.server_instance.shutdown()
         if self.server_thread:

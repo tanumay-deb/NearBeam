@@ -306,6 +306,7 @@ class NearBeamServer:
         CORS(self.app, resources=CORS_RESOURCES, origins=LAN_ORIGINS)
 
         # In-memory shared state
+        self._stopping = threading.Event()
         self._clipboard_lock = threading.Lock()
         self._events_lock = threading.Lock()
         self._clients_lock = threading.Lock()
@@ -359,7 +360,6 @@ class NearBeamServer:
         self._session_locks: Dict[str, threading.Lock] = {}
         self._cancelled_uploads: "OrderedDict[str, float]" = OrderedDict()
 
-        self._stopping = threading.Event()
         self.current_ip = get_local_ip()
         threading.Thread(target=self._watch_network, daemon=True).start()
         threading.Thread(target=remove_stale_uploads, args=(config.save_directory,), daemon=True).start()

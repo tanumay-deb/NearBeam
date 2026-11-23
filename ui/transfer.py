@@ -46,6 +46,10 @@ class OutgoingTransfer:
         self._resume = threading.Event()
         self._resume.set()
         self._cancelled = False
+        self._started = False
+        self._remote_started = False
+        self._done_lock = threading.Lock()
+        self._done_emitted = False
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -66,11 +70,22 @@ class OutgoingTransfer:
         self._cancelled = True
         self._resume.set()  # wake a paused loop so it can exit
 
+    def _emit_done(self, ok: bool, msg: str):
+        with self._done_lock:
+            if self._done_emitted:
+                return
+            self._done_emitted = True
+        self.on_done(ok, msg)
+
     def join(self, timeout: Optional[float] = None):
         if self._thread:
             self._thread.join(timeout)
 
     def run(self):
+        self._started = True
+        if self._cancelled:
+            self._emit_done(False, "Cancelled")
+            return
         total_chunks = max(1, (self.total + self.chunk_size - 1) // self.chunk_size)
         t0 = time.monotonic()
         sent_at_t0 = 0
@@ -78,13 +93,15 @@ class OutgoingTransfer:
             with open(self.file_path, "rb", buffering=self.chunk_size) as f:
                 for idx in range(total_chunks):
                     # Pause/cancel take effect between chunks.
-                    was_paused = self.paused
+                    wait_start = time.monotonic()
                     self._resume.wait()
+                    waited = time.monotonic() - wait_start
                     if self._cancelled:
-                        self._abort_remote()
-                        self.on_done(False, "Cancelled")
+                        if self._remote_started:
+                            self._abort_remote()
+                        self._emit_done(False, "Cancelled")
                         return
-                    if was_paused:
+                    if waited > 0.05:
                         # Don't count paused time in the speed.
                         t0, sent_at_t0 = time.monotonic(), self.sent
                     offset = idx * self.chunk_size
@@ -105,19 +122,30 @@ class OutgoingTransfer:
                         },
                         method="POST",
                     )
+                    self._remote_started = True
                     with urllib.request.urlopen(req, timeout=60.0) as resp:
                         if resp.status != 200:
                             raise RuntimeError(f"HTTP status {resp.status}")
+                    if self._cancelled:
+                        self._abort_remote()
+                        self._emit_done(False, "Cancelled")
+                        return
                     self.sent = offset + len(data)
                     elapsed = max(time.monotonic() - t0, 1e-6)
                     self.on_progress(self.sent, self.total, (self.sent - sent_at_t0) / elapsed)
-            self.on_done(True, "")
+            if self._cancelled:
+                if self._remote_started:
+                    self._abort_remote()
+                self._emit_done(False, "Cancelled")
+                return
+            self._emit_done(True, "")
         except Exception as e:
             if self._cancelled:
-                self._abort_remote()
-                self.on_done(False, "Cancelled")
+                if self._remote_started:
+                    self._abort_remote()
+                self._emit_done(False, "Cancelled")
             else:
-                self.on_done(False, str(e))
+                self._emit_done(False, str(e))
 
     def _pieces(self, data: bytes):
         for i in range(0, len(data), PIECE_SIZE):

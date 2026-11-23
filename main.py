@@ -232,8 +232,8 @@ def main():
         if send_paths:
             # Prefer waking an existing desktop GUI via QLocalSocket; fall back to HTTP for a headless server.
             try:
-                from gui import SINGLE_INSTANCE_KEY, hand_off_to_running_instance
-                if hand_off_to_running_instance(SINGLE_INSTANCE_KEY, {"show": True, "paths": send_paths}):
+                from gui import INSTANCE_KEY, hand_off_to_running_instance
+                if hand_off_to_running_instance(INSTANCE_KEY, {"show": True, "paths": send_paths}):
                     return
             except Exception:
                 pass

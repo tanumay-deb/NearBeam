@@ -55,8 +55,21 @@ def animations_enabled() -> bool:
 def fade_in(widget: QWidget, duration: int = 220, rise: int = 0):
     """Fades a widget in (optionally rising a few px). The effect is removed afterwards so
     text renders crisply and nested opacity effects don't fight."""
-    if not animations_enabled():
+    if not animations_enabled() or widget is None:
         return
+    prev_fade = getattr(widget, "_nb_fade_anim", None)
+    if prev_fade is not None:
+        try:
+            prev_fade.stop()
+        except RuntimeError:
+            pass
+    prev_slide = getattr(widget, "_nb_slide_anim", None)
+    if prev_slide is not None:
+        try:
+            prev_slide.stop()
+        except RuntimeError:
+            pass
+
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
     anim = QPropertyAnimation(effect, b"opacity", widget)
@@ -64,15 +77,39 @@ def fade_in(widget: QWidget, duration: int = 220, rise: int = 0):
     anim.setStartValue(0.0)
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.OutCubic)
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    widget._nb_fade_anim = anim
+
+    def _finish_fade():
+        try:
+            if widget.graphicsEffect() is effect:
+                widget.setGraphicsEffect(None)
+            if getattr(widget, "_nb_fade_anim", None) is anim:
+                widget._nb_fade_anim = None
+        except RuntimeError:
+            pass
+
+    anim.finished.connect(_finish_fade)
     anim.start(QPropertyAnimation.DeleteWhenStopped)
     if rise:
-        end = widget.pos()
+        base_pos = getattr(widget, "_nb_fade_base_pos", None)
+        if base_pos is None:
+            base_pos = QPoint(0, 0) if widget.parentWidget() is not None and widget.pos().y() == 0 else widget.pos()
+            widget._nb_fade_base_pos = base_pos
         slide = QPropertyAnimation(widget, b"pos", widget)
         slide.setDuration(duration)
-        slide.setStartValue(end + QPoint(0, rise))
-        slide.setEndValue(end)
+        slide.setStartValue(base_pos + QPoint(0, rise))
+        slide.setEndValue(base_pos)
         slide.setEasingCurve(QEasingCurve.OutCubic)
+        widget._nb_slide_anim = slide
+
+        def _finish_slide():
+            try:
+                if getattr(widget, "_nb_slide_anim", None) is slide:
+                    widget._nb_slide_anim = None
+            except RuntimeError:
+                pass
+
+        slide.finished.connect(_finish_slide)
         slide.start(QPropertyAnimation.DeleteWhenStopped)
 
 
@@ -485,6 +522,8 @@ class TransferRow(QFrame):
         self.set_progress(0, total, 0)
 
     def _on_pause(self, paused: bool):
+        if not paused:
+            self._bps = 0.0
         self.btn_pause.setIcon(icon("play" if paused else "pause", theme.MUTED, 16))
         self.btn_pause.setToolTip("Resume" if paused else "Pause")
         self.bar.setProperty("state", "paused" if paused else "")
