@@ -269,6 +269,47 @@ def inside_folder(root_real: str, path: str) -> bool:
         return False
 
 
+ORGANIZE_TYPE_FOLDERS = {
+    "image": "Photos",
+    "video": "Videos",
+    "document": "Documents",
+    "audio": "Audio",
+    "archive": "Archives",
+    "code": "Code",
+    "file": "Other",
+}
+
+
+def resolve_receive_dir(
+    base_save_dir: str,
+    filename: str,
+    relative_dir: str = "",
+    peer_name: str = "",
+    mode: str = "off",
+    is_guest_drop: bool = False,
+) -> str:
+    """Computes final destination folder for a received file respecting auto_organize_mode,
+    folder uploads (relative_dir), and Guest Drops while keeping paths sandboxed inside base_save_dir."""
+    rel_parts = [p for p in (relative_dir or "").replace("\\", "/").split("/") if p not in ("", ".")]
+    bucket = ""
+    if not is_guest_drop:
+        if mode == "type":
+            if not rel_parts:
+                bucket = ORGANIZE_TYPE_FOLDERS.get(get_file_type_category(filename), "Other")
+        elif mode == "date":
+            bucket = datetime.date.today().isoformat()
+        elif mode == "device":
+            raw_peer = (peer_name or "").strip()
+            bucket = safe_filename(raw_peer) if raw_peer else "Other Devices"
+
+    parts = ([bucket] if bucket else []) + rel_parts
+    candidate = os.path.join(base_save_dir, *parts) if parts else base_save_dir
+    base_root = os.path.realpath(base_save_dir)
+    if not inside_folder(base_root, candidate):
+        return base_save_dir
+    return candidate
+
+
 THUMB_PX = 320  # sharp on 3x phone screens for grid tiles, still ~20 KB
 
 
@@ -950,7 +991,25 @@ class NearBeamServer:
         for tok in expired:
             self.active_drop_zones.pop(tok, None)
 
-    def _receive_chunk(self, save_dir: str, peer: str, log_template: str):
+    def _resolve_peer_device_label(self) -> str:
+        """Returns a friendly sender device name for 'device' auto-organize mode."""
+        from urllib.parse import unquote
+        hdr = request.headers.get("X-Device-Name", "").strip()
+        if hdr:
+            return unquote(hdr)[:48]
+        addr = request.remote_addr or ""
+        with self._clients_lock:
+            known = self.connected_clients.get(addr, {}).get("name")
+        if known:
+            return known
+        ua = request.headers.get("User-Agent", "")
+        if ua:
+            parsed = self._parse_client_info(addr or "device", ua)
+            if parsed.get("name"):
+                return parsed["name"]
+        return addr or "Other Devices"
+
+    def _receive_chunk(self, save_dir: str, peer: str, log_template: str, is_guest_drop: bool = False):
         """Shared chunk receiver for host uploads and guest drops."""
         from urllib.parse import unquote
         session_id = request.headers.get("X-Session-Id") or request.form.get("session_id")
@@ -975,7 +1034,6 @@ class NearBeamServer:
         filename = safe_filename(unquote(filename_raw))
         relative_dir = unquote(request.headers.get("X-Relative-Dir", request.form.get("relative_dir", ""))).strip()
 
-        dest_dir = save_dir
         if relative_dir:
             norm_rel = relative_dir.replace("\\", "/")
             if norm_rel.startswith("/"):
@@ -987,10 +1045,19 @@ class NearBeamServer:
             # BEFORE os.path.join so names like 'D: notes' aren't parsed as Windows drive letters.
             clean_parts = [safe_filename(p) for p in raw_parts]
             relative_dir = "/".join(clean_parts)
-            dest_dir = os.path.join(save_dir, *clean_parts) if clean_parts else save_dir
+            probe_dir = os.path.join(save_dir, *clean_parts) if clean_parts else save_dir
             root = os.path.realpath(save_dir)
-            if not inside_folder(root, dest_dir):
+            if not inside_folder(root, probe_dir):
                 return jsonify({"error": "Invalid relative directory"}), 400
+
+        dest_dir = resolve_receive_dir(
+            save_dir,
+            filename=filename,
+            relative_dir=relative_dir,
+            peer_name=self._resolve_peer_device_label(),
+            mode=config.auto_organize_mode,
+            is_guest_drop=is_guest_drop,
+        )
 
         session_lock = self._get_session_lock(session_id)
         with session_lock:
@@ -1771,6 +1838,7 @@ class NearBeamServer:
                 os.path.join(config.save_directory, "Guest Drops"),
                 f"Guest Drop ({request.remote_addr})",
                 "Guest dropped '{name}' ({size})",
+                is_guest_drop=True,
             )
 
         @app.route("/api/upload", methods=["POST"])
@@ -1795,6 +1863,14 @@ class NearBeamServer:
                 original_name = f.filename
                 clean_name = safe_filename(original_name)
                 save_dir = config.save_directory
+                dest_dir = resolve_receive_dir(
+                    save_dir,
+                    filename=clean_name,
+                    relative_dir="",
+                    peer_name=self._resolve_peer_device_label(),
+                    mode=config.auto_organize_mode,
+                    is_guest_drop=False,
+                )
                 os.makedirs(save_dir, exist_ok=True)
                 temp_path = os.path.join(save_dir, f".{uuid.uuid4().hex}.tmp")
 
@@ -1810,7 +1886,7 @@ class NearBeamServer:
                                 break
                             out_file.write(chunk)
                             total_bytes += len(chunk)
-                    dest_path = finalize_upload(temp_path, save_dir, clean_name)
+                    dest_path = finalize_upload(temp_path, dest_dir, clean_name)
                 except Exception:
                     if os.path.exists(temp_path):
                         try:
@@ -1975,50 +2051,79 @@ class NearBeamServer:
                 resp["batch"] = batch
             return jsonify(resp)
 
+        def _resolve_received_file(filepath: str) -> Optional[str]:
+            save_dir = config.save_directory
+            norm = (filepath or "").replace("\\", "/").lstrip("/")
+            parts = [p for p in norm.split("/") if p not in ("", ".")]
+            if not parts or any(p == ".." or p.startswith(".") for p in parts):
+                return None
+            target = os.path.join(save_dir, *parts)
+            root_real = os.path.realpath(save_dir)
+            if not inside_folder(root_real, target):
+                return None
+            real_target = os.path.realpath(target)
+            if not os.path.isfile(real_target):
+                return None
+            return real_target
+
         @app.route("/api/received")
         def api_received():
-            """Lists files in the auto-save directory."""
+            """Lists files in the auto-save directory (including auto-organized subfolders)."""
             save_dir = config.save_directory
             files = []
             if os.path.exists(save_dir) and os.path.isdir(save_dir):
+                root_real = os.path.realpath(save_dir)
                 try:
-                    with os.scandir(save_dir) as entries:
-                        for entry in entries:
-                            if entry.is_file() and not entry.name.startswith("."):
-                                stat = entry.stat()
-                                size = stat.st_size
-                                files.append({
-                                    "filename": entry.name,
-                                    "size": size,
-                                    "formatted_size": format_size(size),
-                                    "modified": _format_mtime(stat.st_mtime),
-                                    "category": get_file_type_category(entry.name),
-                                })
+                    for walk_root, dirnames, filenames in os.walk(save_dir):
+                        dirnames[:] = [
+                            d for d in dirnames
+                            if not d.startswith(".") and inside_folder(root_real, os.path.join(walk_root, d))
+                        ]
+                        for fname in filenames:
+                            if fname.startswith("."):
+                                continue
+                            fpath = os.path.join(walk_root, fname)
+                            if not inside_folder(root_real, fpath):
+                                continue
+                            try:
+                                stat = os.stat(fpath)
+                            except OSError:
+                                continue
+                            rel = os.path.relpath(fpath, save_dir).replace("\\", "/")
+                            folder = os.path.dirname(rel).replace("\\", "/")
+                            size = stat.st_size
+                            files.append({
+                                "filename": fname,
+                                "rel_path": rel,
+                                "folder": folder if folder != "." else "",
+                                "size": size,
+                                "formatted_size": format_size(size),
+                                "modified": _format_mtime(stat.st_mtime),
+                                "mtime": stat.st_mtime,
+                                "category": get_file_type_category(fname),
+                            })
                 except Exception as e:
                     print(f"Error scanning save directory: {e}")
 
-            files.sort(key=lambda x: x["modified"], reverse=True)
+            files.sort(key=lambda x: x.get("mtime", 0), reverse=True)
             return jsonify({"files": files, "save_directory": save_dir})
 
-        @app.route("/api/received/download/<filename>")
+        @app.route("/api/received/download/<path:filename>")
         def api_received_download(filename: str):
-            """Downloads an auto-saved file from the save directory."""
-            save_dir = config.save_directory
-            safe_name = os.path.basename(filename)
-            target = os.path.join(save_dir, safe_name)
-            if safe_name.startswith(".") or not os.path.isfile(target):  # hidden = another device's partial upload
+            """Downloads an auto-saved file from the save directory (or an organized subfolder)."""
+            target = _resolve_received_file(filename)
+            if not target:
                 return jsonify({"error": "File not found"}), 404
+            safe_name = os.path.basename(target)
             return self._track_download(
                 send_file(target, as_attachment=True, download_name=safe_name, conditional=True), safe_name
             )
 
-        @app.route("/api/received/preview/<filename>")
+        @app.route("/api/received/preview/<path:filename>")
         def api_received_preview(filename: str):
             """Streams an auto-saved file inline for preview."""
-            save_dir = config.save_directory
-            safe_name = os.path.basename(filename)
-            target = os.path.join(save_dir, safe_name)
-            if safe_name.startswith(".") or not os.path.isfile(target):
+            target = _resolve_received_file(filename)
+            if not target:
                 return jsonify({"error": "File not found"}), 404
             mime_type, _ = mimetypes.guess_type(target)
             return send_file(target, mimetype=mime_type or "application/octet-stream", conditional=True)

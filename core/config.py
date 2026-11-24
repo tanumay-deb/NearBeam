@@ -28,7 +28,12 @@ def legacy_config_paths() -> list[Path]:
     return paths
 
 
+VALID_ORGANIZE_MODES = ("off", "type", "date", "device")
+
+
 class ConfigManager:
+    VALID_ORGANIZE_MODES = VALID_ORGANIZE_MODES
+
     def __init__(self, config_path=None):
         if config_path is None:
             self.config_path = user_config_path()
@@ -46,6 +51,7 @@ class ConfigManager:
         self.data = {
             "port": 5000,
             "auto_save": True,
+            "auto_organize_mode": "off",
             "save_directory": self.default_save_dir,
             "safe_folders": [],
             "transfer_history": [],
@@ -91,6 +97,8 @@ class ConfigManager:
                     self.data["save_directory"] = self.default_save_dir
                 if not isinstance(self.data.get("port"), int) or isinstance(self.data.get("port"), bool):
                     self.data["port"] = 5000
+                if self.data.get("auto_organize_mode") not in VALID_ORGANIZE_MODES:
+                    self.data["auto_organize_mode"] = "off"
             except Exception as e:
                 print(f"Error loading config from {self.config_path}: {e}")
 
@@ -118,6 +126,18 @@ class ConfigManager:
         with self._lock:
             self.data["auto_save"] = bool(enabled)
             self.save()
+
+    @property
+    def auto_organize_mode(self) -> str:
+        mode = self.data.get("auto_organize_mode", "off")
+        return mode if mode in VALID_ORGANIZE_MODES else "off"
+
+    def set_auto_organize_mode(self, mode: str) -> str:
+        clean = mode if mode in VALID_ORGANIZE_MODES else "off"
+        with self._lock:
+            self.data["auto_organize_mode"] = clean
+            self.save()
+        return clean
 
     @property
     def clipboard_sync_enabled(self) -> bool:
