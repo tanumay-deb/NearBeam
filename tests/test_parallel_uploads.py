@@ -385,5 +385,30 @@ class TestOutgoingTransferParallel(unittest.TestCase):
             self.assertEqual(f2.read(), f1.read())
 
 
+class TestWebParallelAndReceivedContracts(unittest.TestCase):
+    def test_app_js_parallel_transfer_manager_and_received_folder_contracts(self):
+        import subprocess
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        js_path = root / "static" / "js" / "app.js"
+        src = js_path.read_text(encoding="utf-8")
+
+        for token in (
+            "LARGE_FILE_THRESHOLD",
+            "X-Parallel",
+            "inFlightXhrs",
+            "completedChunks",
+            "/api/upload/status/",
+            "file.rel_path",
+            "file.folder",
+        ):
+            self.assertIn(token, src, f"Missing expected JS contract token: {token}")
+
+        # Verify syntax with Node if available
+        res = subprocess.run(["node", "--check", str(js_path)], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

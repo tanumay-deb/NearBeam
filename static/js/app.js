@@ -1985,7 +1985,12 @@ function renderMeshNodesUI(role, nodes) {
 }
 
 
-// --- Production-Grade Transfer Manager (NB-03) ---
+// --- Production-Grade Transfer Manager (NB-03 + Parallel Multi-Stream #7) ---
+const LARGE_FILE_THRESHOLD = 16 * 1024 * 1024; // 16 MB -> parallel multi-stream chunks
+const PARALLEL_CHUNK_SIZE = 8 * 1024 * 1024;   // 8 MB per parallel chunk
+const MAX_STREAMS_PER_LARGE_FILE = 4;          // 4 concurrent streams for large files
+const MAX_TOTAL_UPLOAD_STREAMS = 5;            // Keeps 1 of browser's 6 HTTP/1.1 slots free for SSE
+
 class TransferManager {
   constructor() {
     this.queue = [];
@@ -1995,11 +2000,12 @@ class TransferManager {
     this.list = document.getElementById("activeTransfersList");
     this.failedCard = document.getElementById("failedTransfersCard");
     this.failedList = document.getElementById("failedTransfersList");
-    // Adaptive concurrency: small files ride a wide parallel lane,
-    // large files get a narrow lane so they don't clog the Wi-Fi pipe.
-    this.smallFileThreshold = 8 * 1024 * 1024; // 8 MB
-    this.maxSmallConcurrent = 8;
-    this.maxLargeConcurrent = 2;
+    // Adaptive smart switching: files >= 16 MB use 4 parallel 8 MB streams;
+    // files < 16 MB use 1 stream each with up to 5 concurrent small files.
+    this.smallFileThreshold = LARGE_FILE_THRESHOLD;
+    this.parallelChunkSize = PARALLEL_CHUNK_SIZE;
+    this.maxStreamsPerLargeFile = MAX_STREAMS_PER_LARGE_FILE;
+    this.maxTotalStreams = MAX_TOTAL_UPLOAD_STREAMS;
 
     this.queueHeader = document.createElement("div");
     this.queueHeader.className = "queue-header";
@@ -2012,12 +2018,67 @@ class TransferManager {
     }
   }
 
-  addTransfer(sessionId, filename, file, uploadUrl, targetName, relativeDir, startChunk = 0) {
+  chunkByteLength(t, chunkIndex) {
+    const start = chunkIndex * t.chunkSize;
+    const end = Math.min(start + t.chunkSize, t.file.size);
+    return Math.max(0, end - start);
+  }
+
+  completedBytes(t) {
+    let sum = 0;
+    for (const idx of t.completedChunks) {
+      sum += this.chunkByteLength(t, idx);
+    }
+    return Math.min(t.file.size, sum);
+  }
+
+  computeLoadedBytes(t) {
+    let sum = this.completedBytes(t);
+    for (const [idx, loaded] of t.chunkLoaded.entries()) {
+      if (!t.completedChunks.has(idx)) {
+        sum += Math.min(this.chunkByteLength(t, idx), loaded);
+      }
+    }
+    const clamped = Math.min(t.file.size, sum);
+    t.highWaterLoaded = Math.max(t.highWaterLoaded || 0, clamped);
+    return t.highWaterLoaded;
+  }
+
+  totalActiveStreams() {
+    let used = 0;
+    for (const t of this.activeTransfers.values()) {
+      used += t.maxStreams || 1;
+    }
+    return used;
+  }
+
+  addTransfer(sessionId, filename, file, uploadUrl, targetName, relativeDir, completedChunks = null) {
     if (this.container && this.container.classList.contains("hidden")) {
       this.container.classList.remove("hidden");
     }
 
-    const chunkSize = 50 * 1024 * 1024;
+    const isLarge = file.size >= this.smallFileThreshold;
+    const chunkSize = isLarge ? this.parallelChunkSize : Math.max(file.size, 1);
+    const totalChunks = Math.ceil(file.size / chunkSize) || 1;
+    const useParallel = isLarge && totalChunks > 1;
+    const completed = new Set();
+    if (typeof completedChunks === "number" && completedChunks > 0) {
+      for (let i = 0; i < Math.min(completedChunks, totalChunks); i++) {
+        completed.add(i);
+      }
+    } else if (Array.isArray(completedChunks) || completedChunks instanceof Set) {
+      for (const idx of completedChunks) {
+        if (Number.isInteger(idx) && idx >= 0 && idx < totalChunks) {
+          completed.add(idx);
+        }
+      }
+    }
+    const pendingChunks = [];
+    for (let i = 0; i < totalChunks; i++) {
+      if (!completed.has(i)) pendingChunks.push(i);
+    }
+    const maxStreams = useParallel ? Math.min(this.maxStreamsPerLargeFile, totalChunks) : 1;
+
     const transfer = {
       sessionId,
       filename,
@@ -2026,19 +2087,29 @@ class TransferManager {
       targetName,
       relativeDir,
       chunkSize,
-      totalChunks: Math.ceil(file.size / chunkSize) || 1,
-      currentChunk: startChunk,
+      totalChunks,
+      useParallel,
+      isSmall: !useParallel,
+      maxStreams,
+      completedChunks: completed,
+      pendingChunks,
+      inFlightXhrs: new Map(),
+      chunkLoaded: new Map(),
       paused: false,
       cancelled: false,
+      finished: false,
+      failed: false,
       startTime: 0,
-      xhr: null,
       card: null,
       lastUpdate: 0,
       lastSpeedUpdate: 0,
-      lastLoaded: startChunk * chunkSize,
+      lastLoaded: 0,
+      highWaterLoaded: 0,
       emaBps: 0,
     };
-    transfer.isSmall = file.size < this.smallFileThreshold;
+    const initialBytes = this.completedBytes(transfer);
+    transfer.lastLoaded = initialBytes;
+    transfer.highWaterLoaded = initialBytes;
     myUploadSessions.add(sessionId);
 
     this.queue.push(transfer);
@@ -2058,19 +2129,12 @@ class TransferManager {
 
   processQueue() {
     while (this.queue.length > 0) {
-      let activeSmall = 0;
-      let activeLarge = 0;
-      for (const t of this.activeTransfers.values()) {
-        if (t.isSmall) activeSmall++;
-        else activeLarge++;
-      }
-      const smallRoom = activeSmall < this.maxSmallConcurrent;
-      const largeRoom = activeLarge < this.maxLargeConcurrent;
-      if (!smallRoom && !largeRoom) break;
-
+      const usedStreams = this.totalActiveStreams();
       let idx = -1;
       for (let i = 0; i < this.queue.length; i++) {
-        if ((this.queue[i].isSmall && smallRoom) || (!this.queue[i].isSmall && largeRoom)) {
+        const candidate = this.queue[i];
+        const needed = candidate.maxStreams || 1;
+        if (usedStreams + needed <= this.maxTotalStreams || this.activeTransfers.size === 0) {
           idx = i;
           break;
         }
@@ -2092,13 +2156,14 @@ class TransferManager {
     card.id = `transfer-${t.sessionId}`;
 
     const displayPath = t.relativeDir ? `${t.filename} (${t.relativeDir})` : t.filename;
-    const initialPct = t.file.size > 0 ? Math.round(((t.currentChunk * t.chunkSize) / t.file.size) * 100) : 0;
+    const initialBytes = this.completedBytes(t);
+    const initialPct = t.file.size > 0 ? Math.round((initialBytes / t.file.size) * 100) : 0;
 
     card.innerHTML = `
       <div class="transfer-info">
         <div class="transfer-name"></div>
         <div class="transfer-stats">
-          <span id="bytes-${t.sessionId}">${formatBytes(t.currentChunk * t.chunkSize)} / ${formatBytes(t.file.size)}</span>
+          <span id="bytes-${t.sessionId}">${formatBytes(initialBytes)} / ${formatBytes(t.file.size)}</span>
           <span id="speed-${t.sessionId}">Starting…</span>
           <span id="eta-${t.sessionId}">ETA: --</span>
         </div>
@@ -2129,23 +2194,43 @@ class TransferManager {
 
     t.startTime = Date.now();
     t.lastSpeedUpdate = Date.now();
-    this.uploadNextChunk(t.sessionId);
+    this.pumpChunks(t.sessionId);
+  }
+
+  abortInFlight(t, requeue = true) {
+    if (!t || !t.inFlightXhrs) return;
+    const entries = Array.from(t.inFlightXhrs.entries());
+    t.inFlightXhrs.clear();
+    for (const [chunkIdx, xhr] of entries) {
+      t.chunkLoaded.delete(chunkIdx);
+      if (requeue && !t.completedChunks.has(chunkIdx) && !t.pendingChunks.includes(chunkIdx)) {
+        t.pendingChunks.unshift(chunkIdx);
+      }
+      try {
+        xhr.abort();
+      } catch (e) {}
+    }
+    if (requeue) {
+      t.pendingChunks.sort((a, b) => a - b);
+    }
   }
 
   togglePause(sessionId) {
     const t = this.activeTransfers.get(sessionId);
-    if (!t) return;
+    if (!t || t.finished || t.cancelled) return;
     t.paused = !t.paused;
     t.pauseBtn.innerText = t.paused ? "Resume" : "Pause";
     if (t.paused) {
       if (t.speedEl) t.speedEl.innerText = "Paused";
       if (t.etaEl) t.etaEl.innerText = "ETA: --";
-      if (t.xhr) t.xhr.abort();
+      this.abortInFlight(t, true);
     } else {
+      const committed = this.completedBytes(t);
+      t.highWaterLoaded = committed;
+      t.lastLoaded = committed;
       t.lastSpeedUpdate = Date.now();
-      t.lastLoaded = t.currentChunk * t.chunkSize;
       if (t.speedEl) t.speedEl.innerText = "Resuming…";
-      this.uploadNextChunk(sessionId);
+      this.pumpChunks(sessionId);
     }
   }
 
@@ -2160,7 +2245,7 @@ class TransferManager {
     if (t) {
       t.cancelled = true;
       cancelBaseUrl = this.getCancelBaseUrl(t.uploadUrl);
-      if (t.xhr) t.xhr.abort();
+      this.abortInFlight(t, false);
       if (t.card) t.card.remove();
       this.activeTransfers.delete(sessionId);
     } else {
@@ -2181,11 +2266,14 @@ class TransferManager {
   }
 
   markTransferFailed(t, reason) {
-    if (t.cancelled) return;
+    if (t.cancelled || t.finished || t.failed) return;
+    t.failed = true;
+    this.abortInFlight(t, true);
     if (t.card) t.card.remove();
     this.activeTransfers.delete(t.sessionId);
     this.failedTransfers.set(t.sessionId, {
       ...t,
+      completedChunks: new Set(t.completedChunks),
       reason: reason || "Network interrupted",
     });
     this.renderFailedTransfers();
@@ -2207,7 +2295,8 @@ class TransferManager {
     for (const [sessionId, item] of this.failedTransfers.entries()) {
       const row = document.createElement("div");
       row.className = "failed-item";
-      const pct = item.file.size > 0 ? Math.round(((item.currentChunk * item.chunkSize) / item.file.size) * 100) : 0;
+      const doneBytes = item.completedChunks ? this.completedBytes(item) : 0;
+      const pct = item.file.size > 0 ? Math.round((doneBytes / item.file.size) * 100) : 0;
       row.innerHTML = `
         <div class="failed-item-info">
           <div class="failed-item-name"></div>
@@ -2229,12 +2318,42 @@ class TransferManager {
     }
   }
 
-  retryFailedTransfer(sessionId) {
+  async retryFailedTransfer(sessionId) {
     const item = this.failedTransfers.get(sessionId);
     if (!item) return;
     this.failedTransfers.delete(sessionId);
     this.renderFailedTransfers();
-    // Resume from the last uncommitted chunk
+
+    const completed = new Set(item.completedChunks || []);
+    const cancelBaseUrl = this.getCancelBaseUrl(item.uploadUrl);
+    try {
+      const res = await fetch(`${cancelBaseUrl}/api/upload/status/${encodeURIComponent(sessionId)}`);
+      if (res.ok) {
+        const status = await res.json();
+        if (status && status.completed) {
+          setTimeout(() => myUploadSessions.delete(sessionId), 5000);
+          showToast(`Uploaded ${item.filename}`, "success");
+          if (!window.NEARBEAM_GUEST_DROP && typeof fetchReceivedFiles === "function") {
+            fetchReceivedFiles();
+          }
+          return;
+        }
+        if (status && Array.isArray(status.received_chunks) && status.received_chunks.length > 0) {
+          status.received_chunks.forEach((idx) => {
+            if (Number.isInteger(idx) && idx >= 0 && idx < item.totalChunks) {
+              completed.add(idx);
+            }
+          });
+        } else if (status && !item.useParallel && typeof status.received_bytes === "number" && status.received_bytes > 0) {
+          const fullChunks = Math.floor(status.received_bytes / item.chunkSize);
+          for (let i = 0; i < Math.min(fullChunks, item.totalChunks); i++) {
+            completed.add(i);
+          }
+        }
+      }
+    } catch (e) {}
+
+    // Resume by sending only missing chunks
     this.addTransfer(
       item.sessionId,
       item.filename,
@@ -2242,7 +2361,7 @@ class TransferManager {
       item.uploadUrl,
       item.targetName,
       item.relativeDir,
-      item.currentChunk
+      Array.from(completed)
     );
   }
 
@@ -2274,99 +2393,144 @@ class TransferManager {
     }
   }
 
-  uploadNextChunk(sessionId) {
-    const t = this.activeTransfers.get(sessionId);
-    if (!t || t.paused || t.cancelled) return;
+  updateTransferUI(t, force = false) {
+    const now = Date.now();
+    const totalLoaded = this.computeLoadedBytes(t);
+    if (!force && now - t.lastUpdate <= 150 && totalLoaded < t.file.size) {
+      return;
+    }
+    t.lastUpdate = now;
+    const pct = t.file.size > 0 ? Math.round((totalLoaded / t.file.size) * 100) : 100;
+    if (t.barEl) t.barEl.style.width = pct + "%";
+    if (t.bytesEl) t.bytesEl.innerText = `${formatBytes(totalLoaded)} / ${formatBytes(t.file.size)}`;
 
-    const start = t.currentChunk * t.chunkSize;
+    const elapsedSec = (now - t.lastSpeedUpdate) / 1000;
+    if (elapsedSec >= 0.35) {
+      const bytesSinceLast = Math.max(0, totalLoaded - t.lastLoaded);
+      const instantBps = bytesSinceLast / elapsedSec;
+      t.emaBps = t.emaBps > 0 ? t.emaBps * 0.65 + instantBps * 0.35 : instantBps;
+      if (t.speedEl) t.speedEl.innerText = `${formatBytes(t.emaBps)}/s`;
+
+      const remaining = Math.max(0, t.file.size - totalLoaded);
+      const etaSec = t.emaBps > 0 ? Math.ceil(remaining / t.emaBps) : 0;
+      if (t.etaEl) {
+        t.etaEl.innerText = etaSec > 60
+          ? `ETA: ${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
+          : `ETA: ${etaSec}s`;
+      }
+
+      t.lastSpeedUpdate = now;
+      t.lastLoaded = totalLoaded;
+    }
+  }
+
+  completeTransfer(t, fileInfo) {
+    if (t.finished || t.cancelled) return;
+    t.finished = true;
+    this.abortInFlight(t, false);
+    if (t.card) t.card.remove();
+    this.activeTransfers.delete(t.sessionId);
+    // Keep sessionId marked briefly so the matching SSE file_received event doesn't double-toast/duplicate history.
+    setTimeout(() => myUploadSessions.delete(t.sessionId), 5000);
+    this.checkIfDone();
+    try {
+      showToast(`Uploaded ${t.filename}`, "success");
+      if (fileInfo) addSentHistoryItem(fileInfo, !window.NEARBEAM_GUEST_DROP);
+      if (!window.NEARBEAM_GUEST_DROP && typeof fetchReceivedFiles === "function") fetchReceivedFiles();
+    } catch (e) {
+      console.error("Post-upload UI update failed:", e);
+    }
+  }
+
+  pumpChunks(sessionId) {
+    const t = this.activeTransfers.get(sessionId);
+    if (!t || t.paused || t.cancelled || t.finished || t.failed) return;
+    while (
+      !t.paused &&
+      !t.cancelled &&
+      !t.finished &&
+      !t.failed &&
+      t.inFlightXhrs.size < t.maxStreams &&
+      t.pendingChunks.length > 0
+    ) {
+      const nextChunk = t.pendingChunks.shift();
+      this.uploadChunk(sessionId, nextChunk);
+    }
+  }
+
+  uploadChunk(sessionId, chunkIndex) {
+    const t = this.activeTransfers.get(sessionId);
+    if (!t || t.paused || t.cancelled || t.finished || t.failed) return;
+
+    const start = chunkIndex * t.chunkSize;
     const end = Math.min(start + t.chunkSize, t.file.size);
     const chunk = t.file.slice(start, end);
 
-    t.xhr = new XMLHttpRequest();
+    const xhr = new XMLHttpRequest();
+    t.inFlightXhrs.set(chunkIndex, xhr);
     const chunkUrl = t.uploadUrl.replace(/\/upload$/, "/upload/chunk");
-    t.xhr.open("POST", chunkUrl);
-    t.xhr.setRequestHeader("Content-Type", "application/octet-stream");
-    t.xhr.setRequestHeader("X-Session-Id", t.sessionId);
-    t.xhr.setRequestHeader("X-Filename", encodeURIComponent(t.filename));
-    t.xhr.setRequestHeader("X-Chunk-Index", t.currentChunk.toString());
-    t.xhr.setRequestHeader("X-Total-Chunks", t.totalChunks.toString());
-    t.xhr.setRequestHeader("X-Chunk-Offset", start.toString());
-    t.xhr.setRequestHeader("X-File-Size", t.file.size.toString());
+    xhr.open("POST", chunkUrl);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("X-Session-Id", t.sessionId);
+    xhr.setRequestHeader("X-Filename", encodeURIComponent(t.filename));
+    xhr.setRequestHeader("X-Chunk-Index", chunkIndex.toString());
+    xhr.setRequestHeader("X-Total-Chunks", t.totalChunks.toString());
+    xhr.setRequestHeader("X-Chunk-Offset", start.toString());
+    xhr.setRequestHeader("X-File-Size", t.file.size.toString());
+    if (t.useParallel) {
+      xhr.setRequestHeader("X-Parallel", "1");
+    }
     if (t.relativeDir) {
-      t.xhr.setRequestHeader("X-Relative-Dir", encodeURIComponent(t.relativeDir));
+      xhr.setRequestHeader("X-Relative-Dir", encodeURIComponent(t.relativeDir));
     }
 
     if (!t.lastSpeedUpdate) t.lastSpeedUpdate = Date.now();
-    if (t.lastLoaded === undefined) t.lastLoaded = start;
 
-    t.xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable && !t.paused && !t.cancelled) {
-        const now = Date.now();
-        const totalLoaded = Math.min(t.file.size, start + e.loaded);
-
-        if (now - t.lastUpdate > 150 || totalLoaded === t.file.size) {
-          t.lastUpdate = now;
-          const pct = t.file.size > 0 ? Math.round((totalLoaded / t.file.size) * 100) : 100;
-          if (t.barEl) t.barEl.style.width = pct + "%";
-          if (t.bytesEl) t.bytesEl.innerText = `${formatBytes(totalLoaded)} / ${formatBytes(t.file.size)}`;
-
-          const elapsedSec = (now - t.lastSpeedUpdate) / 1000;
-          if (elapsedSec >= 0.35) {
-            const bytesSinceLast = Math.max(0, totalLoaded - t.lastLoaded);
-            const instantBps = bytesSinceLast / elapsedSec;
-            t.emaBps = t.emaBps > 0 ? t.emaBps * 0.65 + instantBps * 0.35 : instantBps;
-            if (t.speedEl) t.speedEl.innerText = `${formatBytes(t.emaBps)}/s`;
-
-            const remaining = Math.max(0, t.file.size - totalLoaded);
-            const etaSec = t.emaBps > 0 ? Math.ceil(remaining / t.emaBps) : 0;
-            if (t.etaEl) {
-              t.etaEl.innerText = etaSec > 60
-                ? `ETA: ${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
-                : `ETA: ${etaSec}s`;
-            }
-
-            t.lastSpeedUpdate = now;
-            t.lastLoaded = totalLoaded;
-          }
-        }
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && !t.paused && !t.cancelled && !t.finished && !t.failed) {
+        t.chunkLoaded.set(chunkIndex, Math.min(chunk.size, e.loaded));
+        this.updateTransferUI(t, false);
       }
     });
 
-    t.xhr.addEventListener("load", () => {
-      if (t.cancelled || t.paused) return;
-      if (t.xhr.status >= 200 && t.xhr.status < 300) {
+    xhr.addEventListener("load", () => {
+      t.inFlightXhrs.delete(chunkIndex);
+      if (t.cancelled || t.paused || t.finished || t.failed) return;
+      if (xhr.status >= 200 && xhr.status < 300) {
         let resp = {};
         try {
-          resp = JSON.parse(t.xhr.responseText);
+          resp = JSON.parse(xhr.responseText);
         } catch (err) {}
+        t.completedChunks.add(chunkIndex);
+        t.chunkLoaded.delete(chunkIndex);
+        this.updateTransferUI(t, true);
         if (resp.completed) {
-          if (t.card) t.card.remove();
-          this.activeTransfers.delete(sessionId);
-          // Keep sessionId marked briefly so the matching SSE file_received event doesn't double-toast/duplicate history.
-          setTimeout(() => myUploadSessions.delete(sessionId), 5000);
-          this.checkIfDone();
-          try {
-            showToast(`Uploaded ${t.filename}`, "success");
-            if (resp.file) addSentHistoryItem(resp.file, !window.NEARBEAM_GUEST_DROP);
-            if (!window.NEARBEAM_GUEST_DROP && typeof fetchReceivedFiles === "function") fetchReceivedFiles();
-          } catch (e) {
-            console.error("Post-upload UI update failed:", e);
-          }
-        } else {
-          t.currentChunk++;
-          this.uploadNextChunk(sessionId);
+          this.completeTransfer(t, resp.file);
+        } else if (t.pendingChunks.length > 0) {
+          this.pumpChunks(sessionId);
+        } else if (t.inFlightXhrs.size === 0 && t.completedChunks.size >= t.totalChunks) {
+          this.completeTransfer(t, resp.file || null);
         }
       } else {
-        this.markTransferFailed(t, `Server status ${t.xhr.status}`);
+        t.chunkLoaded.delete(chunkIndex);
+        if (!t.completedChunks.has(chunkIndex) && !t.pendingChunks.includes(chunkIndex)) {
+          t.pendingChunks.unshift(chunkIndex);
+        }
+        this.markTransferFailed(t, `Server status ${xhr.status}`);
       }
     });
 
-    t.xhr.addEventListener("error", () => {
-      if (t.cancelled || t.paused) return;
+    xhr.addEventListener("error", () => {
+      t.inFlightXhrs.delete(chunkIndex);
+      if (t.cancelled || t.paused || t.finished || t.failed) return;
+      t.chunkLoaded.delete(chunkIndex);
+      if (!t.completedChunks.has(chunkIndex) && !t.pendingChunks.includes(chunkIndex)) {
+        t.pendingChunks.unshift(chunkIndex);
+      }
       this.markTransferFailed(t, "Connection error");
     });
 
-    t.xhr.send(chunk);
+    xhr.send(chunk);
   }
 }
 const transferManager = new TransferManager();
@@ -2557,12 +2721,15 @@ function renderReceivedFiles(files) {
 
     const name = document.createElement("div");
     name.className = "file-name";
-    name.title = file.filename;
+    name.title = file.folder ? `${file.folder}/${file.filename}` : file.filename;
     name.innerText = file.filename;
 
     const meta = document.createElement("div");
     meta.className = "file-meta";
-    meta.innerText = `${file.formatted_size} • ${file.modified}`;
+    const metaParts = [file.formatted_size];
+    if (file.folder) metaParts.push(file.folder);
+    if (file.modified) metaParts.push(file.modified);
+    meta.innerText = metaParts.join(" • ");
 
     details.appendChild(name);
     details.appendChild(meta);
@@ -2573,8 +2740,10 @@ function renderReceivedFiles(files) {
     const actions = document.createElement("div");
     actions.className = "file-card-actions";
 
-    const dlUrl = `/api/received/download/${encodeURIComponent(file.filename)}`;
-    const prevUrl = `/api/received/preview/${encodeURIComponent(file.filename)}`;
+    const relPath = file.rel_path || file.filename;
+    const encodedRelPath = relPath.split("/").map(encodeURIComponent).join("/");
+    const dlUrl = `/api/received/download/${encodedRelPath}`;
+    const prevUrl = `/api/received/preview/${encodedRelPath}`;
 
     const prevBtn = document.createElement("button");
     prevBtn.className = "card-action-btn";
