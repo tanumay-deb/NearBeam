@@ -400,6 +400,7 @@ class NearBeamServer:
         self.finished_uploads: "OrderedDict[str, dict]" = OrderedDict()
         self._session_locks: Dict[str, threading.Lock] = {}
         self._cancelled_uploads: "OrderedDict[str, float]" = OrderedDict()
+        self._parallel_sessions: Dict[str, Dict[str, Any]] = {}
 
         self.current_ip = get_local_ip()
         threading.Thread(target=self._watch_network, daemon=True).start()
@@ -564,6 +565,17 @@ class NearBeamServer:
                         except Exception:
                             pass
                 self.zip_jobs.clear()
+        if hasattr(self, "_upload_state_lock") and hasattr(self, "_parallel_sessions"):
+            with self._upload_state_lock:
+                sessions = list(self._parallel_sessions.values())
+                self._parallel_sessions.clear()
+            for sess in sessions:
+                tp = sess.get("temp_path")
+                if sess.get("active_writers", 0) == 0 and tp and os.path.exists(tp):
+                    try:
+                        os.remove(tp)
+                    except OSError:
+                        pass
 
     def _cleanup_old_zip_jobs(self):
         """Removes zip jobs older than 30 minutes to prevent temp disk buildup."""
@@ -1059,6 +1071,21 @@ class NearBeamServer:
             is_guest_drop=is_guest_drop,
         )
 
+        if request.headers.get("X-Parallel") == "1":
+            return self._receive_parallel_chunk(
+                session_id=session_id,
+                save_dir=save_dir,
+                dest_dir=dest_dir,
+                filename=filename,
+                relative_dir=relative_dir,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                offset=offset,
+                file_size=file_size,
+                peer=peer,
+                log_template=log_template,
+            )
+
         session_lock = self._get_session_lock(session_id)
         with session_lock:
             with self._upload_state_lock:
@@ -1144,40 +1171,240 @@ class NearBeamServer:
             if chunk_index < total_chunks - 1:
                 return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
 
-            final_path = finalize_upload(temp_path, dest_dir, filename)
-            final_name = os.path.basename(final_path)
-            total_bytes = os.path.getsize(final_path)
-
-            file_info = {
-                "filename": final_name,
-                "original_name": filename,
-                "size": total_bytes,
-                "formatted_size": format_size(total_bytes),
-                "saved_path": final_path,
-                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "category": get_file_type_category(final_name),
-            }
-            with self._upload_state_lock:
-                self.finished_uploads[session_id] = file_info
-                if len(self.finished_uploads) > 200:
-                    self.finished_uploads.popitem(last=False)
-                self.received_files_history.insert(0, file_info)
-                if len(self.received_files_history) > 100:
-                    self.received_files_history.pop()
-            config.add_transfer_history({
-                **file_info,
-                "direction": "received",
-                "peer": peer,
-                "status": "completed",
-            })
-
-            self.log_activity(log_template.format(name=final_name, size=format_size(total_bytes)), event_type="upload")
-            self.broadcast_event({
-                "type": "file_received",
-                "file": file_info,
-                "session_id": session_id,
-            })
+            file_info = self._complete_received_upload(
+                session_id=session_id,
+                temp_path=temp_path,
+                dest_dir=dest_dir,
+                filename=filename,
+                peer=peer,
+                log_template=log_template,
+            )
             return jsonify({"success": True, "completed": True, "file": file_info})
+
+    def _complete_received_upload(
+        self,
+        session_id: str,
+        temp_path: str,
+        dest_dir: str,
+        filename: str,
+        peer: str,
+        log_template: str,
+    ) -> dict:
+        final_path = finalize_upload(temp_path, dest_dir, filename)
+        final_name = os.path.basename(final_path)
+        total_bytes = os.path.getsize(final_path)
+
+        file_info = {
+            "filename": final_name,
+            "original_name": filename,
+            "size": total_bytes,
+            "formatted_size": format_size(total_bytes),
+            "saved_path": final_path,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "category": get_file_type_category(final_name),
+        }
+        with self._upload_state_lock:
+            self.finished_uploads[session_id] = file_info
+            if len(self.finished_uploads) > 200:
+                self.finished_uploads.popitem(last=False)
+            self.received_files_history.insert(0, file_info)
+            if len(self.received_files_history) > 100:
+                self.received_files_history.pop()
+        config.add_transfer_history({
+            **file_info,
+            "direction": "received",
+            "peer": peer,
+            "status": "completed",
+        })
+
+        self.log_activity(log_template.format(name=final_name, size=format_size(total_bytes)), event_type="upload")
+        self.broadcast_event({
+            "type": "file_received",
+            "file": file_info,
+            "session_id": session_id,
+        })
+        return file_info
+
+    def _prune_stale_parallel_sessions(self, max_age: float = 6 * 3600):
+        cutoff = time.time() - max_age
+        stale = []
+        with self._upload_state_lock:
+            for sid, sess in list(self._parallel_sessions.items()):
+                if sess.get("active_writers", 0) == 0 and sess.get("created_at", 0) < cutoff:
+                    stale.append(self._parallel_sessions.pop(sid))
+        for sess in stale:
+            tp = sess.get("temp_path")
+            if tp and os.path.exists(tp):
+                try:
+                    os.remove(tp)
+                except OSError:
+                    pass
+
+    def _receive_parallel_chunk(
+        self,
+        session_id: str,
+        save_dir: str,
+        dest_dir: str,
+        filename: str,
+        relative_dir: str,
+        chunk_index: int,
+        total_chunks: int,
+        offset: Optional[int],
+        file_size: Optional[int],
+        peer: str,
+        log_template: str,
+    ):
+        """Order-independent concurrent chunk writer backed by a pre-allocated .tmp file."""
+        if offset is None or file_size is None or offset > file_size:
+            return jsonify({"error": "Parallel uploads require valid X-Chunk-Offset and X-File-Size"}), 400
+
+        self._prune_stale_parallel_sessions()
+        session_lock = self._get_session_lock(session_id)
+        with session_lock:
+            with self._upload_state_lock:
+                if session_id in self._cancelled_uploads:
+                    return jsonify({"success": False, "cancelled": True}), 499
+                finished = self.finished_uploads.get(session_id)
+                if finished:
+                    return jsonify({"success": True, "completed": True, "file": finished})
+                sess = self._parallel_sessions.get(session_id)
+
+            if sess is None:
+                os.makedirs(save_dir, exist_ok=True)
+                temp_path = os.path.join(save_dir, f".{session_id}.tmp")
+                with open(temp_path, "wb") as prealloc:
+                    if file_size > 0:
+                        prealloc.truncate(file_size)
+                sess = {
+                    "temp_path": temp_path,
+                    "dest_dir": dest_dir,  # locked for session (e.g. across midnight in date mode)
+                    "filename": filename,
+                    "file_size": file_size,
+                    "total_chunks": total_chunks,
+                    "received_chunks": set(),
+                    "chunk_progress": {},
+                    "active_writers": 0,
+                    "finalized": False,
+                    "created_at": time.time(),
+                }
+                with self._upload_state_lock:
+                    self._parallel_sessions[session_id] = sess
+            else:
+                if (
+                    sess["file_size"] != file_size
+                    or sess["total_chunks"] != total_chunks
+                    or sess["filename"] != filename
+                ):
+                    return jsonify({"error": "Parallel session headers mismatch"}), 400
+                temp_path = sess["temp_path"]
+
+            sess["active_writers"] += 1
+
+        from_addr = request.remote_addr
+        read_size = 64 * 1024
+        last_emit = time.monotonic()
+        written = 0
+        cancelled = False
+        overflow = False
+        stream_failed = False
+
+        def emit_aggregate_progress(cur_written: int):
+            if file_size < 1024 * 1024:
+                return
+            with session_lock:
+                sess["chunk_progress"][chunk_index] = cur_written
+                total_received = sum(sess["chunk_progress"].values())
+            self.broadcast_event({
+                "type": "upload_progress",
+                "session_id": session_id,
+                "filename": filename,
+                "relative_dir": relative_dir,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "percent": round(min(total_received / file_size, 1.0) * 100, 1) if file_size > 0 else 100.0,
+                "received_bytes": min(total_received, file_size),
+                "total_bytes": file_size,
+                "from_addr": from_addr,
+            })
+
+        try:
+            with open(temp_path, "r+b", buffering=4 * 1024 * 1024) as f:
+                f.seek(offset)
+                stream = request.files["file"].stream if request.files.get("file") else request.stream
+                while True:
+                    if self._is_upload_cancelled(session_id):
+                        cancelled = True
+                        break
+                    data = stream.read(read_size)
+                    if not data:
+                        break
+                    if offset + written + len(data) > file_size:
+                        overflow = True
+                        break
+                    f.write(data)
+                    written += len(data)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.4:
+                        last_emit = now
+                        emit_aggregate_progress(written)
+        except Exception:
+            stream_failed = True
+            raise
+        finally:
+            # Handle is guaranteed closed here before we touch active_writers or rename on Windows.
+            finalize_now = False
+            cleanup_tmp = False
+            with session_lock:
+                sess["active_writers"] = max(0, sess["active_writers"] - 1)
+                is_cancelled = cancelled or self._is_upload_cancelled(session_id)
+                if is_cancelled:
+                    if sess["active_writers"] == 0:
+                        cleanup_tmp = True
+                        with self._upload_state_lock:
+                            self._parallel_sessions.pop(session_id, None)
+                elif overflow or stream_failed:
+                    if chunk_index not in sess["received_chunks"]:
+                        sess["chunk_progress"][chunk_index] = 0
+                else:
+                    sess["received_chunks"].add(chunk_index)
+                    sess["chunk_progress"][chunk_index] = written
+                    if (
+                        len(sess["received_chunks"]) == sess["total_chunks"]
+                        and sess["active_writers"] == 0
+                        and not sess["finalized"]
+                    ):
+                        sess["finalized"] = True
+                        finalize_now = True
+                        with self._upload_state_lock:
+                            self._parallel_sessions.pop(session_id, None)
+
+            if cleanup_tmp:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+
+        if cancelled or self._is_upload_cancelled(session_id):
+            return jsonify({"success": False, "cancelled": True}), 499
+        if overflow:
+            return jsonify({"error": "Chunk exceeds declared X-File-Size"}), 400
+
+        emit_aggregate_progress(written)
+
+        if finalize_now:
+            with session_lock:
+                file_info = self._complete_received_upload(
+                    session_id=session_id,
+                    temp_path=temp_path,
+                    dest_dir=sess["dest_dir"],
+                    filename=sess["filename"],
+                    peer=peer,
+                    log_template=log_template,
+                )
+            return jsonify({"success": True, "completed": True, "file": file_info})
+
+        return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
 
     def _register_routes(self):
         app = self.app
@@ -1947,6 +2174,25 @@ class NearBeamServer:
         def api_upload_status(session_id):
             if not _SESSION_ID_RE.fullmatch(session_id):
                 return jsonify({"received_bytes": 0})
+            with self._upload_state_lock:
+                finished = self.finished_uploads.get(session_id)
+                psess = self._parallel_sessions.get(session_id)
+            if finished:
+                return jsonify({
+                    "received_bytes": finished.get("size", 0),
+                    "received_chunks": [],
+                    "completed": True,
+                })
+            if psess is not None:
+                session_lock = self._get_session_lock(session_id)
+                with session_lock:
+                    recv_chunks = sorted(psess["received_chunks"])
+                    recv_bytes = sum(psess["chunk_progress"].values())
+                return jsonify({
+                    "received_bytes": recv_bytes,
+                    "received_chunks": recv_chunks,
+                    "completed": False,
+                })
             candidates = [
                 os.path.join(config.save_directory, f".{session_id}.tmp"),
                 os.path.join(config.save_directory, "Guest Drops", f".{session_id}.tmp"),
@@ -1955,8 +2201,8 @@ class NearBeamServer:
             for temp_path in candidates:
                 if os.path.exists(temp_path):
                     size = os.path.getsize(temp_path)
-                    return jsonify({"received_bytes": size})
-            return jsonify({"received_bytes": 0})
+                    return jsonify({"received_bytes": size, "received_chunks": [], "completed": False})
+            return jsonify({"received_bytes": 0, "received_chunks": [], "completed": False})
 
         @app.route("/api/upload/cancel", methods=["POST"])
         def api_upload_cancel():
@@ -1978,13 +2224,26 @@ class NearBeamServer:
                 session_lock = self._get_session_lock(session_id)
                 acquired = session_lock.acquire(blocking=False)
                 try:
-                    for temp_path in candidates:
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                                removed_tmp = True
-                            except OSError:
-                                pass
+                    can_delete = acquired
+                    if acquired:
+                        with self._upload_state_lock:
+                            psess = self._parallel_sessions.get(session_id)
+                            if psess is not None:
+                                if psess.get("active_writers", 0) == 0:
+                                    self._parallel_sessions.pop(session_id, None)
+                                    tp = psess.get("temp_path")
+                                    if tp and tp not in candidates:
+                                        candidates.insert(0, tp)
+                                else:
+                                    can_delete = False
+                    if can_delete:
+                        for temp_path in candidates:
+                            if os.path.exists(temp_path):
+                                try:
+                                    os.remove(temp_path)
+                                    removed_tmp = True
+                                except OSError:
+                                    pass
                 finally:
                     if acquired:
                         session_lock.release()
