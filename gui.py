@@ -5,6 +5,7 @@ Features High-DPI support, scrollable responsive cards, no-wrap buttons,
 and clean visual alignment.
 """
 
+import concurrent.futures
 import datetime
 import getpass
 import html
@@ -987,14 +988,16 @@ class MainWindow(QMainWindow):
             tx._emit_done(False, "Cancelled")
 
     def _start_outgoing(self, upload_url: str, target_name: str, file_paths: list[str]):
-        """Queues files to a peer PC; they're sent one after another on a worker thread."""
+        """Queues files to a peer PC: up to 3 small files concurrently, large files via 4-stream parallel chunks."""
         batch = []
+        local_device = get_hostname()
         for fp in file_paths:
             try:
                 tx = OutgoingTransfer(
                     upload_url,
                     target_name,
                     fp,
+                    device_name=local_device,
                 )
             except OSError as e:
                 self._append_log(f"Skipped '{os.path.basename(fp)}': {e}", "warning")
@@ -1011,7 +1014,19 @@ class MainWindow(QMainWindow):
         if not batch:
             return
         self._append_log(f"Sending {len(batch)} file(s) to {target_name}...", "info")
-        threading.Thread(target=lambda: [tx.run() for tx in batch], daemon=True).start()
+
+        def _dispatch(items):
+            small = [t for t in items if t.total < t.parallel_threshold]
+            large = [t for t in items if t.total >= t.parallel_threshold]
+            if small:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(small))) as pool:
+                    futs = [pool.submit(t.run) for t in small]
+                    for fut in futs:
+                        fut.result()
+            for t in large:
+                t.run()
+
+        threading.Thread(target=_dispatch, args=(batch,), daemon=True).start()
 
     def _add_active_row(self, tid: str, row, tx=None, **extra):
         self.transfers_page.active_box.addWidget(row)

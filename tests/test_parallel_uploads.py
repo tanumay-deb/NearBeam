@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from unittest import mock
@@ -200,6 +201,188 @@ class TestServerParallelChunks(unittest.TestCase):
             self.assertEqual([n for n in os.listdir(self.cfg.save_directory) if n.endswith(".tmp")], [])
         finally:
             httpd.shutdown()
+
+
+class TestOutgoingTransferParallel(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="nearbeam_outpar_")
+        self.save_dir = os.path.join(self.base, "recv")
+        self.cfg = ConfigManager(os.path.join(self.base, "cfg.json"))
+        self.cfg.set_save_directory(self.save_dir)
+        self.cfg.set_auto_save(True)
+        self.cfg.set_auto_organize_mode("off")
+        self.orig_config = srv_mod.config
+        srv_mod.config = self.cfg
+        self.server = NearBeamServer(port=0, enable_mesh=False)
+        self.observed_headers = []
+        self.observed_clients = []
+
+        orig_app = self.server.app
+
+        def recording_wsgi(environ, start_response):
+            if environ.get("PATH_INFO") == "/api/upload/chunk":
+                self.observed_headers.append({
+                    "parallel": environ.get("HTTP_X_PARALLEL"),
+                    "device": environ.get("HTTP_X_DEVICE_NAME"),
+                })
+                self.observed_clients.append(
+                    (environ.get("REMOTE_ADDR"), environ.get("REMOTE_PORT"))
+                )
+            return orig_app(environ, start_response)
+
+        self.httpd = make_server(
+            "127.0.0.1", 0, recording_wsgi, threaded=True, request_handler=NearBeamRequestHandler
+        )
+        self.port = self.httpd.server_port
+        self._srv_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._srv_thread.start()
+        self.url = f"http://127.0.0.1:{self.port}/api/upload"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.server.shutdown()
+        srv_mod.config = self.orig_config
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _make_file(self, name: str, size: int) -> str:
+        path = os.path.join(self.base, name)
+        with open(path, "wb") as f:
+            f.write(os.urandom(size))
+        return path
+
+    def test_large_file_uses_parallel_multi_stream_and_delivers_byte_identical(self):
+        from ui.transfer import OutgoingTransfer
+
+        mb = 1024 * 1024
+        src = self._make_file("parallel_20mb.bin", 20 * mb + 321)
+        progress = []
+        done = {}
+        tx = OutgoingTransfer(
+            self.url,
+            "peer",
+            src,
+            on_progress=lambda s, t, bps: progress.append(s),
+            on_done=lambda ok, msg: done.update(ok=ok, msg=msg),
+            chunk_size=2 * mb,
+            max_streams=4,
+            parallel_threshold=4 * mb,
+        )
+        tx.start()
+        tx.join(60)
+        self.assertTrue(done.get("ok"), done)
+        saved = os.path.join(self.save_dir, "parallel_20mb.bin")
+        with open(src, "rb") as f1, open(saved, "rb") as f2:
+            self.assertEqual(f2.read(), f1.read())
+        self.assertEqual(progress, sorted(progress))
+        self.assertEqual(progress[-1], os.path.getsize(src))
+        self.assertTrue(self.observed_headers)
+        self.assertTrue(all(h["parallel"] == "1" for h in self.observed_headers))
+
+    def test_keep_alive_reuses_tcp_connection(self):
+        from ui.transfer import OutgoingTransfer
+
+        mb = 1024 * 1024
+        src = self._make_file("keepalive.bin", 4 * mb)
+        done = {}
+        tx = OutgoingTransfer(
+            self.url,
+            "peer",
+            src,
+            on_done=lambda ok, msg: done.update(ok=ok, msg=msg),
+            chunk_size=1 * mb,
+            max_streams=1,
+            parallel_threshold=16 * mb,
+        )
+        tx.run()
+        self.assertTrue(done.get("ok"), done)
+        self.assertEqual(len(self.observed_clients), 4)
+        # All 4 sequential chunks reused a single HTTP/1.1 TCP socket (same client port)
+        self.assertEqual(len(set(self.observed_clients)), 1, self.observed_clients)
+
+    def test_parallel_pause_resume_and_mid_chunk_cancel(self):
+        from ui.transfer import OutgoingTransfer
+
+        mb = 1024 * 1024
+        # 1) Pause & resume in parallel mode
+        src = self._make_file("par_pause.bin", 12 * mb)
+        first_chunk = threading.Event()
+        done = {}
+
+        class PacedTransfer(OutgoingTransfer):
+            def _pieces(self, data):
+                for piece in super()._pieces(data):
+                    time.sleep(0.01)
+                    yield piece
+
+        tx = PacedTransfer(
+            self.url,
+            "peer",
+            src,
+            on_progress=lambda s, t, bps: first_chunk.set(),
+            on_done=lambda ok, msg: done.update(ok=ok, msg=msg),
+            chunk_size=1 * mb,
+            max_streams=3,
+            parallel_threshold=4 * mb,
+        )
+        tx.start()
+        self.assertTrue(first_chunk.wait(10))
+        tx.pause()
+        time.sleep(0.4)
+        stalled_at = tx.sent
+        time.sleep(0.3)
+        self.assertEqual(tx.sent, stalled_at)
+        self.assertLess(stalled_at, tx.total)
+        tx.resume()
+        tx.join(30)
+        self.assertTrue(done.get("ok"), done)
+        with open(src, "rb") as f1, open(os.path.join(self.save_dir, "par_pause.bin"), "rb") as f2:
+            self.assertEqual(f2.read(), f1.read())
+
+        # 2) Cancel mid-parallel upload
+        src2 = self._make_file("par_cancel.bin", 12 * mb)
+        done2 = {}
+        tx2 = PacedTransfer(
+            self.url,
+            "peer",
+            src2,
+            on_done=lambda ok, msg: done2.update(ok=ok, msg=msg),
+            chunk_size=1 * mb,
+            max_streams=4,
+            parallel_threshold=4 * mb,
+        )
+        tx2.start()
+        time.sleep(0.15)
+        tx2.cancel()
+        tx2.join(10)
+        self.assertEqual(done2.get("ok"), False)
+        self.assertEqual(done2.get("msg"), "Cancelled")
+        tmp = os.path.join(self.save_dir, f".{tx2.session_id}.tmp")
+        deadline = time.time() + 3
+        while os.path.exists(tmp) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(os.path.exists(tmp))
+        self.assertFalse(os.path.exists(os.path.join(self.save_dir, "par_cancel.bin")))
+
+    def test_device_name_header_integrates_with_auto_organize_device_mode(self):
+        from ui.transfer import OutgoingTransfer
+
+        self.cfg.set_auto_organize_mode("device")
+        src = self._make_file("clip.mp4", 64 * 1024)
+        done = {}
+        tx = OutgoingTransfer(
+            self.url,
+            "peer",
+            src,
+            on_done=lambda ok, msg: done.update(ok=ok, msg=msg),
+            device_name="Studio-PC",
+        )
+        tx.run()
+        self.assertTrue(done.get("ok"), done)
+        saved = os.path.join(self.save_dir, "Studio-PC", "clip.mp4")
+        self.assertTrue(os.path.isfile(saved))
+        with open(src, "rb") as f1, open(saved, "rb") as f2:
+            self.assertEqual(f2.read(), f1.read())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import mimetypes
 import os
 import queue
 import re
+import selectors
 import sys
 import tempfile
 import threading
@@ -31,7 +32,8 @@ from flask import (
     send_file,
 )
 from flask_cors import CORS
-from werkzeug.serving import WSGIRequestHandler
+from werkzeug.exceptions import InternalServerError
+from werkzeug.serving import WSGIRequestHandler, connection_dropped_errors
 from werkzeug.wsgi import FileWrapper
 import socket
 
@@ -44,12 +46,101 @@ def _high_speed_file_wrapper(file_obj, buffer_size: int = 4 * 1024 * 1024):
     return FileWrapper(file_obj, buffer_size=buffer_size)
 
 
+class _CountingReader:
+    """Wraps rfile for WSGI requests so NearBeamRequestHandler knows when the body was 100% consumed."""
+
+    def __init__(self, stream, expected_length: int):
+        self._stream = stream
+        self.expected_length = expected_length
+        self.bytes_read = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.expected_length - self.bytes_read)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            to_read = self.remaining
+        else:
+            to_read = min(size, self.remaining)
+        if to_read <= 0:
+            return b""
+        data = self._stream.read(to_read)
+        self.bytes_read += len(data)
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        to_read = self.remaining if (size is None or size < 0) else min(size, self.remaining)
+        fn = getattr(self._stream, "read1", self._stream.read)
+        data = fn(to_read)
+        self.bytes_read += len(data)
+        return data
+
+    def readinto(self, b) -> int:
+        if self.remaining <= 0:
+            return 0
+        view = memoryview(b)
+        if len(view) > self.remaining:
+            view = view[:self.remaining]
+        if hasattr(self._stream, "readinto"):
+            n = self._stream.readinto(view)
+            if n:
+                self.bytes_read += n
+            return n or 0
+        data = self._stream.read(len(view))
+        n = len(data)
+        view[:n] = data
+        self.bytes_read += n
+        return n
+
+    def readline(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        limit = self.remaining if (size is None or size < 0) else min(size, self.remaining)
+        data = self._stream.readline(limit)
+        self.bytes_read += len(data)
+        return data
+
+    def readlines(self, hint: int = -1):
+        lines = []
+        total = 0
+        while self.remaining > 0:
+            line = self.readline()
+            if not line:
+                break
+            lines.append(line)
+            total += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def close(self):
+        # Never close the shared socket rfile on keep-alive connections
+        pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
 class NearBeamRequestHandler(WSGIRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 60
+    keep_alive_timeout = 15.0
 
     def setup(self):
         super().setup()
+        self._requests_handled = 0
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -57,10 +148,199 @@ class NearBeamRequestHandler(WSGIRequestHandler):
         except Exception:
             pass
 
+    def handle_one_request(self):
+        if getattr(self, "_requests_handled", 0) > 0:
+            # Wait for the next keep-alive request in short slices so server shutdown never hangs
+            deadline = time.monotonic() + self.keep_alive_timeout
+            sel = selectors.DefaultSelector()
+            try:
+                sel.register(self.connection, selectors.EVENT_READ)
+                ready = False
+                while time.monotonic() < deadline:
+                    shut_down = getattr(self.server, "_BaseServer__is_shut_down", None)
+                    if shut_down is not None and shut_down.is_set():
+                        self.close_connection = True
+                        return
+                    if sel.select(timeout=0.25):
+                        ready = True
+                        break
+                if not ready:
+                    self.close_connection = True
+                    return
+            except OSError:
+                self.close_connection = True
+                return
+            finally:
+                sel.close()
+        self._requests_handled = getattr(self, "_requests_handled", 0) + 1
+        super().handle_one_request()
+
     def make_environ(self):
         env = super().make_environ()
         env["wsgi.file_wrapper"] = _high_speed_file_wrapper
         return env
+
+    def run_wsgi(self) -> None:
+        if self.headers.get("Expect", "").lower().strip() == "100-continue":
+            self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+        self.environ = environ = self.make_environ()
+        conn_hdr = (self.headers.get("Connection") or "").lower()
+        transfer_enc = (self.headers.get("Transfer-Encoding") or "").lower()
+        want_keep_alive = (
+            self.request_version >= "HTTP/1.1"
+            and "keep-alive" in conn_hdr
+            and "close" not in conn_hdr
+            and "chunked" not in transfer_enc
+        )
+        reader: Optional[_CountingReader] = None
+        if want_keep_alive:
+            raw_cl = self.headers.get("Content-Length")
+            try:
+                expected_len = int(raw_cl) if raw_cl is not None else 0
+                if expected_len < 0:
+                    want_keep_alive = False
+                else:
+                    reader = _CountingReader(self.rfile, expected_len)
+                    environ["wsgi.input"] = reader
+            except ValueError:
+                want_keep_alive = False
+
+        status_set = None
+        headers_set = None
+        status_sent = None
+        headers_sent = None
+        chunk_response = False
+        keep_alive = False
+
+        def write(data: bytes) -> None:
+            nonlocal status_sent, headers_sent, chunk_response, keep_alive
+            assert status_set is not None, "write() before start_response"
+            assert headers_set is not None, "write() before start_response"
+            if status_sent is None:
+                status_sent = status_set
+                headers_sent = headers_set
+                try:
+                    code_str, msg = status_sent.split(None, 1)
+                except ValueError:
+                    code_str, msg = status_sent, ""
+                code = int(code_str)
+                self.send_response(code, msg)
+                header_keys = set()
+                content_type = ""
+                for key, value in headers_sent:
+                    lk = key.lower()
+                    if lk == "connection":
+                        continue
+                    self.send_header(key, value)
+                    header_keys.add(lk)
+                    if lk == "content-type":
+                        content_type = value.lower()
+
+                framed_no_chunk = (
+                    "content-length" in header_keys
+                    or environ["REQUEST_METHOD"] == "HEAD"
+                    or (100 <= code < 200)
+                    or code in {204, 304}
+                )
+                if not framed_no_chunk and self.protocol_version >= "HTTP/1.1":
+                    chunk_response = True
+                    self.send_header("Transfer-Encoding", "chunked")
+
+                is_sse = "text/event-stream" in content_type
+                can_keep_alive = (
+                    want_keep_alive
+                    and reader is not None
+                    and reader.remaining == 0
+                    and code < 400
+                    and not is_sse
+                    and (framed_no_chunk or chunk_response)
+                )
+                if can_keep_alive:
+                    keep_alive = True
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Keep-Alive", f"timeout={int(self.keep_alive_timeout)}")
+                    self.close_connection = False
+                else:
+                    keep_alive = False
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                self.end_headers()
+
+            assert isinstance(data, bytes), "applications must write bytes"
+            if data:
+                if chunk_response:
+                    self.wfile.write(hex(len(data))[2:].encode())
+                    self.wfile.write(b"\r\n")
+                self.wfile.write(data)
+                if chunk_response:
+                    self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+        def start_response(status, headers, exc_info=None):
+            nonlocal status_set, headers_set
+            if exc_info:
+                try:
+                    if headers_sent:
+                        raise exc_info[1].with_traceback(exc_info[2])
+                finally:
+                    exc_info = None
+            elif headers_set:
+                raise AssertionError("Headers already set")
+            status_set = status
+            headers_set = headers
+            return write
+
+        def execute(app) -> None:
+            application_iter = app(environ, start_response)
+            try:
+                for data in application_iter:
+                    write(data)
+                if not headers_sent:
+                    write(b"")
+                if chunk_response:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+            finally:
+                if not keep_alive:
+                    selector = selectors.DefaultSelector()
+                    try:
+                        selector.register(self.connection, selectors.EVENT_READ)
+                        total_size = 0
+                        total_reads = 0
+                        while selector.select(timeout=0.01):
+                            data = self.rfile.read(10_000_000)
+                            total_size += len(data)
+                            total_reads += 1
+                            if not data or total_size >= 10_000_000_000 or total_reads > 1000:
+                                break
+                    except OSError:
+                        pass
+                    finally:
+                        selector.close()
+
+                if hasattr(application_iter, "close"):
+                    application_iter.close()
+
+        try:
+            execute(self.server.app)
+        except connection_dropped_errors as e:
+            self.close_connection = True
+            self.connection_dropped(e, environ)
+        except Exception as e:
+            self.close_connection = True
+            if self.server.passthrough_errors:
+                raise
+            try:
+                if status_sent is None:
+                    status_set = None
+                    headers_set = None
+                execute(InternalServerError())
+            except Exception:
+                pass
+            from werkzeug.debug.tbtools import DebugTraceback
+            msg = DebugTraceback(e).render_traceback_text()
+            self.server.log("error", f"Error on request:\n{msg}")
 
 PRECOMPRESSED_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
