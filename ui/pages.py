@@ -3,6 +3,7 @@
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -308,7 +309,15 @@ class ClipboardPage(Page):
 
 
 class SettingsPage(Page):
-    def __init__(self, save_dir: str, autosave: bool, clipboard: bool, shell_menu: bool, autostart: bool):
+    def __init__(
+        self,
+        save_dir: str,
+        autosave: bool,
+        clipboard: bool,
+        shell_menu: bool,
+        autostart: bool,
+        organize_mode: str = "off",
+    ):
         super().__init__("Settings")
 
         receiving = Card(spacing=8)
@@ -325,6 +334,26 @@ class SettingsPage(Page):
         receiving.body.addLayout(dir_row)
         self.autosave = ToggleRow("Auto-save incoming files", "Save files from your devices straight into this folder.", autosave)
         receiving.body.addWidget(self.autosave)
+
+        org_row = QHBoxLayout()
+        org_text = QVBoxLayout()
+        org_text.setSpacing(2)
+        org_text.addWidget(label("Auto-organize received files"))
+        org_text.addWidget(label("Sort loose incoming files into subfolders automatically. Folder uploads stay intact.", "dim", wrap=True))
+        org_row.addLayout(org_text, 1)
+        self.cmb_organize = QComboBox()
+        self.cmb_organize.setMinimumWidth(220)
+        for text_label, mode_val in (
+            ("Off (single folder)", "off"),
+            ("By file type (Photos, Videos...)", "type"),
+            ("By date (YYYY-MM-DD)", "date"),
+            ("By device (iPhone, Laptop...)", "device"),
+        ):
+            self.cmb_organize.addItem(text_label, mode_val)
+        sel_idx = self.cmb_organize.findData(organize_mode)
+        self.cmb_organize.setCurrentIndex(sel_idx if sel_idx >= 0 else 0)
+        org_row.addWidget(self.cmb_organize, 0, Qt.AlignVCenter)
+        receiving.body.addLayout(org_row)
         self.body.addWidget(receiving)
 
         clip = Card(spacing=4)

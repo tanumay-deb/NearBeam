@@ -111,6 +111,17 @@ QLineEdit {{
     color: {TEXT}; padding: 7px 10px; selection-background-color: {ACCENT_FILL};
 }}
 QLineEdit:focus {{ border-color: {ACCENT}; }}
+QComboBox {{
+    background-color: {RAISED}; border: 1px solid {BORDER_STRONG}; border-radius: 8px;
+    color: {TEXT}; padding: 7px 12px; font-weight: 500;
+}}
+QComboBox:hover, QComboBox:focus {{ border-color: {ACCENT}; }}
+QComboBox::drop-down {{ border: none; width: 24px; }}
+QComboBox QAbstractItemView {{
+    background-color: {RAISED}; border: 1px solid {BORDER_STRONG}; color: {TEXT};
+    selection-background-color: rgba(56, 189, 248, 0.20); selection-color: {TEXT};
+    outline: 0; padding: 4px;
+}}
 QTextEdit, QPlainTextEdit {{
     background-color: {RAISED}; border: 1px solid {BORDER}; border-radius: 8px;
     color: {TEXT}; padding: 8px 10px; selection-background-color: {ACCENT_FILL};

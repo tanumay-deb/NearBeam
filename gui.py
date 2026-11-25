@@ -403,6 +403,7 @@ class MainWindow(QMainWindow):
             config.clipboard_sync_enabled,
             is_shell_integration_enabled(),
             is_autostart_enabled(),
+            config.auto_organize_mode,
         )
         for page in (self.home, self.transfers_page, self.shared_page, self.clipboard_page, self.settings_page):
             self.stack.addWidget(page)
@@ -439,6 +440,8 @@ class MainWindow(QMainWindow):
         s.btn_open_dir.clicked.connect(self._open_save_folder)
         self.chk_autosave = s.autosave.switch
         self.chk_autosave.toggled.connect(self._toggle_autosave)
+        self.cmb_organize = s.cmb_organize
+        self.cmb_organize.currentIndexChanged.connect(self._change_auto_organize)
         self.chk_clipboard_sync = s.clipboard.switch
         self.chk_clipboard_sync.toggled.connect(lambda on: self._set_clipboard_switches(on))
         self.clipboard_page.sync_row.switch.toggled.connect(lambda on: self._set_clipboard_switches(on))
@@ -1220,6 +1223,12 @@ class MainWindow(QMainWindow):
         config.set_auto_save(checked)
         state_str = "ENABLED" if checked else "DISABLED"
         self._append_log(f"Auto-Save setting updated: {state_str}", "info")
+
+    def _change_auto_organize(self, _index: int):
+        mode = self.cmb_organize.currentData() or "off"
+        config.set_auto_organize_mode(mode)
+        label_text = self.cmb_organize.currentText()
+        self._append_log(f"Auto-Organize Received updated: {label_text}", "info")
 
     def _set_clipboard_switches(self, on: bool):
         """Keeps the Settings and Clipboard page switches in step."""

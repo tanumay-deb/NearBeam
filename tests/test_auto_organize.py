@@ -179,5 +179,52 @@ class TestAutoOrganizeConfigAndRouting(unittest.TestCase):
         self.assertEqual(self.client.get("/api/received/preview/Photos/.partial.tmp").status_code, 404)
 
 
+class TestAutoOrganizeSettingsGui(unittest.TestCase):
+    def test_settings_dropdown_defaults_off_and_updates_config(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import gui
+
+        app = QApplication.instance() or QApplication([])
+        tmp = tempfile.mkdtemp(prefix="nb_org_gui_")
+        cfg = ConfigManager(os.path.join(tmp, "cfg.json"))
+        cfg.set_save_directory(os.path.join(tmp, "recv"))
+        orig = (gui.config, srv_mod.config, gui.NearBeamServer)
+        gui.config = srv_mod.config = cfg
+        gui.NearBeamServer = lambda port: srv_mod.NearBeamServer(port=port, enable_mesh=False)
+        win = None
+        try:
+            win = gui.MainWindow()
+            app.processEvents()
+            cmb = win.settings_page.cmb_organize
+            self.assertEqual(cmb.currentData(), "off")
+
+            idx_type = cmb.findData("type")
+            self.assertGreaterEqual(idx_type, 0)
+            cmb.setCurrentIndex(idx_type)
+            app.processEvents()
+            self.assertEqual(cfg.auto_organize_mode, "type")
+
+            idx_date = cmb.findData("date")
+            self.assertGreaterEqual(idx_date, 0)
+            cmb.setCurrentIndex(idx_date)
+            app.processEvents()
+            self.assertEqual(cfg.auto_organize_mode, "date")
+
+            idx_dev = cmb.findData("device")
+            self.assertGreaterEqual(idx_dev, 0)
+            cmb.setCurrentIndex(idx_dev)
+            app.processEvents()
+            self.assertEqual(cfg.auto_organize_mode, "device")
+        finally:
+            if win is not None:
+                win.tray_icon.hide()
+                win._clean_exit()
+                win.deleteLater()
+                app.processEvents()
+            gui.config, srv_mod.config, gui.NearBeamServer = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
