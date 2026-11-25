@@ -5,7 +5,9 @@
 import io
 import os
 import shutil
+import sys
 import tempfile
+import time
 import unittest
 
 from PIL import Image
@@ -65,6 +67,97 @@ class TestThumbnails(unittest.TestCase):
     def test_path_traversal_is_refused(self):
         self.assertIn(self._thumb("../cfg.json").status_code, (403, 404))
         self.assertIn(self._thumb("..\\cfg.json").status_code, (403, 404))
+
+
+class TestNativeThumbnailsModule(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nearbeam_thumbs_mod_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_is_thumbnailable_extensions(self):
+        from core.thumbnails import is_thumbnailable
+
+        for name in ("photo.jpg", "IMG.JPEG", "pic.png", "anim.gif", "hero.webp", "scan.bmp"):
+            self.assertTrue(is_thumbnailable(name), name)
+
+        for name in ("notes.txt", "archive.zip", "data.bin", "Makefile", ""):
+            self.assertFalse(is_thumbnailable(name), name)
+
+        for name in ("clip.mp4", "report.pdf", "IMG_0001.HEIC", "deck.pptx", "raw.dng"):
+            expected = sys.platform == "win32"
+            self.assertEqual(is_thumbnailable(name), expected, name)
+
+    def test_pillow_fast_path_and_negative_cache(self):
+        from core.thumbnails import make_thumbnail
+
+        make_thumbnail.cache_clear()
+        good = os.path.join(self.tmp, "good.jpg")
+        Image.new("RGB", (1200, 800), (20, 140, 220)).save(good, "JPEG", quality=92)
+        st = os.stat(good)
+        data = make_thumbnail(good, st.st_mtime_ns, st.st_size)
+        self.assertTrue(data)
+        img = Image.open(io.BytesIO(data))
+        self.assertLessEqual(max(img.size), 320)
+
+        bad = os.path.join(self.tmp, "corrupt.jpg")
+        with open(bad, "wb") as f:
+            f.write(b"not-a-valid-image-payload")
+        st_bad = os.stat(bad)
+        self.assertEqual(make_thumbnail(bad, st_bad.st_mtime_ns, st_bad.st_size), b"")
+
+    def test_bgra_to_jpeg_handles_alpha_and_resizing(self):
+        from core.thumbnails import _bgra_to_jpeg
+
+        # 640x480 semi-transparent red in BGRA order (B=0, G=0, R=255, A=128)
+        raw_bgra = bytes([0, 0, 255, 128]) * (640 * 480)
+        jpeg = _bgra_to_jpeg(raw_bgra, 640, 480)
+        self.assertTrue(jpeg)
+        img = Image.open(io.BytesIO(jpeg))
+        self.assertEqual(img.format, "JPEG")
+        self.assertLessEqual(max(img.size), 320)
+        self.assertEqual(img.mode, "RGB")
+
+    def test_windows_shell_timeout_returns_empty_without_hanging(self):
+        from core.thumbnails import _WindowsShellThumbnailPool
+
+        def slow_extractor(_path):
+            time.sleep(2.0)
+            return b"late"
+
+        pool = _WindowsShellThumbnailPool(workers=1, extractor=slow_extractor, init_com=False)
+        try:
+            t0 = time.monotonic()
+            out = pool.generate("dummy.mp4", timeout=0.1)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(out, b"")
+            self.assertLess(elapsed, 0.8)
+        finally:
+            pool.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Shell COM thumbnails require Windows")
+    def test_real_windows_shell_extractor_handles_real_image_and_unsupported_file(self):
+        from core.thumbnails import _WindowsShellThumbnailPool
+
+        jpg = os.path.join(self.tmp, "shell_test.jpg")
+        Image.new("RGB", (600, 400), (220, 90, 40)).save(jpg, "JPEG", quality=90)
+        txt = os.path.join(self.tmp, "plain.txt")
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("just plain text without embedded thumbnail")
+
+        pool = _WindowsShellThumbnailPool(workers=1)
+        try:
+            jpg_bytes = pool.generate(jpg, timeout=5.0)
+            self.assertTrue(jpg_bytes, "Windows Shell failed to thumbnail a real JPEG")
+            img = Image.open(io.BytesIO(jpg_bytes))
+            self.assertEqual(img.format, "JPEG")
+            self.assertLessEqual(max(img.size), 320)
+
+            txt_bytes = pool.generate(txt, timeout=5.0)
+            self.assertEqual(txt_bytes, b"", "SIIGBF_THUMBNAILONLY must not return generic file icons")
+        finally:
+            pool.shutdown()
 
 
 if __name__ == "__main__":
