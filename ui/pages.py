@@ -1,5 +1,7 @@
 """Control Panel pages. Pages only lay out widgets; MainWindow owns the behaviour."""
 
+import html
+
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QScrollArea,
+    QSizePolicy,
     QTableWidget,
     QTextEdit,
     QVBoxLayout,
@@ -150,15 +153,22 @@ class HomePage(Page):
             row.addWidget(icon_label("send", theme.ACCENT, 18), 0, Qt.AlignVCenter)
             info = QVBoxLayout()
             info.setSpacing(2)
-            info.addWidget(label(batch.get("label", "Files")))
+            batch_label = batch.get("label", "Files")
+            title_lbl = label(batch_label)
+            title_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            title_lbl.setToolTip(f"<span>{html.escape(batch_label)}</span>")
+            info.addWidget(title_lbl)
             fcount = batch.get("file_count", 0)
             fword = "1 file" if fcount == 1 else f"{fcount} files"
             dl = int(batch.get("download_count") or 0)
             dl_part = f" · Downloaded {dl}×" if dl > 0 else ""
             meta_txt = f"{fword} · {batch.get('formatted_size', '0 B')} · Sent {batch.get('created_at', '')}{dl_part}"
-            info.addWidget(label(meta_txt, "dim"))
+            meta_lbl = label(meta_txt, "dim")
+            meta_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            meta_lbl.setToolTip(f"<span>{html.escape(meta_txt)}</span>")
+            info.addWidget(meta_lbl)
             row.addLayout(info, 1)
-            clear_btn = icon_button("x", f"Remove {batch.get('label', 'batch')}")
+            clear_btn = icon_button("x", f"<span>{html.escape('Remove ' + batch_label)}</span>")
             clear_btn.setFixedSize(28, 28)
             bid = batch.get("id", "")
             clear_btn.clicked.connect(lambda _=False, batch_id=bid: on_clear(batch_id))

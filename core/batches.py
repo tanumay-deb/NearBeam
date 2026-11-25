@@ -6,6 +6,8 @@ Keeps one-off drops/sends completely separate from permanent Safe List folders.
 from collections import OrderedDict
 import datetime
 import os
+import stat
+import sys
 import threading
 import time
 import uuid
@@ -54,6 +56,24 @@ def _inside_folder(root_real: str, path: str) -> bool:
         return os.path.commonpath([root_real, os.path.realpath(path)]) == root_real
     except ValueError:
         return False
+
+
+_WIN_LINK_REPARSE_TAGS = (
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+)
+
+
+def _is_link_or_junction(path: str) -> bool:
+    try:
+        if os.path.islink(path):
+            return True
+        if sys.platform == "win32":
+            st = os.lstat(path)
+            return getattr(st, "st_reparse_tag", 0) in _WIN_LINK_REPARSE_TAGS
+    except OSError:
+        return True
+    return False
 
 
 def _unique_rel_path(candidate: str, used: set[str]) -> str:
@@ -118,9 +138,20 @@ class BatchStore:
                 expanded.append((real_root, os.path.basename(real_root)))
             elif os.path.isdir(real_root):
                 root_name = os.path.basename(real_root.rstrip("/\\")) or "folder"
+                seen_dirs = {real_root}
                 for walk_root, dirnames, filenames in os.walk(real_root):
-                    # Prune external junctions / symlinks in-place so we never walk outside real_root
-                    dirnames[:] = [d for d in dirnames if _inside_folder(real_root, os.path.join(walk_root, d))]
+                    # Prune external junctions / symlinks AND internal junction cycles in-place
+                    kept = []
+                    for d in dirnames:
+                        dp = os.path.join(walk_root, d)
+                        if _is_link_or_junction(dp) or not _inside_folder(real_root, dp):
+                            continue
+                        real_d = os.path.realpath(dp)
+                        if real_d in seen_dirs:
+                            continue
+                        seen_dirs.add(real_d)
+                        kept.append(d)
+                    dirnames[:] = kept
                     for fname in filenames:
                         fpath = os.path.join(walk_root, fname)
                         if not _inside_folder(real_root, fpath):

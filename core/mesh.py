@@ -79,6 +79,7 @@ class MeshManager:
         self.started_at = time.time()  # older leader wins when two leaders meet
         self.electing = False
         self._beacon_count = 0
+        self._missed_leader_heartbeats = 0
         self.leader_info: Optional[dict] = None
         self.nodes: dict[str, MeshNode] = {}
 
@@ -268,12 +269,18 @@ class MeshManager:
                         step_down_target = other
                 else:
                     # While leaders coexist, every node picks the same (oldest) one instead of
-                    # following whichever announced last.
+                    # following whichever announced last — unless the current leader already missed a heartbeat.
                     current = self.leader_info
-                    if current and current.get("node_id") != other["node_id"] and _rank(other) >= _rank(current):
+                    if (
+                        current
+                        and self._missed_leader_heartbeats == 0
+                        and current.get("node_id") != other["node_id"]
+                        and _rank(other) >= _rank(current)
+                    ):
                         return
                     changed = not current or current.get("node_id") != other["node_id"]
                     self.leader_info = other
+                    self._missed_leader_heartbeats = 0
                     should_register = changed and not self.electing  # during election _discover_and_elect registers
             if step_down_target is not None:
                 self._step_down(step_down_target)
@@ -301,6 +308,7 @@ class MeshManager:
         with self._lock:
             self.role = "node"
             self.leader_info = leader
+            self._missed_leader_heartbeats = 0
             self.nodes.clear()
         print(f"  [Mesh] Another Leader found: {leader.get('name')} ({leader.get('ip')}). Joining it as a Secondary Node.")
         threading.Thread(target=self._register_with_leader, daemon=True).start()
@@ -309,7 +317,46 @@ class MeshManager:
         if self.on_nodes_change:
             self.on_nodes_change(self.get_nodes_list())
 
-    def _register_with_leader(self):
+    def _update_leader_metadata_locked(self, data: dict):
+        """Keeps leader_info synchronized if a leader restarted on the same IP:port."""
+        if not self.leader_info or not isinstance(data, dict):
+            return
+        if data.get("leader_id"):
+            self.leader_info["node_id"] = data["leader_id"]
+        if data.get("leader_name"):
+            self.leader_info["name"] = data["leader_name"]
+        if data.get("leader_started_at") is not None:
+            self.leader_info["started_at"] = data["leader_started_at"]
+
+    def _handle_not_leader_response(self, err_data: dict, allow_redirect: bool = True):
+        """Re-anchors a secondary node if its target stepped down to non-leader."""
+        redirect = err_data.get("leader") if isinstance(err_data, dict) else None
+        if (
+            allow_redirect
+            and isinstance(redirect, dict)
+            and redirect.get("ip")
+            and redirect.get("port")
+            and redirect.get("node_id") != self.node_id
+        ):
+            with self._lock:
+                self.leader_info = {
+                    "node_id": redirect.get("node_id"),
+                    "name": redirect.get("name", "Primary PC"),
+                    "ip": redirect["ip"],
+                    "port": redirect["port"],
+                    "started_at": redirect.get("started_at") or 0,
+                }
+                self._missed_leader_heartbeats = 0
+            self._register_with_leader(allow_redirect=False)
+            return
+        # No valid redirect target: clear stale leader and run discovery/promotion.
+        with self._lock:
+            self.leader_info = None
+            self._missed_leader_heartbeats = 0
+        if self.running and not self._stop_event.is_set():
+            self._discover_and_elect()
+
+    def _register_with_leader(self, allow_redirect: bool = True):
         """Sends HTTP registration request to Primary Leader."""
         with self._lock:
             leader = dict(self.leader_info) if self.leader_info else None
@@ -333,14 +380,28 @@ class MeshManager:
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
+                    body = json.loads(resp.read() or b"{}")
+                    if body.get("leader_role") and body.get("leader_role") != "leader":
+                        self._handle_not_leader_response(body, allow_redirect=allow_redirect)
+                        return
+                    with self._lock:
+                        self._update_leader_metadata_locked(body)
+                        self._missed_leader_heartbeats = 0
                     print(f"  [Mesh] Registered successfully with Leader @ {leader['ip']}:{leader['port']}")
+        except urllib.error.HTTPError as he:
+            if he.code == 409:
+                try:
+                    err_body = json.loads(he.read() or b"{}")
+                except Exception:
+                    err_body = {}
+                self._handle_not_leader_response(err_body, allow_redirect=allow_redirect)
+            else:
+                print(f"  [Mesh] Registration with Leader failed: {he}")
         except Exception as e:
             print(f"  [Mesh] Registration with Leader failed: {e}")
 
     def _heartbeat_loop(self):
         """Sends periodic heartbeats if Node, or cleans dead nodes if Leader."""
-        missed_leader_heartbeats = 0
-
         while self.running and not self._stop_event.wait(HEARTBEAT_INTERVAL):
             with self._lock:
                 role = self.role
@@ -361,19 +422,47 @@ class MeshManager:
                         if not self.running:
                             break
                         if resp.status == 200:
-                            missed_leader_heartbeats = 0
+                            body = json.loads(resp.read() or b"{}")
+                            if body.get("leader_role") and body.get("leader_role") != "leader":
+                                self._handle_not_leader_response(body)
+                                continue
+                            with self._lock:
+                                self._missed_leader_heartbeats = 0
+                                self._update_leader_metadata_locked(body)
                             # Leader restarted or merged and doesn't know us: register again.
-                            if json.loads(resp.read() or b"{}").get("updated") is False:
+                            if body.get("updated") is False:
                                 self._register_with_leader()
+                except urllib.error.HTTPError as he:
+                    if not self.running:
+                        break
+                    if he.code == 409:
+                        try:
+                            err_body = json.loads(he.read() or b"{}")
+                        except Exception:
+                            err_body = {}
+                        self._handle_not_leader_response(err_body)
+                        continue
+                    with self._lock:
+                        self._missed_leader_heartbeats += 1
+                        missed = self._missed_leader_heartbeats
+                    print(f"  [Mesh] Missed heartbeat to Leader ({missed}/5)")
+                    if missed >= 5:
+                        print("  [Mesh] Leader is unreachable! Promoting self to Primary Leader.")
+                        with self._lock:
+                            self._missed_leader_heartbeats = 0
+                        self.promote_to_leader()
                 except Exception:
                     if not self.running:
                         break
-                    missed_leader_heartbeats += 1
-                    print(f"  [Mesh] Missed heartbeat to Leader ({missed_leader_heartbeats}/5)")
+                    with self._lock:
+                        self._missed_leader_heartbeats += 1
+                        missed = self._missed_leader_heartbeats
+                    print(f"  [Mesh] Missed heartbeat to Leader ({missed}/5)")
 
-                    if missed_leader_heartbeats >= 5:
+                    if missed >= 5:
                         print("  [Mesh] Leader is unreachable! Promoting self to Primary Leader.")
-                        missed_leader_heartbeats = 0  # else a later step-down re-promotes on its first miss
+                        with self._lock:
+                            self._missed_leader_heartbeats = 0
                         self.promote_to_leader()
 
             elif role == "leader":
@@ -422,6 +511,8 @@ class MeshManager:
     def register_node(self, node_or_dict) -> bool:
         """Adds or updates a node in the leader's registry."""
         with self._lock:
+            if self.role != "leader":
+                return False
             if isinstance(node_or_dict, dict):
                 node = MeshNode(
                     node_id=node_or_dict["node_id"],
@@ -442,6 +533,8 @@ class MeshManager:
     def update_heartbeat(self, node_id: str) -> bool:
         """Updates last_seen timestamp for an active node."""
         with self._lock:
+            if self.role != "leader":
+                return False
             if node_id in self.nodes:
                 self.nodes[node_id].last_seen = time.time()
                 return True
@@ -501,6 +594,13 @@ class MeshManager:
                 nodes_list.append(leader_entry)
 
             return nodes_list
+
+    def note_remote_clipboard(self, text: str = "", image_base64: Optional[str] = None):
+        """Records clipboard content received from a peer so re-copying an older item later isn't dropped."""
+        if not text and not image_base64:
+            return
+        with self._lock:
+            self._last_synced_clipboard_hash = hash((text or "", image_base64 or ""))
 
     def broadcast_clipboard_mesh(
         self,

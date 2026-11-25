@@ -9,6 +9,7 @@ from collections import deque
 import http.client
 import json
 import os
+import selectors
 import socket
 import threading
 import time
@@ -28,6 +29,7 @@ _RETRYABLE_CONN_ERRORS = (
     http.client.CannotSendRequest,
     http.client.BadStatusLine,
     http.client.ResponseNotReady,
+    http.client.IncompleteRead,
     BrokenPipeError,
     ConnectionResetError,
     ConnectionAbortedError,
@@ -56,7 +58,7 @@ class OutgoingTransfer:
         self.cancel_url = self.chunk_url[: -len("/chunk")] + "/cancel"
         parsed = urllib.parse.urlsplit(self.chunk_url)
         self._scheme = (parsed.scheme or "http").lower()
-        self._host = parsed.hostname or "127.0.0.1"
+        self._host = urllib.parse.unquote(parsed.hostname or "127.0.0.1")
         self._port = parsed.port or (443 if self._scheme == "https" else 80)
         self._chunk_path = parsed.path or "/api/upload/chunk"
         if parsed.query:
@@ -86,10 +88,14 @@ class OutgoingTransfer:
         self._remote_started = False
         self._done_lock = threading.Lock()
         self._done_emitted = False
+        self._done_event = threading.Event()
         self._progress_lock = threading.Lock()
         self._pause_lock = threading.Lock()
         self._paused_since: Optional[float] = None
         self._paused_total = 0.0
+        self._in_flight = 0
+        self._conns_lock = threading.Lock()
+        self._active_conns: set[http.client.HTTPConnection] = set()
         self._chunk_bytes: dict[int, int] = {}
         self._thread: Optional[threading.Thread] = None
 
@@ -103,9 +109,10 @@ class OutgoingTransfer:
 
     def pause(self):
         with self._pause_lock:
-            if self._resume.is_set():
-                self._paused_since = time.monotonic()
             self._resume.clear()
+            # Only start accumulating paused time once no chunk is actively transmitting.
+            if self._in_flight == 0 and self._paused_since is None:
+                self._paused_since = time.monotonic()
 
     def resume(self):
         with self._pause_lock:
@@ -117,6 +124,20 @@ class OutgoingTransfer:
     def cancel(self):
         self._cancelled = True
         self.resume()  # wake paused workers so they exit immediately
+        # Immediately interrupt any blocked socket send/getresponse instead of waiting 60s.
+        with self._conns_lock:
+            conns = list(self._active_conns)
+        for conn in conns:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def _emit_done(self, ok: bool, msg: str):
         with self._done_lock:
@@ -128,6 +149,8 @@ class OutgoingTransfer:
     def join(self, timeout: Optional[float] = None):
         if self._thread:
             self._thread.join(timeout)
+        elif self._started:
+            self._done_event.wait(timeout)
 
     def _active_elapsed(self, t0: float) -> float:
         with self._pause_lock:
@@ -146,12 +169,24 @@ class OutgoingTransfer:
                 conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             except OSError:
                 pass
+        with self._conns_lock:
+            self._active_conns.add(conn)
+        if self._cancelled:
+            with self._conns_lock:
+                self._active_conns.discard(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise _Cancelled()
         return conn
 
     def _close_connection(self, conn_holder: list):
         conn = conn_holder[0]
         conn_holder[0] = None
         if conn is not None:
+            with self._conns_lock:
+                self._active_conns.discard(conn)
             try:
                 conn.close()
             except Exception:
@@ -197,6 +232,22 @@ class OutgoingTransfer:
                 self._remote_started = True
                 for piece in self._pieces(data):
                     conn.send(piece)
+                # Poll socket readability in 0.25s slices before getresponse() so cancel()
+                # aborts a silent/blackholed peer in <= 0.25s instead of blocking 60s.
+                if conn.sock is not None:
+                    sel = selectors.DefaultSelector()
+                    try:
+                        sel.register(conn.sock, selectors.EVENT_READ)
+                        resp_deadline = time.monotonic() + 60.0
+                        while time.monotonic() < resp_deadline:
+                            if self._cancelled:
+                                raise _Cancelled()
+                            if sel.select(timeout=0.25):
+                                break
+                        else:
+                            raise TimeoutError("Timed out waiting for peer response")
+                    finally:
+                        sel.close()
                 resp = conn.getresponse()
                 body = resp.read()
                 status = resp.status
@@ -234,54 +285,76 @@ class OutgoingTransfer:
             bps = current_sent / self._active_elapsed(t0)
             self.on_progress(current_sent, self.total, bps)
 
+    def _begin_in_flight(self):
+        with self._pause_lock:
+            self._in_flight += 1
+
+    def _end_in_flight(self):
+        with self._pause_lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            if self._in_flight == 0 and not self._resume.is_set() and self._paused_since is None:
+                self._paused_since = time.monotonic()
+
     def run(self):
         self._started = True
-        if self._cancelled:
-            self._emit_done(False, "Cancelled")
-            return
-        total_chunks = max(1, (self.total + self.chunk_size - 1) // self.chunk_size)
-        use_parallel = (
-            self.total >= self.parallel_threshold
-            and total_chunks > 1
-            and self.max_streams > 1
-        )
-        t0 = time.monotonic()
-        with self._pause_lock:
-            self._paused_total = 0.0
-            self._paused_since = None if self._resume.is_set() else t0
-
         try:
-            if use_parallel:
-                self._run_parallel(total_chunks, t0)
-            else:
-                self._run_sequential(total_chunks, t0)
-
             if self._cancelled:
-                if self._remote_started:
-                    self._abort_remote()
                 self._emit_done(False, "Cancelled")
                 return
-            self._emit_done(True, "")
-        except Exception as e:
-            if self._cancelled or isinstance(e, _Cancelled):
-                if self._remote_started:
-                    self._abort_remote()
-                self._emit_done(False, "Cancelled")
-            else:
-                self._emit_done(False, str(e))
+            total_chunks = max(1, (self.total + self.chunk_size - 1) // self.chunk_size)
+            use_parallel = (
+                self.total >= self.parallel_threshold
+                and total_chunks > 1
+                and self.max_streams > 1
+            )
+            t0 = time.monotonic()
+            with self._pause_lock:
+                self._paused_total = 0.0
+                self._in_flight = 0
+                self._paused_since = None if self._resume.is_set() else t0
+
+            try:
+                if use_parallel:
+                    self._run_parallel(total_chunks, t0)
+                else:
+                    self._run_sequential(total_chunks, t0)
+
+                if self._cancelled:
+                    if self._remote_started:
+                        self._abort_remote()
+                    self._emit_done(False, "Cancelled")
+                    return
+                self._emit_done(True, "")
+            except Exception as e:
+                if self._cancelled or isinstance(e, _Cancelled):
+                    if self._remote_started:
+                        self._abort_remote()
+                    self._emit_done(False, "Cancelled")
+                else:
+                    if self._remote_started:
+                        self._abort_remote(timeout=2.0)
+                    self._emit_done(False, str(e))
+        finally:
+            self._done_event.set()
 
     def _run_sequential(self, total_chunks: int, t0: float):
         conn_holder = [None]
         try:
             with open(self.file_path, "rb", buffering=self.chunk_size) as f:
                 for idx in range(total_chunks):
-                    self._resume.wait()
+                    while not self._resume.wait(0.2):
+                        if self._cancelled:
+                            raise _Cancelled()
                     if self._cancelled:
                         raise _Cancelled()
                     offset = idx * self.chunk_size
                     f.seek(offset)
                     data = f.read(self.chunk_size)
-                    self._post_chunk(conn_holder, idx, total_chunks, offset, data, parallel=False)
+                    self._begin_in_flight()
+                    try:
+                        self._post_chunk(conn_holder, idx, total_chunks, offset, data, parallel=False)
+                    finally:
+                        self._end_in_flight()
                     if self._cancelled:
                         raise _Cancelled()
                     self._record_chunk_done(idx, len(data), t0)
@@ -300,7 +373,9 @@ class OutgoingTransfer:
             try:
                 with open(self.file_path, "rb") as f:
                     while not self._cancelled and not stop_event.is_set():
-                        self._resume.wait()
+                        while not self._resume.wait(0.2):
+                            if self._cancelled or stop_event.is_set():
+                                return
                         if self._cancelled or stop_event.is_set():
                             return
                         with queue_lock:
@@ -310,7 +385,11 @@ class OutgoingTransfer:
                         offset = idx * self.chunk_size
                         f.seek(offset)
                         data = f.read(self.chunk_size)
-                        self._post_chunk(conn_holder, idx, total_chunks, offset, data, parallel=True)
+                        self._begin_in_flight()
+                        try:
+                            self._post_chunk(conn_holder, idx, total_chunks, offset, data, parallel=True)
+                        finally:
+                            self._end_in_flight()
                         if self._cancelled or stop_event.is_set():
                             return
                         self._record_chunk_done(idx, len(data), t0)
@@ -322,7 +401,6 @@ class OutgoingTransfer:
                     if first_error[0] is None:
                         first_error[0] = exc
                 stop_event.set()
-                # Unblock any sibling workers paused in _resume.wait() so join() never hangs.
                 self._resume.set()
             finally:
                 self._close_connection(conn_holder)
@@ -345,7 +423,7 @@ class OutgoingTransfer:
                 raise _Cancelled()
             yield data[i:i + PIECE_SIZE]
 
-    def _abort_remote(self):
+    def _abort_remote(self, timeout: float = 2.0):
         """Ask the receiver to delete its partial temp file."""
         try:
             req = urllib.request.Request(
@@ -354,6 +432,6 @@ class OutgoingTransfer:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=10.0).close()
+            urllib.request.urlopen(req, timeout=timeout).close()
         except Exception:
             pass

@@ -71,6 +71,8 @@ def get_all_local_ips() -> list[str]:
 
 def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
     """Checks if a given port is available for binding."""
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             # On Windows SO_REUSEADDR lets a bind succeed on a port another server is

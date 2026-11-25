@@ -62,13 +62,6 @@ const fileInput = document.getElementById("fileInput");
 const folderInput = document.getElementById("folderInput");
 const btnSelectFiles = document.getElementById("btnSelectFiles");
 const btnSelectFolder = document.getElementById("btnSelectFolder");
-const uploadProgressCard = document.getElementById("uploadProgressCard");
-const progressFileName = document.getElementById("progressFileName");
-const progressSpeed = document.getElementById("progressSpeed");
-const progressPct = document.getElementById("progressPct");
-const progressBarFill = document.getElementById("progressBarFill");
-const progressTransferred = document.getElementById("progressTransferred");
-const progressEta = document.getElementById("progressEta");
 const sentList = document.getElementById("sentList");
 const btnRetryAllFailed = document.getElementById("btnRetryAllFailed");
 const btnClearHistory = document.getElementById("btnClearHistory");
@@ -122,6 +115,10 @@ const zipBytesCount = document.getElementById("zipBytesCount");
 
 let activeZipJobId = null;
 let zipProgressTimer = null;
+let zipJobCompleted = false;
+let zipModalSeq = 0;
+let safeBrowseSeq = 0;
+let previewSeq = 0;
 const ZIP_RING_CIRCUMFERENCE = 326.7;
 
 // Theme
@@ -164,7 +161,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // Helper to switch active tab programmatically
-function activateTab(targetId) {
+function activateTab(targetId, fetchOnOpen = true) {
   const tabBtns = document.querySelectorAll(".tab-btn");
   const tabPanes = document.querySelectorAll(".tab-pane");
   tabBtns.forEach((b) => {
@@ -175,8 +172,10 @@ function activateTab(targetId) {
     if (p.id === targetId) p.classList.add("active");
     else p.classList.remove("active");
   });
-  if (targetId === "tab-received") fetchReceivedFiles();
-  else if (targetId === "tab-clipboard") fetchClipboard();
+  if (fetchOnOpen) {
+    if (targetId === "tab-received") fetchReceivedFiles();
+    else if (targetId === "tab-clipboard") fetchClipboard();
+  }
 }
 
 function setupHeroDashboardActions() {
@@ -284,6 +283,7 @@ async function fetchServerInfo() {
     }
 
     if (serverInfo.nearby_devices) {
+      nearbyDevices = serverInfo.nearby_devices;
       renderNearbyDevicesDashboard(serverInfo.nearby_devices);
     }
   } catch (e) {
@@ -329,6 +329,7 @@ function getParentSubpath(subpath) {
 }
 
 function showAllSafeFolders(pushHistory = true) {
+  safeBrowseSeq++;
   currentFolderId = "";
   currentSubpath = "";
   currentBatchId = "";
@@ -486,7 +487,7 @@ async function fetchSendBatches(showNewToast = false) {
         updated.file_count !== currentBatchMeta.file_count ||
         updated.total_bytes !== currentBatchMeta.total_bytes
       ) {
-        openSendBatch(currentBatchId, false);
+        openSendBatch(currentBatchId, false, false);
       }
     }
   } catch (e) {
@@ -605,9 +606,10 @@ function renderIncomingBatches() {
   });
 }
 
-async function openSendBatch(batchId, pushHistory = true) {
+async function openSendBatch(batchId, pushHistory = true, switchTab = true) {
   if (!batchId) return;
-  activateTab("tab-safelist");
+  const seq = ++safeBrowseSeq;
+  if (switchTab) activateTab("tab-safelist");
   currentBatchId = batchId;
   currentFolderId = "";
   currentSubpath = "";
@@ -625,6 +627,7 @@ async function openSendBatch(batchId, pushHistory = true) {
 
   try {
     const res = await fetch(`/api/batches/${encodeURIComponent(batchId)}/items`);
+    if (seq !== safeBrowseSeq) return;
     if (!res.ok) {
       safeItemsCache = [];
       currentBatchMeta = null;
@@ -634,6 +637,7 @@ async function openSendBatch(batchId, pushHistory = true) {
       return;
     }
     const data = await res.json();
+    if (seq !== safeBrowseSeq) return;
     currentBatchMeta = data.batch || null;
     safeItemsCache = data.items || [];
     browseType = "all";
@@ -641,6 +645,7 @@ async function openSendBatch(batchId, pushHistory = true) {
     if (browseToolbar) browseToolbar.hidden = false;
     applyBrowseView();
   } catch (e) {
+    if (seq !== safeBrowseSeq) return;
     renderSafeEmptyState("Error loading send batch: " + e.message);
   }
 }
@@ -753,9 +758,11 @@ async function fetchSafeFolders() {
         }
         showAllSafeFolders(false);
       }
-    } else {
+    } else if (cachedSafeFolders.some((f) => f.id === currentFolderId)) {
       selectSafeFolder.value = currentFolderId;
       browseSafeFolder(currentFolderId, currentSubpath, false);
+    } else {
+      showAllSafeFolders(false);
     }
   } catch (e) {
     renderSafeEmptyState("Error loading safe list folders.");
@@ -803,6 +810,8 @@ if (btnDownloadFolderZip) {
 }
 
 function openZipProgressModal(folderName) {
+  zipJobCompleted = false;
+  zipModalSeq++;
   if (zipModalFolderText) zipModalFolderText.innerText = folderName;
   if (zipProgressCircle) {
     zipProgressCircle.style.strokeDashoffset = ZIP_RING_CIRCUMFERENCE;
@@ -839,18 +848,21 @@ async function cancelZipDownload() {
     clearInterval(zipProgressTimer);
     zipProgressTimer = null;
   }
-  if (activeZipJobId) {
-    const jid = activeZipJobId;
-    activeZipJobId = null;
-    try {
-      await fetch("/api/safelist/cancel-zip", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jid }),
-      });
-    } catch (e) {
-      // Ignore network errors on cancel
-    }
+  if (zipJobCompleted || !activeZipJobId) {
+    zipJobCompleted = false;
+    closeZipProgressModal();
+    return;
+  }
+  const jid = activeZipJobId;
+  activeZipJobId = null;
+  try {
+    await fetch("/api/safelist/cancel-zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jid }),
+    });
+  } catch (e) {
+    // Ignore network errors on cancel
   }
   closeZipProgressModal();
   showToast("ZIP preparation cancelled", "info");
@@ -961,6 +973,9 @@ function pollZipProgress(jobId, folderName, initialFiles, initialBytes) {
       } else if (progress.status === "completed") {
         clearInterval(zipProgressTimer);
         zipProgressTimer = null;
+        zipJobCompleted = true;
+        activeZipJobId = null;
+        const completedModalSeq = zipModalSeq;
 
         if (zipProgressCircle) {
           zipProgressCircle.style.strokeDashoffset = 0;
@@ -973,6 +988,7 @@ function pollZipProgress(jobId, folderName, initialFiles, initialBytes) {
           zipStatusBadge.style.color = "var(--accent-emerald)";
         }
         if (zipCurrentFile) zipCurrentFile.innerText = "Archive ready! Starting download...";
+        if (btnCancelZipLabel) btnCancelZipLabel.innerText = "Close";
         if (zipFilesCount) {
           zipFilesCount.innerText = `${progress.total_files || initialFiles} / ${progress.total_files || initialFiles} files`;
         }
@@ -993,7 +1009,7 @@ function pollZipProgress(jobId, folderName, initialFiles, initialBytes) {
 
         // Automatically close modal after 1.8 seconds
         setTimeout(() => {
-          if (activeZipJobId === jobId) {
+          if (zipModalSeq === completedModalSeq) {
             closeZipProgressModal();
           }
         }, 1800);
@@ -1041,13 +1057,17 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
     return;
   }
 
+  const seq = ++safeBrowseSeq;
   currentBatchId = "";
   currentBatchMeta = null;
   currentFolderId = folderId;
   currentSubpath = subpath;
   setSelectMode(false, false);
   if (selectSafeFolder) selectSafeFolder.value = folderId;
-  if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "inline-flex";
+  const rootEntry = cachedSafeFolders.find((f) => f.id === folderId);
+  if (btnDownloadFolderZip) {
+    btnDownloadFolderZip.style.display = rootEntry && rootEntry.is_file ? "none" : "inline-flex";
+  }
 
   // Update Back button state
   if (btnSafeBack) {
@@ -1068,6 +1088,7 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
   try {
     const url = `/api/safelist/browse?folder_id=${encodeURIComponent(folderId)}&subpath=${encodeURIComponent(subpath)}`;
     const res = await fetch(url);
+    if (seq !== safeBrowseSeq) return;
     if (!res.ok) {
       safeItemsCache = [];
       if (browseToolbar) browseToolbar.hidden = true;
@@ -1082,12 +1103,14 @@ async function browseSafeFolder(folderId, subpath = "", pushHistory = true) {
     }
 
     const data = await res.json();
+    if (seq !== safeBrowseSeq) return;
     renderBreadcrumbs(data.breadcrumbs || []);
     safeItemsCache = data.items || [];
     browseType = "all";
     if (browseToolbar) browseToolbar.hidden = false;
     applyBrowseView();
   } catch (e) {
+    if (seq !== safeBrowseSeq) return;
     renderSafeEmptyState("Error browsing folder: " + e.message);
   }
 }
@@ -2069,7 +2092,9 @@ class TransferManager {
   totalActiveStreams() {
     let used = 0;
     for (const t of this.activeTransfers.values()) {
-      if (!t.paused) used += t.maxStreams || 1;
+      if (!t.paused) {
+        if (!t.waitingForSlot) used += t.maxStreams || 1;
+      }
     }
     return used;
   }
@@ -2118,6 +2143,7 @@ class TransferManager {
       inFlightXhrs: new Map(),
       chunkLoaded: new Map(),
       paused: false,
+      waitingForSlot: false,
       cancelled: false,
       finished: false,
       failed: false,
@@ -2150,13 +2176,27 @@ class TransferManager {
   }
 
   processQueue() {
+    // First wake any resumed active transfers that were waiting for stream budget.
+    for (const t of this.activeTransfers.values()) {
+      if (t.waitingForSlot && !t.paused && !t.cancelled && !t.finished && !t.failed) {
+        const usedStreams = this.totalActiveStreams();
+        const needed = t.maxStreams || 1;
+        if (usedStreams + needed <= this.maxTotalStreams || usedStreams === 0) {
+          t.waitingForSlot = false;
+          t.lastSpeedUpdate = Date.now();
+          if (t.speedEl) t.speedEl.innerText = "Resuming…";
+          this.pumpChunks(t.sessionId);
+        }
+      }
+    }
+
     while (this.queue.length > 0) {
       const usedStreams = this.totalActiveStreams();
       let idx = -1;
       for (let i = 0; i < this.queue.length; i++) {
         const candidate = this.queue[i];
         const needed = candidate.maxStreams || 1;
-        if (usedStreams + needed <= this.maxTotalStreams || this.activeTransfers.size === 0) {
+        if (usedStreams + needed <= this.maxTotalStreams || usedStreams === 0) {
           idx = i;
           break;
         }
@@ -2247,6 +2287,7 @@ class TransferManager {
     t.paused = !t.paused;
     t.pauseBtn.innerText = t.paused ? "Resume" : "Pause";
     if (t.paused) {
+      t.waitingForSlot = false;
       if (t.speedEl) t.speedEl.innerText = "Paused";
       if (t.etaEl) t.etaEl.innerText = "ETA: --";
       this.abortInFlight(t, true);
@@ -2257,6 +2298,13 @@ class TransferManager {
       t.highWaterLoaded = committed;
       t.lastLoaded = committed;
       t.lastSpeedUpdate = Date.now();
+      const usedWithoutSelf = this.totalActiveStreams() - (t.maxStreams || 1);
+      if (usedWithoutSelf > 0 && usedWithoutSelf + (t.maxStreams || 1) > this.maxTotalStreams) {
+        t.waitingForSlot = true;
+        if (t.speedEl) t.speedEl.innerText = "Queued…";
+        return;
+      }
+      t.waitingForSlot = false;
       if (t.speedEl) t.speedEl.innerText = "Resuming…";
       this.pumpChunks(sessionId);
     }
@@ -2267,11 +2315,14 @@ class TransferManager {
   }
 
   cancelTransfer(sessionId) {
-    myUploadSessions.delete(sessionId);
+    // Keep sessionId marked briefly so late SSE upload_progress/file_received won't spawn an incoming row.
+    setTimeout(() => myUploadSessions.delete(sessionId), 5000);
+    removeIncomingProgress(sessionId);
     const t = this.activeTransfers.get(sessionId);
     let cancelBaseUrl = "";
     if (t) {
       t.cancelled = true;
+      t.waitingForSlot = false;
       cancelBaseUrl = this.getCancelBaseUrl(t.uploadUrl);
       this.abortInFlight(t, false);
       if (t.card) t.card.remove();
@@ -2354,9 +2405,11 @@ class TransferManager {
 
     const completed = new Set(item.completedChunks || []);
     const cancelBaseUrl = this.getCancelBaseUrl(item.uploadUrl);
+    let statusChecked = false;
     try {
       const res = await fetch(`${cancelBaseUrl}/api/upload/status/${encodeURIComponent(sessionId)}`);
       if (res.ok) {
+        statusChecked = true;
         const status = await res.json();
         if (status && status.completed) {
           setTimeout(() => myUploadSessions.delete(sessionId), 5000);
@@ -2393,9 +2446,22 @@ class TransferManager {
       }
     } catch (e) {}
 
+    // If the server has no resumable chunks (e.g. restarted leaving a stale .tmp on disk),
+    // clean up the old session and start cleanly with a fresh sessionId so parallel chunks never hit 409.
+    let nextSessionId = item.sessionId;
+    if (statusChecked && completed.size === 0) {
+      fetch(`${cancelBaseUrl}/api/upload/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      }).catch(() => {});
+      setTimeout(() => myUploadSessions.delete(sessionId), 5000);
+      nextSessionId = uuidv4();
+    }
+
     // Resume by sending only missing chunks
     this.addTransfer(
-      item.sessionId,
+      nextSessionId,
       item.filename,
       item.file,
       item.uploadUrl,
@@ -2413,7 +2479,8 @@ class TransferManager {
   dismissFailedTransfer(sessionId) {
     const item = this.failedTransfers.get(sessionId);
     this.failedTransfers.delete(sessionId);
-    myUploadSessions.delete(sessionId);
+    setTimeout(() => myUploadSessions.delete(sessionId), 5000);
+    removeIncomingProgress(sessionId);
     if (item) {
       const cancelBaseUrl = this.getCancelBaseUrl(item.uploadUrl);
       fetch(`${cancelBaseUrl}/api/upload/cancel`, {
@@ -2452,11 +2519,15 @@ class TransferManager {
       if (t.speedEl) t.speedEl.innerText = `${formatBytes(t.emaBps)}/s`;
 
       const remaining = Math.max(0, t.file.size - totalLoaded);
-      const etaSec = t.emaBps > 0 ? Math.ceil(remaining / t.emaBps) : 0;
       if (t.etaEl) {
-        t.etaEl.innerText = etaSec > 60
-          ? `ETA: ${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
-          : `ETA: ${etaSec}s`;
+        if (remaining > 0 && t.emaBps <= 0) {
+          t.etaEl.innerText = "ETA: --";
+        } else {
+          const etaSec = t.emaBps > 0 ? Math.ceil(remaining / t.emaBps) : 0;
+          t.etaEl.innerText = etaSec > 60
+            ? `ETA: ${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
+            : `ETA: ${etaSec}s`;
+        }
       }
 
       t.lastSpeedUpdate = now;
@@ -2826,6 +2897,7 @@ function renderReceivedFiles(files) {
 
 let clipboardDebounceTimer = null;
 let isUpdatingFromSSE = false;
+let lastServerClipboardText = "";
 
 function setupClipboardSync() {
   if (!chkKeepSyncingClipboard) return;
@@ -2864,6 +2936,7 @@ function setupClipboardSync() {
 
       clearTimeout(clipboardDebounceTimer);
       clipboardDebounceTimer = setTimeout(() => {
+        clipboardDebounceTimer = null;
         sendClipboardData(clipboardTextarea.value, false);
       }, 350);
     });
@@ -3047,6 +3120,7 @@ async function sendClipboardData(text, showToastNotification = true) {
       body: JSON.stringify({ text }),
     });
     if (res.ok) {
+      lastServerClipboardText = text;
       if (syncLiveStatus && chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked) {
         syncLiveStatus.className = "sync-live-status";
         syncLiveStatus.innerText = "● Auto-Sync Active";
@@ -3079,7 +3153,10 @@ async function fetchClipboard() {
     const res = await fetch("/api/clipboard");
     if (!res.ok) return;
     const data = await res.json();
-    if (clipboardTextarea && data.text !== undefined && data.text !== clipboardTextarea.value) {
+    if (data.text !== undefined) {
+      lastServerClipboardText = data.text;
+    }
+    if (clipboardTextarea && data.text !== undefined && data.text !== clipboardTextarea.value && clipboardDebounceTimer === null) {
       isUpdatingFromSSE = true;
       clipboardTextarea.value = data.text;
       isUpdatingFromSSE = false;
@@ -3124,11 +3201,23 @@ function setupSSE() {
   if (!window.EventSource) return;
 
   const eventSource = new EventSource("/api/events");
+  let sseDisconnected = false;
 
   eventSource.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
-      if (data.type === "file_received") {
+      if (data.type === "connected") {
+        if (sseDisconnected) {
+          sseDisconnected = false;
+          if (incomingTransfersList) incomingTransfersList.innerHTML = "";
+          if (incomingTransferCard) incomingTransferCard.classList.add("hidden");
+          fetchReceivedFiles();
+          fetchClipboard();
+          fetchSendBatches(false);
+          fetchSafeFolders();
+          fetchMeshNodes();
+        }
+      } else if (data.type === "file_received") {
         removeIncomingProgress(data.session_id);
         if (!myUploadSessions.has(data.session_id)) {
           if (data.file) {
@@ -3157,7 +3246,11 @@ function setupSSE() {
           fetchNearbyDevices();
         }
       } else if (data.type === "clipboard_updated") {
-        if (clipboardTextarea && data.text !== undefined && data.text !== clipboardTextarea.value) {
+        const textChanged = data.text !== undefined && data.text !== lastServerClipboardText;
+        if (data.text !== undefined) {
+          lastServerClipboardText = data.text;
+        }
+        if (clipboardTextarea && textChanged && data.text !== clipboardTextarea.value && clipboardDebounceTimer === null) {
           isUpdatingFromSSE = true;
           clipboardTextarea.value = data.text;
           isUpdatingFromSSE = false;
@@ -3167,8 +3260,8 @@ function setupSSE() {
           clipboardUpdatedTime.innerText = `Synced just now (${data.updated_at})`;
         }
 
-        // Auto-copy to device clipboard if keep syncing is enabled and window has focus
-        if (chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked && data.text) {
+        // Auto-copy to device clipboard only when text actually changed and window has focus
+        if (textChanged && chkKeepSyncingClipboard && chkKeepSyncingClipboard.checked && data.text) {
           if (navigator.clipboard && document.hasFocus()) {
             navigator.clipboard.writeText(data.text).catch(() => {});
           }
@@ -3190,6 +3283,7 @@ function setupSSE() {
   };
 
   eventSource.onerror = () => {
+    sseDisconnected = true;
     // Reconnects automatically
   };
 }
@@ -3242,6 +3336,7 @@ function removeIncomingProgress(sessionId) {
 // --- Modals Setup ---
 
 function closePreviewModal() {
+  previewSeq++;
   if (!previewModal) return;
   previewModal.classList.add("hidden");
   if (previewModalBody) {
@@ -3312,6 +3407,7 @@ function setupModalEvents() {
 const TEXT_PREVIEW_EXTS = new Set(["txt", "md", "csv", "log"]);
 
 async function openPreviewModal(title, category, previewUrl, downloadUrl) {
+  const seq = ++previewSeq;
   previewModalTitle.innerText = title;
   previewModalBody.innerHTML = "<p>Loading preview...</p>";
   btnModalDownload.href = downloadUrl;
@@ -3341,11 +3437,14 @@ async function openPreviewModal(title, category, previewUrl, downloadUrl) {
   } else if (category === "code" || TEXT_PREVIEW_EXTS.has(ext)) {
     try {
       const res = await fetch(previewUrl);
+      if (seq !== previewSeq) return;
       const text = await res.text();
+      if (seq !== previewSeq) return;
       // Show first 50KB if huge
       const snippet = text.length > 50000 ? text.slice(0, 50000) + "\n\n... (file preview truncated)" : text;
       previewModalBody.innerHTML = `<pre><code>${escapeHtml(snippet)}</code></pre>`;
     } catch (e) {
+      if (seq !== previewSeq) return;
       previewModalBody.innerHTML = `<p>Unable to preview this file inline.</p>`;
     }
   } else {

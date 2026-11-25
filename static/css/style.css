@@ -419,6 +419,8 @@ body {
 
 .section-header-flex {
   display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 24px;
@@ -1937,6 +1939,14 @@ body {
   font-weight: 700;
   color: #34d399;
   letter-spacing: 0.2px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .mesh-cluster-pill {
+    display: none;
+  }
 }
 
 .mesh-dot {

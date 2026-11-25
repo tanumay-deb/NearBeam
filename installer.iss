@@ -68,3 +68,19 @@ Root: HKCU; Subkey: "Software\Classes\Directory\shell\NearBeam\command"; ValueTy
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[UninstallDelete]
+; Clean up SendTo / Start Menu shortcuts even if created later via NearBeam Settings
+Type: files; Name: "{userappdata}\Microsoft\Windows\SendTo\{#MyAppName}.lnk"
+Type: files; Name: "{autoprograms}\{#MyAppName}.lnk"
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\*\shell\NearBeam');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\shell\NearBeam');
+  end;
+end;

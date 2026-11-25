@@ -1,5 +1,6 @@
 """Small reusable widgets for the Control Panel."""
 
+import html
 import os
 import sys
 from functools import lru_cache
@@ -369,7 +370,9 @@ class _DropMixin:
         repolish(self)
 
     def dragEnterEvent(self, event):
-        if event.mimeData() and event.mimeData().hasUrls():
+        if event.mimeData() and event.mimeData().hasUrls() and any(
+            u.isLocalFile() and os.path.exists(u.toLocalFile()) for u in event.mimeData().urls()
+        ):
             event.acceptProposedAction()
             self._set_over(True)
 
@@ -414,7 +417,7 @@ class DeviceCard(_DropMixin, QFrame):
         super().__init__()
         self.device = device
         self.setProperty("row", True)
-        self.setMinimumWidth(200)
+        self.setMinimumWidth(160)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._init_drop()
         row = QHBoxLayout(self)
@@ -430,7 +433,7 @@ class DeviceCard(_DropMixin, QFrame):
         if device.get("is_self"):
             name_text = name_text.removesuffix(" (This PC)")  # mesh adds it; the card shows its own tag
         name = label(name_text)
-        name.setToolTip(name_text)
+        name.setToolTip(f"<span>{html.escape(name_text)}</span>")
         name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         text.addWidget(name)
         tags = QHBoxLayout()
@@ -445,7 +448,7 @@ class DeviceCard(_DropMixin, QFrame):
         row.addLayout(text, 1)
         if not device.get("is_self"):
             tip = f"Send files to {device.get('name')}" if device.get("kind") == "host" else f"Share files with {device.get('name')}"
-            send = icon_button("send", tip, theme.ACCENT)
+            send = icon_button("send", f"<span>{html.escape(tip)}</span>", theme.ACCENT)
             send.clicked.connect(self.send_clicked.emit)
             row.addWidget(send)
 
@@ -482,7 +485,7 @@ class TransferRow(QFrame):
         mid.setSpacing(4)
         top = QHBoxLayout()
         self.name = label(filename)
-        self.name.setToolTip(filename)
+        self.name.setToolTip(f"<span>{html.escape(filename)}</span>")
         self.name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         top.addWidget(self.name, 1)
         self.pct = label("", "dim")
@@ -497,6 +500,7 @@ class TransferRow(QFrame):
         mid.addWidget(self.bar)
         bottom = QHBoxLayout()
         self.meta = label("", "dim")
+        self.meta.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         bottom.addWidget(self.meta, 1)
         self.stats = label("", "dim")
         self.stats.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -546,6 +550,10 @@ class TransferRow(QFrame):
     def set_progress(self, sent: int, total: int, bps: float):
         self.total = total or self.total
         self.sent = sent
+        paused = self.btn_pause is not None and self.btn_pause.isChecked()
+        if not paused and self.bar.property("state"):
+            self.bar.setProperty("state", "")
+            repolish(self.bar)
         # Smooth the speed so the readout and time-left don't jitter between chunks.
         if bps > 0:
             self._bps = bps if self._bps <= 0 else self._bps * 0.6 + bps * 0.4
@@ -582,7 +590,9 @@ class TransferRow(QFrame):
         repolish(self.bar)
         self.pct.setText("")
         self.stats.setText("")
-        self.meta.setText(self._meta_text(status))
+        meta_txt = self._meta_text(status)
+        self.meta.setText(meta_txt)
+        self.meta.setToolTip(f"<span>{html.escape(meta_txt)}</span>")
         for b in (self.btn_pause, self.btn_cancel):
             if b:
                 b.hide()

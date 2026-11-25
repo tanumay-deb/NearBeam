@@ -5,6 +5,7 @@ Features High-DPI support, scrollable responsive cards, no-wrap buttons,
 and clean visual alignment.
 """
 
+from collections import OrderedDict
 import concurrent.futures
 import datetime
 import getpass
@@ -147,7 +148,16 @@ class ServerThread(threading.Thread):
 
     def shutdown(self):
         if self.server:
-            self.server.shutdown()
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+            try:
+                self.server.server_close()
+            except Exception:
+                pass
+        if self.is_alive():
+            self.join(timeout=3.0)
 
 
 class ActivityBridge(QObject):
@@ -163,7 +173,7 @@ class ActivityBridge(QObject):
 
 class QRDialog(QDialog):
     """Clean, properly scaled dialog showing QR code for mobile scanning."""
-    def __init__(self, urls, initial_url: str = None, parent=None):
+    def __init__(self, urls, initial_url: str = None, parent=None, is_leader: bool = True):
         super().__init__(parent)
         self.setWindowTitle("NearBeam - Mobile Connect & QR Code")
         self.setFixedSize(380, 450)
@@ -199,7 +209,8 @@ class QRDialog(QDialog):
             self.nearbeam_url = str(urls)
             self.mdns_url = str(urls)
 
-        self.initial_url = initial_url or self.nearbeam_url
+        self.is_leader = is_leader
+        self.initial_url = initial_url or (self.nearbeam_url if is_leader else self.mdns_url)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -228,6 +239,8 @@ class QRDialog(QDialog):
         mode_layout.addWidget(self.btn_mode_mdns)
         mode_layout.addWidget(self.btn_mode_host)
         mode_layout.addWidget(self.btn_mode_direct)
+        if not self.is_leader:
+            self.btn_mode_mdns.hide()
         layout.addLayout(mode_layout)
 
         self.url_box = QLabel()
@@ -252,7 +265,7 @@ class QRDialog(QDialog):
         # Initial selection
         if getattr(self, "initial_url", None) == self.primary_url:
             self._select_direct()
-        elif getattr(self, "initial_url", None) == getattr(self, "mdns_url", None):
+        elif not self.is_leader or getattr(self, "initial_url", None) == getattr(self, "mdns_url", None):
             self._select_host()
         else:
             self._select_mdns()
@@ -302,7 +315,10 @@ class QRDialog(QDialog):
         pix = QPixmap()
         if qr_bytes:
             pix.loadFromData(qr_bytes)
-        self.img_container.setPixmap(pix.scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if not pix.isNull():
+            self.img_container.setPixmap(pix.scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.img_container.clear()
 
     def _copy_current(self):
         clipboard = QApplication.clipboard()
@@ -310,7 +326,7 @@ class QRDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, send_paths: list[str] = None):
+    def __init__(self, send_paths: list[str] = None, port: int = None):
         super().__init__()
         self.initial_send_paths = send_paths or []
         self.setWindowTitle("NearBeam")
@@ -341,6 +357,7 @@ class MainWindow(QMainWindow):
 
         # Transfers: id -> {"row": TransferRow, "tx": OutgoingTransfer | None, ...}
         self.active_transfers = {}
+        self._finished_incoming_tids: "OrderedDict[str, float]" = OrderedDict()
         self.server_events = queue.Queue()
 
         # Clipboard auto-sync tracking state. Windows reports our own clipboard writes later,
@@ -354,7 +371,7 @@ class MainWindow(QMainWindow):
         # Server setup
         self.server_thread = None
         self.server_instance = None
-        self.port = config.data.get("port", 5000)
+        self.port = port if port is not None else config.data.get("port", 5000)
         self.current_url = f"http://nearbeam.local:{self.port}"
         self.ip_url = f"http://127.0.0.1:{self.port}"
 
@@ -575,10 +592,10 @@ class MainWindow(QMainWindow):
     def _on_other_instance(self, msg: dict):
         """A second launch (Start menu, desktop icon, Explorer "Send with") reached this window."""
         paths = [p for p in msg.get("paths") or [] if isinstance(p, str)]
-        if paths:
-            self._handle_shared_paths(paths, source="Explorer")
         if msg.get("show") or paths:
             self._bring_to_front()
+        if paths:
+            self._handle_shared_paths(paths, source="Explorer")
 
     def _go(self, index: int):
         self.nav_buttons[index].setChecked(True)
@@ -637,7 +654,8 @@ class MainWindow(QMainWindow):
             self.server_instance.add_mesh_callback(
                 lambda role, nodes: self.bridge.mesh_updated.emit(role, nodes)
             )
-            self.server_instance.event_subscribers.append(self.server_events)
+            with self.server_instance._events_lock:
+                self.server_instance.event_subscribers.append(self.server_events)
 
             self.server_thread = ServerThread(self.server_instance.app, "0.0.0.0", actual_port)
             self.server_thread.start()
@@ -795,7 +813,7 @@ class MainWindow(QMainWindow):
 
     def _show_qr(self):
         urls = getattr(self, "active_urls", self.current_url)
-        dlg = QRDialog(urls, initial_url=self.ip_url, parent=self)
+        dlg = QRDialog(urls, initial_url=self.ip_url, parent=self, is_leader=(self.mesh_role == "leader"))
         dlg.exec()
 
     # ------------------------------------------------------------------
@@ -961,7 +979,9 @@ class MainWindow(QMainWindow):
 
     def dragEnterEvent(self, event):
         """Accept files and folders dragged anywhere onto the NearBeam desktop window (NB-04)."""
-        if event.mimeData() and event.mimeData().hasUrls():
+        if event.mimeData() and event.mimeData().hasUrls() and any(
+            u.isLocalFile() and os.path.exists(u.toLocalFile()) for u in event.mimeData().urls()
+        ):
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -1018,18 +1038,23 @@ class MainWindow(QMainWindow):
             return
         self._append_log(f"Sending {len(batch)} file(s) to {target_name}...", "info")
 
-        def _dispatch(items):
-            small = [t for t in items if t.total < t.parallel_threshold]
-            large = [t for t in items if t.total >= t.parallel_threshold]
-            if small:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(small))) as pool:
-                    futs = [pool.submit(t.run) for t in small]
-                    for fut in futs:
-                        fut.result()
-            for t in large:
+        small = [t for t in batch if t.total < t.parallel_threshold]
+        large = [t for t in batch if t.total >= t.parallel_threshold]
+
+        def _dispatch_small(items):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(items))) as pool:
+                futs = [pool.submit(t.run) for t in items]
+                for fut in futs:
+                    fut.result()
+
+        def _dispatch_large(items):
+            for t in items:
                 t.run()
 
-        threading.Thread(target=_dispatch, args=(batch,), daemon=True).start()
+        if small:
+            threading.Thread(target=_dispatch_small, args=(small,), daemon=True).start()
+        if large:
+            threading.Thread(target=_dispatch_large, args=(large,), daemon=True).start()
 
     def _add_active_row(self, tid: str, row, tx=None, **extra):
         self.transfers_page.active_box.addWidget(row)
@@ -1087,6 +1112,8 @@ class MainWindow(QMainWindow):
         changed_folders = False
         changed_batches = False
         changed_network = False
+        pending_uploads: dict[str, dict] = {}
+        pending_downloads: dict[str, dict] = {}
         while True:
             try:
                 payload = self.server_events.get_nowait()
@@ -1099,47 +1126,40 @@ class MainWindow(QMainWindow):
             etype = ev.get("type")
             tid = f"in:{ev.get('session_id')}"
             if etype == "upload_progress":
-                received = int(ev.get("received_bytes") or 0)
-                total = int(ev.get("total_bytes") or 0) or received
-                entry = self.active_transfers.get(tid)
-                now = time.monotonic()
-                if not entry:
-                    row = TransferRow(ev.get("filename", "file"), "received", self._peer_name(ev.get("from_addr", "")), total)
-                    self._add_active_row(tid, row, last=(now, received))
-                    row.set_progress(received, total, 0)
+                if tid in self._finished_incoming_tids:
                     continue
-                last_t, last_b = entry.get("last", (now, received))
-                bps = (received - last_b) / (now - last_t) if now > last_t else 0
-                entry["last"] = (now, received)
-                entry["row"].set_progress(received, total, max(bps, 0))
+                prev = pending_uploads.get(tid)
+                rec_bytes = int(ev.get("received_bytes") or 0)
+                if prev is None or rec_bytes >= int(prev.get("received_bytes") or 0):
+                    pending_uploads[tid] = ev
             elif etype == "file_received":
+                pending_uploads.pop(tid, None)
+                if ev.get("session_id"):
+                    self._finished_incoming_tids[tid] = time.monotonic()
+                    if len(self._finished_incoming_tids) > 200:
+                        self._finished_incoming_tids.popitem(last=False)
                 entry = self.active_transfers.get(tid)
                 if entry:
+                    entry["finished"] = True
+                    entry["gen"] = entry.get("gen", 0) + 1
                     entry["row"].set_finished(True, "Received")
                     QTimer.singleShot(1500, self, lambda t=tid: self._remove_active_row(t))
                 changed_history = True
             elif etype == "upload_cancelled":
+                pending_uploads.pop(tid, None)
                 self._remove_active_row(tid)
             elif etype == "download_progress":
-                # A phone/browser pulling a shared file from this PC
                 did = ev.get("download_id")
-                sent, total = int(ev.get("sent") or 0), int(ev.get("total") or 0)
-                now = time.monotonic()
-                entry = self.active_transfers.get(did)
-                if not entry:
-                    row = TransferRow(ev.get("filename", "file"), "sent", self._peer_name(ev.get("to_addr", "")), total)
-                    self._add_active_row(did, row, last=(now, sent))
-                    row.set_progress(sent, total, 0)
-                    continue
-                last_t, last_b = entry.get("last", (now, sent))
-                bps = (sent - last_b) / (now - last_t) if now > last_t and sent >= last_b else 0
-                entry["last"] = (now, sent)
-                entry["row"].set_progress(sent, total, bps)
+                if did:
+                    pending_downloads[did] = ev
             elif etype == "download_finished":
                 did = ev.get("download_id")
+                pending_downloads.pop(did, None)
                 entry = self.active_transfers.get(did)
                 if ev.get("completed"):
                     if entry:
+                        entry["finished"] = True
+                        entry["gen"] = entry.get("gen", 0) + 1
                         entry["row"].set_finished(True, "Downloaded")
                         QTimer.singleShot(1500, self, lambda t=did: self._remove_active_row(t))
                     changed_history = True
@@ -1148,6 +1168,8 @@ class MainWindow(QMainWindow):
                     if ev.get("partial_range"):
                         self._remove_active_row(did)
                     else:
+                        entry["finished"] = True
+                        entry["gen"] = entry.get("gen", 0) + 1
                         entry["row"].set_finished(False, "Stopped")
                         QTimer.singleShot(3000, self, lambda t=did: self._remove_active_row(t))
             elif etype == "safelist_updated":
@@ -1156,6 +1178,57 @@ class MainWindow(QMainWindow):
                 changed_batches = True
             elif etype == "network_changed":
                 changed_network = True
+
+        now = time.monotonic()
+        for tid, ev in pending_uploads.items():
+            if tid in self._finished_incoming_tids:
+                continue
+            received = int(ev.get("received_bytes") or 0)
+            total = int(ev.get("total_bytes") or 0) or received
+            entry = self.active_transfers.get(tid)
+            if not entry:
+                row = TransferRow(ev.get("filename", "file"), "received", self._peer_name(ev.get("from_addr", "")), total)
+                self._add_active_row(tid, row, last=(now, received), gen=0, stalled=False, finished=False)
+                row.set_progress(received, total, 0)
+                continue
+            if entry.get("finished"):
+                continue
+            if entry.get("stalled"):
+                entry["stalled"] = False
+                entry["gen"] = entry.get("gen", 0) + 1
+            last_t, last_b = entry.get("last", (now, received))
+            received = max(received, last_b)
+            dt = now - last_t
+            if dt >= 0.1:
+                bps = (received - last_b) / dt
+                entry["last"] = (now, received)
+            else:
+                bps = 0.0
+            entry["row"].set_progress(received, total, max(bps, 0.0))
+
+        for did, ev in pending_downloads.items():
+            sent, total = int(ev.get("sent") or 0), int(ev.get("total") or 0)
+            entry = self.active_transfers.get(did)
+            if not entry:
+                row = TransferRow(ev.get("filename", "file"), "sent", self._peer_name(ev.get("to_addr", "")), total)
+                self._add_active_row(did, row, last=(now, sent), gen=0, stalled=False, finished=False)
+                row.set_progress(sent, total, 0)
+                continue
+            if entry.get("finished"):
+                continue
+            if entry.get("stalled"):
+                entry["stalled"] = False
+                entry["gen"] = entry.get("gen", 0) + 1
+            last_t, last_b = entry.get("last", (now, sent))
+            sent = max(sent, last_b)
+            dt = now - last_t
+            if dt >= 0.1:
+                bps = (sent - last_b) / dt
+                entry["last"] = (now, sent)
+            else:
+                bps = 0.0
+            entry["row"].set_progress(sent, total, max(bps, 0.0))
+
         if changed_history:
             self._refresh_history()
         if changed_folders:
@@ -1167,15 +1240,28 @@ class MainWindow(QMainWindow):
             self._refresh_nearby_devices_ui()
         self._sweep_stalled_rows()
 
+    def _remove_if_still_stalled(self, tid: str, expected_gen: int):
+        entry = self.active_transfers.get(tid)
+        if entry and entry.get("stalled") and entry.get("gen") == expected_gen:
+            self._remove_active_row(tid)
+
     def _sweep_stalled_rows(self, max_idle: float = 120.0):
         """A phone upload/download that stops (screen locked, Wi-Fi lost) never sends a finish
-        event; mark it stopped instead of leaving it 'active' forever. A resume makes a new row."""
+        event; mark it stopped instead of leaving it 'active' forever. A resume recovers the row."""
         now = time.monotonic()
         for tid, entry in list(self.active_transfers.items()):
-            if entry.get("tx") is None and "last" in entry and not entry.get("stalled") and now - entry["last"][0] > max_idle:
+            if (
+                entry.get("tx") is None
+                and "last" in entry
+                and not entry.get("stalled")
+                and not entry.get("finished")
+                and now - entry["last"][0] > max_idle
+            ):
                 entry["stalled"] = True
+                entry["gen"] = entry.get("gen", 0) + 1
+                gen = entry["gen"]
                 entry["row"].set_finished(False, "Stopped responding")
-                QTimer.singleShot(3000, self, lambda t=tid: self._remove_active_row(t))
+                QTimer.singleShot(3000, self, lambda t=tid, g=gen: self._remove_if_still_stalled(t, g))
 
     def _history_row(self, rec: dict):
         direction = "sent" if rec.get("direction") == "sent" else "received"
@@ -1246,6 +1332,8 @@ class MainWindow(QMainWindow):
         state_str = "ENABLED" if checked else "DISABLED"
         self._append_log(f"Clipboard Auto-Sync: {state_str}", "info")
         if checked:
+            self._last_synced_clipboard = ""
+            self._last_synced_image_hash = ""
             self._on_local_clipboard_changed()
 
     # ------------------------------------------------------------------
@@ -1533,26 +1621,59 @@ class MainWindow(QMainWindow):
             self._append_log(f"Cleared all {removed} item(s) from Shared folders.", "info")
 
     def _clean_exit(self):
+        # Release single-instance IPC first so a new launch never hands off into a dying window.
+        inst_srv = getattr(self, "instance_server", None)
+        if inst_srv is not None:
+            try:
+                inst_srv.close()
+            except Exception:
+                pass
+            self.instance_server = None
+        inst_lock = getattr(self, "instance_lock", None)
+        if inst_lock is not None:
+            try:
+                inst_lock.unlock()
+            except Exception:
+                pass
+            self.instance_lock = None
+
         if getattr(self, "nearby_timer", None):
             self.nearby_timer.stop()
         if getattr(self, "events_timer", None):
             self.events_timer.stop()
-        for entry in list(self.active_transfers.values()):
-            tx = entry.get("tx")
-            if tx is not None:
-                try:
-                    tx.cancel()
-                except Exception:
-                    pass
         if getattr(self, "tray_icon", None):
             try:
                 self.tray_icon.hide()
             except Exception:
                 pass
-        if self.server_instance:
-            self.server_instance.shutdown()
+
+        active_txs = []
+        for entry in list(self.active_transfers.values()):
+            tx = entry.get("tx")
+            if tx is not None:
+                active_txs.append(tx)
+                try:
+                    tx.cancel()
+                except Exception:
+                    pass
+        # Give cancelled outgoing transfers a brief window to finish _abort_remote().
+        deadline = time.monotonic() + 1.5
+        for tx in active_txs:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            try:
+                tx.join(timeout=rem)
+            except Exception:
+                pass
+
+        # Signal SSE streams to exit first, stop accepting HTTP requests, then tear down backend state.
+        if self.server_instance and hasattr(self.server_instance, "_stopping"):
+            self.server_instance._stopping.set()
         if self.server_thread:
             self.server_thread.shutdown()
+        if self.server_instance:
+            self.server_instance.shutdown()
         QApplication.quit()
 
     def closeEvent(self, event):
@@ -1646,14 +1767,14 @@ def listen_for_other_instances(key: str, on_message, parent=None) -> QLocalServe
     return server
 
 
-def run_gui(start_minimized: bool = False, send_paths: list[str] = None):
+def run_gui(start_minimized: bool = False, send_paths: list[str] = None, port: int = None):
     app = QApplication(sys.argv)
     app.setApplicationName("NearBeam")
     # One NearBeam per user: e.g. opening it from the Start menu while the autostarted tray copy runs.
     instance_lock = claim_single_instance(INSTANCE_KEY, {"show": not start_minimized, "paths": send_paths or []})
     if instance_lock is None:
         return
-    window = MainWindow(send_paths=send_paths)
+    window = MainWindow(send_paths=send_paths, port=port)
     window.instance_lock = instance_lock  # held for the app's lifetime
     window.instance_server = listen_for_other_instances(INSTANCE_KEY, window._on_other_instance, window)
     if not start_minimized:

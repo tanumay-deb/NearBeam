@@ -49,6 +49,31 @@ def _get_sendto_shortcut_path() -> str | None:
     return os.path.join(appdata, "Microsoft", "Windows", "SendTo", "NearBeam.lnk")
 
 
+def _parse_cmd_tokens(cmd: str) -> list[str]:
+    """Splits a Windows shell command string into tokens respecting double quotes."""
+    tokens = []
+    i = 0
+    n = len(cmd)
+    while i < n:
+        while i < n and cmd[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if cmd[i] == '"':
+            end = cmd.find('"', i + 1)
+            if end == -1:
+                tokens.append(cmd[i + 1 :])
+                break
+            tokens.append(cmd[i + 1 : end])
+            i = end + 1
+        else:
+            start = i
+            while i < n and not cmd[i].isspace():
+                i += 1
+            tokens.append(cmd[start:i])
+    return tokens
+
+
 def is_shell_integration_enabled() -> bool:
     """Checks if 'Send with NearBeam' is registered in Windows Explorer context menu with a valid target."""
     if not is_windows():
@@ -60,19 +85,32 @@ def is_shell_integration_enabled() -> bool:
             winreg.HKEY_CURRENT_USER, f"{FILE_SHELL_KEY}\\command", 0, winreg.KEY_READ
         ) as key:
             val, _ = winreg.QueryValueEx(key, "")
-            if not isinstance(val, str) or not val.strip():
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, f"{DIR_SHELL_KEY}\\command", 0, winreg.KEY_READ
+        ) as dir_key:
+            dir_val, _ = winreg.QueryValueEx(dir_key, "")
+        if not isinstance(val, str) or not val.strip() or not isinstance(dir_val, str) or not dir_val.strip():
+            return False
+
+        expected_cmd, _ = _get_launch_command_and_icon()
+        if val.strip().lower() == expected_cmd.strip().lower():
+            return True
+
+        tokens = _parse_cmd_tokens(val.strip())
+        if not tokens:
+            return False
+        exe = tokens[0]
+        if not exe or not os.path.exists(exe):
+            return False
+        exe_base = os.path.basename(exe).lower()
+        is_python = exe_base in ("python.exe", "pythonw.exe")
+        if getattr(sys, "frozen", False) and is_python:
+            # Frozen app should upgrade stale source-tree pythonw.exe registrations.
+            return False
+        if is_python:
+            if len(tokens) < 2 or not os.path.exists(tokens[1]):
                 return False
-            expected_cmd, _ = _get_launch_command_and_icon()
-            if val.strip().lower() == expected_cmd.strip().lower():
-                return True
-            # Accept an existing command only if its referenced executable still exists
-            stripped = val.strip()
-            if stripped.startswith('"'):
-                end = stripped.find('"', 1)
-                exe = stripped[1:end] if end > 1 else ""
-            else:
-                exe = stripped.split(" ", 1)[0]
-            return bool(exe and os.path.exists(exe))
+        return True
     except (FileNotFoundError, OSError):
         return False
 

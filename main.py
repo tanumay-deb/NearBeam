@@ -177,6 +177,7 @@ def send_paths_to_running_instance(paths: list[str], port: int = 5000) -> bool:
 
 
 def main():
+    has_console = sys.stdout is not None
     # Non-UTF-8 consoles (cp1252, redirected output) must not crash on the emoji banner.
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
@@ -200,8 +201,8 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=config.data.get("port", 5000),
-        help="Port to run the server on (default: 5000)",
+        default=None,
+        help="Port to run the server on (default: configured port or 5000)",
     )
     parser.add_argument(
         "--minimized",
@@ -220,14 +221,39 @@ def main():
         default=[],
         help="Optional file or folder paths passed via Windows SendTo or drag-and-drop onto executable",
     )
-    args = parser.parse_args()
+    # In frozen console=False builds, sys.stdout/sys.stderr are None; bind StringIO around
+    # argparse so --help or invalid arguments never crash with AttributeError.
+    orig_out, orig_err = sys.stdout, sys.stderr
+    captured_io = None
+    if orig_out is None or orig_err is None:
+        import io
+        captured_io = io.StringIO()
+        if sys.stdout is None:
+            sys.stdout = captured_io
+        if sys.stderr is None:
+            sys.stderr = captured_io
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if captured_io is not None:
+            msg = captured_io.getvalue().strip()
+            if msg and sys.platform == "win32":
+                try:
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(0, msg, "NearBeam", 0x40 if exc.code == 0 else 0x30)
+                except Exception:
+                    pass
+        raise
+    finally:
+        sys.stdout, sys.stderr = orig_out, orig_err
 
+    effective_port = args.port if args.port is not None else config.data.get("port", 5000)
     send_paths = [os.path.abspath(p) for p in (args.send + args.paths) if p and os.path.exists(p)]
 
     if args.headless:
-        if send_paths and send_paths_to_running_instance(send_paths, args.port):
+        if send_paths and send_paths_to_running_instance(send_paths, effective_port):
             return
-        run_headless(args.port)
+        run_headless(effective_port)
     else:
         if send_paths:
             # Prefer waking an existing desktop GUI via QLocalSocket; fall back to HTTP for a headless server.
@@ -237,11 +263,11 @@ def main():
                     return
             except Exception:
                 pass
-            if send_paths_to_running_instance(send_paths, args.port):
+            if send_paths_to_running_instance(send_paths, effective_port):
                 return
         try:
             from gui import run_gui
-            run_gui(start_minimized=args.minimized, send_paths=send_paths)
+            run_gui(start_minimized=args.minimized, send_paths=send_paths, port=args.port)
         except Exception as e:
             import traceback
             err_msg = traceback.format_exc()
@@ -252,7 +278,7 @@ def main():
                     f.write(err_msg)
             except Exception:
                 log_path = Path("nearbeam_error.log")
-            if sys.stdout is not None:
+            if has_console:
                 print(f"Failed to launch GUI ({e}), falling back to headless CLI mode...\n")
             try:
                 import ctypes
@@ -264,8 +290,8 @@ def main():
                 )
             except Exception:
                 pass
-            if sys.stdout is not None:
-                run_headless(args.port)
+            if has_console:
+                run_headless(effective_port)
 
 
 if __name__ == "__main__":

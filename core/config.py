@@ -295,6 +295,8 @@ class ConfigManager:
         elif not isinstance(subpath, str):
             raise PermissionError("Access denied: Invalid subpath type.")
         clean_subpath = subpath.replace("\\", "/").strip("/")
+        if any(":" in part for part in clean_subpath.split("/") if part):
+            raise PermissionError("Access denied: Invalid path syntax.")
         if os.path.isfile(base_real):
             if not clean_subpath or clean_subpath == os.path.basename(base_real):
                 return base_real

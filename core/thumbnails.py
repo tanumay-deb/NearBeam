@@ -275,6 +275,7 @@ class _WindowsShellThumbnailPool:
         self._extractor = extractor or _extract_windows_shell_thumbnail
         self._init_com = init_com and (sys.platform == "win32")
         self._queue: queue.Queue = queue.Queue(maxsize=64)
+        self._state_lock = threading.Lock()
         self._closed = False
         self._threads = [
             threading.Thread(target=self._worker_loop, name=f"nearbeam-thumb-sta-{i}", daemon=True)
@@ -317,13 +318,14 @@ class _WindowsShellThumbnailPool:
 
     def generate(self, path: str, timeout: float = SHELL_TIMEOUT_SEC) -> Optional[bytes]:
         """Returns JPEG bytes, b"" on definitive unavailability, or None on transient timeout/backpressure."""
-        if self._closed:
-            return None
         fut: Future = Future()
-        try:
-            self._queue.put_nowait((path, fut))
-        except queue.Full:
-            return None
+        with self._state_lock:
+            if self._closed:
+                return None
+            try:
+                self._queue.put_nowait((path, fut))
+            except queue.Full:
+                return None
         try:
             return fut.result(timeout=timeout)
         except (FutureTimeoutError, Exception):
@@ -331,24 +333,25 @@ class _WindowsShellThumbnailPool:
             return None
 
     def shutdown(self):
-        if self._closed:
-            return
-        self._closed = True
-        # Drain queued futures so stop sentinels always fit cleanly
-        while True:
-            try:
-                queued = self._queue.get_nowait()
-                if queued is not None:
-                    _, fut = queued
-                    if not fut.done():
-                        fut.cancel()
-            except queue.Empty:
-                break
-        for _ in self._threads:
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:
-                break
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            # Drain queued futures so stop sentinels always fit cleanly and no callers hang.
+            while True:
+                try:
+                    queued = self._queue.get_nowait()
+                    if queued is not None:
+                        _, fut = queued
+                        if not fut.done():
+                            fut.cancel()
+                except queue.Empty:
+                    break
+            for _ in self._threads:
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    break
 
 
 _shell_pool_lock = threading.Lock()
