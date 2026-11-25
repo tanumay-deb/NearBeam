@@ -24,9 +24,12 @@ def _default_format_size(size_bytes: int) -> str:
 
 def _default_category(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
-    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico", ".heic"}:
+    if ext in {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico",
+        ".heic", ".heif", ".avif", ".tif", ".tiff", ".cr2", ".nef", ".arw", ".dng",
+    }:
         return "image"
-    if ext in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv"}:
+    if ext in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v"}:
         return "video"
     if ext in {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}:
         return "audio"

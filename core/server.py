@@ -81,7 +81,7 @@ class _CountingReader:
     def readinto(self, b) -> int:
         if self.remaining <= 0:
             return 0
-        view = memoryview(b)
+        view = memoryview(b).cast("B")
         if len(view) > self.remaining:
             view = view[:self.remaining]
         if hasattr(self._stream, "readinto"):
@@ -150,20 +150,28 @@ class NearBeamRequestHandler(WSGIRequestHandler):
 
     def handle_one_request(self):
         if getattr(self, "_requests_handled", 0) > 0:
-            # Wait for the next keep-alive request in short slices so server shutdown never hangs
+            # Wait for the next keep-alive request using rfile.peek(1) with short socket
+            # timeouts so both HTTP pipelining (already buffered in rfile) and fast server
+            # shutdown work cleanly without hanging.
             deadline = time.monotonic() + self.keep_alive_timeout
-            sel = selectors.DefaultSelector()
+            prev_timeout = self.connection.gettimeout()
             try:
-                sel.register(self.connection, selectors.EVENT_READ)
+                self.connection.settimeout(0.25)
                 ready = False
                 while time.monotonic() < deadline:
                     shut_down = getattr(self.server, "_BaseServer__is_shut_down", None)
                     if shut_down is not None and shut_down.is_set():
                         self.close_connection = True
                         return
-                    if sel.select(timeout=0.25):
+                    try:
+                        peeked = self.rfile.peek(1)
+                        if not peeked:
+                            self.close_connection = True
+                            return
                         ready = True
                         break
+                    except (TimeoutError, socket.timeout):
+                        continue
                 if not ready:
                     self.close_connection = True
                     return
@@ -171,7 +179,10 @@ class NearBeamRequestHandler(WSGIRequestHandler):
                 self.close_connection = True
                 return
             finally:
-                sel.close()
+                try:
+                    self.connection.settimeout(prev_timeout if prev_timeout is not None else self.timeout)
+                except OSError:
+                    pass
         self._requests_handled = getattr(self, "_requests_handled", 0) + 1
         super().handle_one_request()
 
@@ -183,19 +194,22 @@ class NearBeamRequestHandler(WSGIRequestHandler):
     def run_wsgi(self) -> None:
         if self.headers.get("Expect", "").lower().strip() == "100-continue":
             self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            self.wfile.flush()
 
         self.environ = environ = self.make_environ()
         conn_hdr = (self.headers.get("Connection") or "").lower()
         transfer_enc = (self.headers.get("Transfer-Encoding") or "").lower()
+        cl_values = self.headers.get_all("Content-Length") or []
+        # RFC 9112 §9.3: HTTP/1.1 connections are persistent by default unless Connection: close is sent.
         want_keep_alive = (
             self.request_version >= "HTTP/1.1"
-            and "keep-alive" in conn_hdr
             and "close" not in conn_hdr
             and "chunked" not in transfer_enc
+            and len(cl_values) <= 1
         )
         reader: Optional[_CountingReader] = None
         if want_keep_alive:
-            raw_cl = self.headers.get("Content-Length")
+            raw_cl = cl_values[0] if cl_values else None
             try:
                 expected_len = int(raw_cl) if raw_cl is not None else 0
                 if expected_len < 0:
@@ -491,9 +505,12 @@ def get_file_type_category(filename: str, is_dir: bool = False) -> str:
         return "folder"
 
     ext = os.path.splitext(filename)[1].lower()
-    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico", ".heic"}:
+    if ext in {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico",
+        ".heic", ".heif", ".avif", ".tif", ".tiff", ".cr2", ".nef", ".arw", ".dng",
+    }:
         return "image"
-    elif ext in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv"}:
+    elif ext in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v"}:
         return "video"
     elif ext in {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}:
         return "audio"
@@ -535,10 +552,19 @@ def finalize_upload(temp_path: str, dest_dir: str, filename: str) -> str:
             final_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
             counter += 1
     try:
-        os.replace(temp_path, final_path)
-    except OSError:
-        import shutil
-        shutil.move(temp_path, final_path)
+        try:
+            os.replace(temp_path, final_path)
+        except OSError:
+            import shutil
+            shutil.move(temp_path, final_path)
+    except Exception:
+        # Remove the empty placeholder claimed via open(..., "xb") so no 0-byte orphan remains.
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        raise
     return final_path
 
 
@@ -581,7 +607,13 @@ def resolve_receive_dir(
             bucket = datetime.date.today().isoformat()
         elif mode == "device":
             raw_peer = (peer_name or "").strip()
-            bucket = safe_filename(raw_peer) if raw_peer else "Other Devices"
+            # Reject traversal/dot-only labels and strip leading dots so subfolders stay visible in /api/received.
+            stripped_peer = raw_peer.lstrip(". ")
+            if not stripped_peer or raw_peer in (".", ".."):
+                bucket = "Other Devices"
+            else:
+                cleaned_peer = safe_filename(stripped_peer).lstrip(". ")
+                bucket = cleaned_peer or "Other Devices"
 
     parts = ([bucket] if bucket else []) + rel_parts
     candidate = os.path.join(base_save_dir, *parts) if parts else base_save_dir
@@ -1249,7 +1281,7 @@ class NearBeamServer:
             if lock is None:
                 if len(self._session_locks) > 512:
                     for key in list(self._session_locks.keys()):
-                        if not self._session_locks[key].locked():
+                        if not self._session_locks[key].locked() and key not in self._parallel_sessions:
                             self._session_locks.pop(key, None)
                             if len(self._session_locks) <= 256:
                                 break
@@ -1317,8 +1349,14 @@ class NearBeamServer:
             if any(p == ".." for p in raw_parts) or (raw_parts and re.fullmatch(r"[A-Za-z]:", raw_parts[0])):
                 return jsonify({"error": "Invalid relative directory"}), 400
             # Folder names get the same clean-up as file names ('Trip: day 1' -> 'Trip_ day 1')
-            # BEFORE os.path.join so names like 'D: notes' aren't parsed as Windows drive letters.
-            clean_parts = [safe_filename(p) for p in raw_parts]
+            # BEFORE os.path.join so names like 'D: notes' aren't parsed as Windows drive letters,
+            # and strip leading dots so uploaded folders aren't hidden from /api/received.
+            clean_parts = []
+            for p in raw_parts:
+                cleaned = safe_filename(p).lstrip(". ")
+                if not cleaned:
+                    return jsonify({"error": "Invalid relative directory"}), 400
+                clean_parts.append(cleaned)
             relative_dir = "/".join(clean_parts)
             probe_dir = os.path.join(save_dir, *clean_parts) if clean_parts else save_dir
             root = os.path.realpath(save_dir)
@@ -1354,6 +1392,8 @@ class NearBeamServer:
             with self._upload_state_lock:
                 if session_id in self._cancelled_uploads:
                     return jsonify({"success": False, "cancelled": True}), 499
+                if session_id in self._parallel_sessions:
+                    return jsonify({"error": "Session is already active in parallel mode"}), 409
                 finished = self.finished_uploads.get(session_id)
                 if finished:
                     return jsonify({"success": True, "completed": True, "file": finished})
@@ -1468,6 +1508,7 @@ class NearBeamServer:
         }
         with self._upload_state_lock:
             self.finished_uploads[session_id] = file_info
+            self._parallel_sessions.pop(session_id, None)
             if len(self.finished_uploads) > 200:
                 self.finished_uploads.popitem(last=False)
             self.received_files_history.insert(0, file_info)
@@ -1503,6 +1544,20 @@ class NearBeamServer:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _ranges_cover_file(ranges, file_size: int) -> bool:
+        """Verifies committed chunk byte ranges contiguously cover [0, file_size) with no gaps."""
+        if file_size == 0:
+            return True
+        intervals = sorted((s, e) for s, e in ranges if e > s)
+        covered = 0
+        for start, end in intervals:
+            if start > covered:
+                return False
+            if end > covered:
+                covered = end
+        return covered == file_size
+
     def _receive_parallel_chunk(
         self,
         session_id: str,
@@ -1535,9 +1590,19 @@ class NearBeamServer:
             if sess is None:
                 os.makedirs(save_dir, exist_ok=True)
                 temp_path = os.path.join(save_dir, f".{session_id}.tmp")
-                with open(temp_path, "wb") as prealloc:
-                    if file_size > 0:
-                        prealloc.truncate(file_size)
+                if os.path.exists(temp_path):
+                    return jsonify({"error": "Session is already active in sequential mode"}), 409
+                try:
+                    with open(temp_path, "wb") as prealloc:
+                        if file_size > 0:
+                            prealloc.truncate(file_size)
+                except OSError:
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except OSError:
+                        pass
+                    raise
                 sess = {
                     "temp_path": temp_path,
                     "dest_dir": dest_dir,  # locked for session (e.g. across midnight in date mode)
@@ -1546,6 +1611,7 @@ class NearBeamServer:
                     "total_chunks": total_chunks,
                     "received_chunks": set(),
                     "chunk_progress": {},
+                    "chunk_ranges": {},
                     "active_writers": 0,
                     "finalized": False,
                     "created_at": time.time(),
@@ -1569,14 +1635,15 @@ class NearBeamServer:
         written = 0
         cancelled = False
         overflow = False
-        stream_failed = False
+        stream_exc = None
+        using_multipart = bool(request.files.get("file"))
+        expected_cl = None if using_multipart else request.content_length
 
-        def emit_aggregate_progress(cur_written: int):
-            if file_size < 1024 * 1024:
+        def _emit_aggregate_progress_locked(cur_written: int):
+            if file_size < 1024 * 1024 or sess.get("finalized") or self._is_upload_cancelled(session_id):
                 return
-            with session_lock:
-                sess["chunk_progress"][chunk_index] = cur_written
-                total_received = sum(sess["chunk_progress"].values())
+            sess["chunk_progress"][chunk_index] = cur_written
+            total_received = sum(sess["chunk_progress"].values())
             self.broadcast_event({
                 "type": "upload_progress",
                 "session_id": session_id,
@@ -1593,7 +1660,7 @@ class NearBeamServer:
         try:
             with open(temp_path, "r+b", buffering=4 * 1024 * 1024) as f:
                 f.seek(offset)
-                stream = request.files["file"].stream if request.files.get("file") else request.stream
+                stream = request.files["file"].stream if using_multipart else request.stream
                 while True:
                     if self._is_upload_cancelled(session_id):
                         cancelled = True
@@ -1609,65 +1676,76 @@ class NearBeamServer:
                     now = time.monotonic()
                     if now - last_emit >= 0.4:
                         last_emit = now
-                        emit_aggregate_progress(written)
-        except Exception:
-            stream_failed = True
-            raise
-        finally:
-            # Handle is guaranteed closed here before we touch active_writers or rename on Windows.
-            finalize_now = False
-            cleanup_tmp = False
-            with session_lock:
-                sess["active_writers"] = max(0, sess["active_writers"] - 1)
-                is_cancelled = cancelled or self._is_upload_cancelled(session_id)
-                if is_cancelled:
-                    if sess["active_writers"] == 0:
-                        cleanup_tmp = True
-                        with self._upload_state_lock:
-                            self._parallel_sessions.pop(session_id, None)
-                elif overflow or stream_failed:
+                        with session_lock:
+                            _emit_aggregate_progress_locked(written)
+        except BaseException as exc:
+            stream_exc = exc
+
+        # File handle is guaranteed closed here; hold session_lock continuously through
+        # active_writers decrement, byte-coverage verification, and atomic finalization.
+        cleanup_tmp = False
+        with session_lock:
+            sess["active_writers"] = max(0, sess["active_writers"] - 1)
+            is_cancelled = cancelled or self._is_upload_cancelled(session_id)
+            if is_cancelled:
+                if sess["active_writers"] == 0:
+                    cleanup_tmp = True
+                    with self._upload_state_lock:
+                        self._parallel_sessions.pop(session_id, None)
+            elif stream_exc is not None:
+                if chunk_index not in sess["received_chunks"]:
+                    sess["chunk_progress"][chunk_index] = 0
+                    sess["chunk_ranges"].pop(chunk_index, None)
+                raise stream_exc
+            else:
+                short_read = expected_cl is not None and written != expected_cl
+                empty_nonzero = file_size > 0 and written == 0
+                if overflow or short_read or empty_nonzero:
                     if chunk_index not in sess["received_chunks"]:
                         sess["chunk_progress"][chunk_index] = 0
-                else:
-                    sess["received_chunks"].add(chunk_index)
-                    sess["chunk_progress"][chunk_index] = written
-                    if (
-                        len(sess["received_chunks"]) == sess["total_chunks"]
-                        and sess["active_writers"] == 0
-                        and not sess["finalized"]
+                        sess["chunk_ranges"].pop(chunk_index, None)
+                    err_msg = (
+                        "Chunk exceeds declared X-File-Size"
+                        if overflow
+                        else ("Empty chunk not allowed for non-empty file" if empty_nonzero else "Incomplete chunk payload")
+                    )
+                    return jsonify({"error": err_msg}), 400
+
+                sess["received_chunks"].add(chunk_index)
+                sess["chunk_progress"][chunk_index] = written
+                sess["chunk_ranges"][chunk_index] = (offset, offset + written)
+
+                if (
+                    len(sess["received_chunks"]) == sess["total_chunks"]
+                    and sess["active_writers"] == 0
+                    and not sess["finalized"]
+                ):
+                    actual_size = os.path.getsize(temp_path) if os.path.isfile(temp_path) else -1
+                    if actual_size != sess["file_size"] or not self._ranges_cover_file(
+                        sess["chunk_ranges"].values(), sess["file_size"]
                     ):
-                        sess["finalized"] = True
-                        finalize_now = True
-                        with self._upload_state_lock:
-                            self._parallel_sessions.pop(session_id, None)
+                        return jsonify({"error": "Parallel chunks do not cover full file size"}), 400
+                    sess["finalized"] = True
+                    file_info = self._complete_received_upload(
+                        session_id=session_id,
+                        temp_path=temp_path,
+                        dest_dir=sess["dest_dir"],
+                        filename=sess["filename"],
+                        peer=peer,
+                        log_template=log_template,
+                    )
+                    return jsonify({"success": True, "completed": True, "file": file_info})
 
-            if cleanup_tmp:
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except OSError:
-                    pass
+                _emit_aggregate_progress_locked(written)
+                return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
 
-        if cancelled or self._is_upload_cancelled(session_id):
-            return jsonify({"success": False, "cancelled": True}), 499
-        if overflow:
-            return jsonify({"error": "Chunk exceeds declared X-File-Size"}), 400
-
-        emit_aggregate_progress(written)
-
-        if finalize_now:
-            with session_lock:
-                file_info = self._complete_received_upload(
-                    session_id=session_id,
-                    temp_path=temp_path,
-                    dest_dir=sess["dest_dir"],
-                    filename=sess["filename"],
-                    peer=peer,
-                    log_template=log_template,
-                )
-            return jsonify({"success": True, "completed": True, "file": file_info})
-
-        return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+        if cleanup_tmp:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+        return jsonify({"success": False, "cancelled": True}), 499
 
     def _register_routes(self):
         app = self.app
@@ -2452,10 +2530,20 @@ class NearBeamServer:
                     "received_bytes": finished.get("size", 0),
                     "received_chunks": [],
                     "completed": True,
+                    "file": finished,
                 })
             if psess is not None:
                 session_lock = self._get_session_lock(session_id)
                 with session_lock:
+                    with self._upload_state_lock:
+                        finished_now = self.finished_uploads.get(session_id)
+                    if finished_now:
+                        return jsonify({
+                            "received_bytes": finished_now.get("size", 0),
+                            "received_chunks": [],
+                            "completed": True,
+                            "file": finished_now,
+                        })
                     recv_chunks = sorted(psess["received_chunks"])
                     recv_bytes = sum(psess["chunk_progress"].values())
                 return jsonify({
@@ -2943,13 +3031,16 @@ class NearBeamServer:
                 try:
                     # Initial heartbeat
                     yield f"data: {json.dumps({'type': 'connected'})}\n\n"
-                    while True:
+                    last_beat = time.monotonic()
+                    while not self._stopping.is_set():
                         try:
-                            msg = client_queue.get(timeout=25)
+                            msg = client_queue.get(timeout=1.0)
                             yield f"data: {msg}\n\n"
+                            last_beat = time.monotonic()
                         except queue.Empty:
-                            # Keep-alive heartbeat
-                            yield f": heartbeat\n\n"
+                            if time.monotonic() - last_beat >= 25.0:
+                                last_beat = time.monotonic()
+                                yield f": heartbeat\n\n"
                 finally:
                     with self._events_lock:
                         if client_queue in self.event_subscribers:

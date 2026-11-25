@@ -2069,7 +2069,7 @@ class TransferManager {
   totalActiveStreams() {
     let used = 0;
     for (const t of this.activeTransfers.values()) {
-      used += t.maxStreams || 1;
+      if (!t.paused) used += t.maxStreams || 1;
     }
     return used;
   }
@@ -2216,6 +2216,10 @@ class TransferManager {
 
     t.startTime = Date.now();
     t.lastSpeedUpdate = Date.now();
+    if (t.pendingChunks.length === 0) {
+      this.completeTransfer(t, null);
+      return;
+    }
     this.pumpChunks(t.sessionId);
   }
 
@@ -2246,6 +2250,8 @@ class TransferManager {
       if (t.speedEl) t.speedEl.innerText = "Paused";
       if (t.etaEl) t.etaEl.innerText = "ETA: --";
       this.abortInFlight(t, true);
+      // Free stream slots so queued files can proceed while this transfer is paused.
+      this.processQueue();
     } else {
       const committed = this.completedBytes(t);
       t.highWaterLoaded = committed;
@@ -2355,21 +2361,33 @@ class TransferManager {
         if (status && status.completed) {
           setTimeout(() => myUploadSessions.delete(sessionId), 5000);
           showToast(`Uploaded ${item.filename}`, "success");
+          addSentHistoryItem(
+            status.file || {
+              filename: item.filename,
+              size: item.file.size,
+              formatted_size: formatBytes(item.file.size),
+            },
+            !window.NEARBEAM_GUEST_DROP
+          );
           if (!window.NEARBEAM_GUEST_DROP && typeof fetchReceivedFiles === "function") {
             fetchReceivedFiles();
           }
           return;
         }
-        if (status && Array.isArray(status.received_chunks) && status.received_chunks.length > 0) {
-          status.received_chunks.forEach((idx) => {
-            if (Number.isInteger(idx) && idx >= 0 && idx < item.totalChunks) {
-              completed.add(idx);
+        // Server status is authoritative: if server restarted or pruned the session, drop stale client chunks.
+        if (status && typeof status === "object") {
+          completed.clear();
+          if (Array.isArray(status.received_chunks) && status.received_chunks.length > 0) {
+            status.received_chunks.forEach((idx) => {
+              if (Number.isInteger(idx) && idx >= 0 && idx < item.totalChunks) {
+                completed.add(idx);
+              }
+            });
+          } else if (!item.useParallel && typeof status.received_bytes === "number" && status.received_bytes > 0) {
+            const fullChunks = Math.floor(status.received_bytes / item.chunkSize);
+            for (let i = 0; i < Math.min(fullChunks, item.totalChunks); i++) {
+              completed.add(i);
             }
-          });
-        } else if (status && !item.useParallel && typeof status.received_bytes === "number" && status.received_bytes > 0) {
-          const fullChunks = Math.floor(status.received_bytes / item.chunkSize);
-          for (let i = 0; i < Math.min(fullChunks, item.totalChunks); i++) {
-            completed.add(i);
           }
         }
       }
@@ -2550,6 +2568,16 @@ class TransferManager {
         t.pendingChunks.unshift(chunkIndex);
       }
       this.markTransferFailed(t, "Connection error");
+    });
+
+    xhr.addEventListener("abort", () => {
+      const wasTracked = t.inFlightXhrs.delete(chunkIndex);
+      if (!wasTracked || t.cancelled || t.paused || t.finished || t.failed) return;
+      t.chunkLoaded.delete(chunkIndex);
+      if (!t.completedChunks.has(chunkIndex) && !t.pendingChunks.includes(chunkIndex)) {
+        t.pendingChunks.unshift(chunkIndex);
+      }
+      this.markTransferFailed(t, "Upload aborted");
     });
 
     xhr.send(chunk);

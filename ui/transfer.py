@@ -316,11 +316,14 @@ class OutgoingTransfer:
                         self._record_chunk_done(idx, len(data), t0)
             except _Cancelled:
                 stop_event.set()
+                self._resume.set()
             except BaseException as exc:
                 with err_lock:
                     if first_error[0] is None:
                         first_error[0] = exc
                 stop_event.set()
+                # Unblock any sibling workers paused in _resume.wait() so join() never hangs.
+                self._resume.set()
             finally:
                 self._close_connection(conn_holder)
 

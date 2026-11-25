@@ -5,9 +5,9 @@ Thumbnail generation for NearBeam.
   for videos, PDFs, HEIC/HEIF, RAW photos, and Office documents with zero pip deps.
 """
 
+from collections import OrderedDict
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import ctypes
-from functools import lru_cache
 import io
 import os
 import queue
@@ -215,7 +215,7 @@ if sys.platform == "win32":
                 return b""
             width = int(bmp.bmWidth)
             height = int(abs(bmp.bmHeight))
-            if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+            if width <= 0 or height <= 0 or width > 4096 or height > 4096:
                 return b""
 
             bmi = _BITMAPINFOHEADER()
@@ -315,24 +315,35 @@ class _WindowsShellThumbnailPool:
                 except Exception:
                     pass
 
-    def generate(self, path: str, timeout: float = SHELL_TIMEOUT_SEC) -> bytes:
+    def generate(self, path: str, timeout: float = SHELL_TIMEOUT_SEC) -> Optional[bytes]:
+        """Returns JPEG bytes, b"" on definitive unavailability, or None on transient timeout/backpressure."""
         if self._closed:
-            return b""
+            return None
         fut: Future = Future()
         try:
             self._queue.put_nowait((path, fut))
         except queue.Full:
-            return b""
+            return None
         try:
             return fut.result(timeout=timeout)
         except (FutureTimeoutError, Exception):
             fut.cancel()
-            return b""
+            return None
 
     def shutdown(self):
         if self._closed:
             return
         self._closed = True
+        # Drain queued futures so stop sentinels always fit cleanly
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+                if queued is not None:
+                    _, fut = queued
+                    if not fut.done():
+                        fut.cancel()
+            except queue.Empty:
+                break
         for _ in self._threads:
             try:
                 self._queue.put_nowait(None)
@@ -362,16 +373,49 @@ def shutdown_thumbnail_pool():
         pool.shutdown()
 
 
-@lru_cache(maxsize=512)
+_THUMB_CACHE_MAXSIZE = 512
+_thumb_cache_lock = threading.Lock()
+_thumb_cache: "OrderedDict[tuple[str, int, int], bytes]" = OrderedDict()
+
+
+def _thumb_cache_clear():
+    with _thumb_cache_lock:
+        _thumb_cache.clear()
+
+
 def make_thumbnail(path: str, mtime_ns: int, size: int) -> bytes:
     """
     Returns cached JPEG thumbnail bytes (<= 320px), or b"" when unavailable.
-    Keyed on (path, mtime_ns, size) so edits invalidate automatically and
-    negative hits (unsupported/broken files) are cached without repeated work.
+    Keyed on (path, mtime_ns, size) so edits invalidate automatically.
+    Definitive failures (corrupt / unsupported files) are cached as b"", while
+    transient Windows Shell queue/timeout failures are NOT permanently cached.
     """
+    key = (path, mtime_ns, size)
+    with _thumb_cache_lock:
+        cached = _thumb_cache.get(key)
+        if cached is not None:
+            _thumb_cache.move_to_end(key)
+            return cached
+
     ext = os.path.splitext(path or "")[1].lower()
+    result: Optional[bytes]
     if ext in PILLOW_IMAGE_EXTS:
-        return _make_pillow_thumbnail(path)
-    if sys.platform == "win32" and ext in SHELL_THUMB_EXTS:
-        return _get_shell_pool().generate(path)
-    return b""
+        result = _make_pillow_thumbnail(path)
+    elif sys.platform == "win32" and ext in SHELL_THUMB_EXTS:
+        result = _get_shell_pool().generate(path)
+    else:
+        result = b""
+
+    if result is None:
+        # Transient timeout or backpressure: do not poison cache
+        return b""
+
+    with _thumb_cache_lock:
+        _thumb_cache[key] = result
+        _thumb_cache.move_to_end(key)
+        while len(_thumb_cache) > _THUMB_CACHE_MAXSIZE:
+            _thumb_cache.popitem(last=False)
+    return result
+
+
+make_thumbnail.cache_clear = _thumb_cache_clear

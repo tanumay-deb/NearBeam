@@ -2800,6 +2800,12 @@ body.theme-light .zip-circle-wrap .progress-ring-track {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
+.file-card.safelist-root-folder .video-thumb-badge {
+  width: 20px;
+  height: 20px;
+  font-size: 0.56rem;
+}
+
 /* List view: one compact row per file, full names */
 #safeFilesContainer.view-list {
   display: flex;

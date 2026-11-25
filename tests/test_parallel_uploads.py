@@ -202,6 +202,97 @@ class TestServerParallelChunks(unittest.TestCase):
         finally:
             httpd.shutdown()
 
+    def test_parallel_rejects_incomplete_or_gap_chunks_without_finalizing_zeros(self):
+        # Declare 10 KB file across 2 chunks, send empty/short bodies with a gap
+        r0 = self._post_chunk("gap-1", "holes.bin", b"", 0, 2, 0, 10240)
+        self.assertEqual(r0.status_code, 400)
+        # Send 2 non-empty chunks that do NOT cover the full [0, 10240) range (gap in middle)
+        r1 = self._post_chunk("gap-2", "holes2.bin", b"A" * 100, 0, 2, 0, 10240)
+        self.assertEqual(r1.status_code, 200)
+        r2 = self._post_chunk("gap-2", "holes2.bin", b"B" * 100, 1, 2, 5000, 10240)
+        self.assertEqual(r2.status_code, 400)
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.save_directory, "holes2.bin")))
+
+    def test_parallel_and_sequential_mix_on_same_session_rejected_with_409(self):
+        # 1) Sequential chunk 0 then parallel chunk 1 -> 409
+        r_seq = self.client.post(
+            "/api/upload/chunk",
+            data=b"AAAA",
+            headers={
+                "X-Session-Id": "mix-seq-1",
+                "X-Filename": "mix1.bin",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "2",
+                "X-Chunk-Offset": "0",
+                "X-File-Size": "8",
+            },
+        )
+        self.assertEqual(r_seq.status_code, 200)
+        r_par = self._post_chunk("mix-seq-1", "mix1.bin", b"BBBB", 1, 2, 4, 8)
+        self.assertEqual(r_par.status_code, 409)
+
+        # 2) Parallel chunk 0 then sequential chunk 1 -> 409
+        r_par2 = self._post_chunk("mix-par-1", "mix2.bin", b"AAAA", 0, 2, 0, 8)
+        self.assertEqual(r_par2.status_code, 200)
+        r_seq2 = self.client.post(
+            "/api/upload/chunk",
+            data=b"BBBB",
+            headers={
+                "X-Session-Id": "mix-par-1",
+                "X-Filename": "mix2.bin",
+                "X-Chunk-Index": "1",
+                "X-Total-Chunks": "2",
+                "X-Chunk-Offset": "4",
+                "X-File-Size": "8",
+            },
+        )
+        self.assertEqual(r_seq2.status_code, 409)
+
+    def test_session_lock_not_evicted_while_parallel_session_active(self):
+        r0 = self._post_chunk("active-lock-1", "keep.bin", b"AAAA", 0, 2, 0, 8)
+        self.assertEqual(r0.status_code, 200)
+        orig_lock = self.server._get_session_lock("active-lock-1")
+        for i in range(600):
+            self.server._get_session_lock(f"noise-sess-{i}")
+        self.assertIs(self.server._get_session_lock("active-lock-1"), orig_lock)
+
+    def test_finalize_upload_cleans_placeholder_if_temp_missing(self):
+        with self.assertRaises(OSError):
+            srv_mod.finalize_upload(
+                os.path.join(self.cfg.save_directory, ".nonexistent.tmp"),
+                self.cfg.save_directory,
+                "orphan.bin",
+            )
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.save_directory, "orphan.bin")))
+
+    def test_http11_keep_alive_default_and_pipelining(self):
+        import socket as sock_mod
+
+        httpd = make_server(
+            "127.0.0.1", 0, self.server.app, threaded=True, request_handler=NearBeamRequestHandler
+        )
+        port = httpd.server_port
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            with sock_mod.create_connection(("127.0.0.1", port), timeout=3.0) as s:
+                # Two pipelined HTTP/1.1 requests sent together WITHOUT explicit Connection: keep-alive
+                pipelined = (
+                    f"GET /api/info HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+                    f"GET /api/info HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+                s.sendall(pipelined)
+                raw = b""
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    raw += chunk
+            self.assertEqual(raw.count(b"HTTP/1.1 200 OK"), 2, raw[:400])
+            self.assertIn(b"Connection: keep-alive", raw)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 class TestOutgoingTransferParallel(unittest.TestCase):
     def setUp(self):
@@ -384,6 +475,40 @@ class TestOutgoingTransferParallel(unittest.TestCase):
         with open(src, "rb") as f1, open(saved, "rb") as f2:
             self.assertEqual(f2.read(), f1.read())
 
+    def test_outgoing_transfer_parallel_error_while_paused_does_not_hang(self):
+        from ui.transfer import OutgoingTransfer
+
+        mb = 1024 * 1024
+        src = self._make_file("err_pause.bin", 8 * mb)
+        done = {}
+        err_triggered = threading.Event()
+
+        class FailingWorkerTransfer(OutgoingTransfer):
+            def _post_chunk(self, conn_holder, idx, total_chunks, offset, data, parallel):
+                if idx == 0:
+                    # Pause sibling workers then fail on worker 0
+                    self.pause()
+                    time.sleep(0.05)
+                    err_triggered.set()
+                    raise RuntimeError("simulated worker boom")
+                return super()._post_chunk(conn_holder, idx, total_chunks, offset, data, parallel)
+
+        tx = FailingWorkerTransfer(
+            self.url,
+            "peer",
+            src,
+            on_done=lambda ok, msg: done.update(ok=ok, msg=msg),
+            chunk_size=1 * mb,
+            max_streams=3,
+            parallel_threshold=2 * mb,
+        )
+        tx.start()
+        tx.join(5.0)
+        self.assertTrue(err_triggered.is_set())
+        self.assertFalse(tx._thread.is_alive(), "Parallel worker deadlocked on _resume.wait() after sibling error")
+        self.assertEqual(done.get("ok"), False)
+        self.assertIn("simulated worker boom", done.get("msg", ""))
+
 
 class TestWebParallelAndReceivedContracts(unittest.TestCase):
     def test_app_js_parallel_transfer_manager_and_received_folder_contracts(self):
@@ -402,6 +527,8 @@ class TestWebParallelAndReceivedContracts(unittest.TestCase):
             "/api/upload/status/",
             "file.rel_path",
             "file.folder",
+            "completed.clear()",
+            "if (!t.paused)",
         ):
             self.assertIn(token, src, f"Missing expected JS contract token: {token}")
 

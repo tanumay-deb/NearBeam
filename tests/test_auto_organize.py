@@ -178,6 +178,61 @@ class TestAutoOrganizeConfigAndRouting(unittest.TestCase):
         self.assertEqual(self.client.get("/api/received/download/Photos/.partial.tmp").status_code, 404)
         self.assertEqual(self.client.get("/api/received/preview/Photos/.partial.tmp").status_code, 404)
 
+    def test_dot_prefixed_device_name_and_relative_dir_sanitized_and_visible(self):
+        self.cfg.set_auto_organize_mode("device")
+        # Dot-prefixed X-Device-Name must not create a hidden dotfolder invisible to /api/received
+        r1 = self.client.post(
+            "/api/upload/chunk",
+            data=b"abc",
+            headers={
+                "X-Session-Id": "dot-dev-1",
+                "X-Filename": "visible1.txt",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "1",
+                "X-Chunk-Offset": "0",
+                "X-File-Size": "3",
+                "X-Device-Name": ".hidden",
+            },
+        )
+        self.assertEqual(r1.status_code, 200)
+        # '..' as X-Device-Name must fall back to 'Other Devices' instead of 'unnamed_file_*'
+        r2 = self.client.post(
+            "/api/upload/chunk",
+            data=b"def",
+            headers={
+                "X-Session-Id": "dot-dev-2",
+                "X-Filename": "visible2.txt",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "1",
+                "X-Chunk-Offset": "0",
+                "X-File-Size": "3",
+                "X-Device-Name": "..",
+            },
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertTrue(os.path.isfile(os.path.join(self.cfg.save_directory, "Other Devices", "visible2.txt")))
+
+        # Dot-prefixed folder segment in X-Relative-Dir stays visible too
+        r3 = self.client.post(
+            "/api/upload/chunk",
+            data=b"ghi",
+            headers={
+                "X-Session-Id": "dot-rel-1",
+                "X-Filename": "visible3.txt",
+                "X-Chunk-Index": "0",
+                "X-Total-Chunks": "1",
+                "X-Chunk-Offset": "0",
+                "X-File-Size": "3",
+                "X-Device-Name": "Desk",
+                "X-Relative-Dir": ".secret/sub",
+            },
+        )
+        self.assertEqual(r3.status_code, 200)
+
+        listed = self.client.get("/api/received").get_json()["files"]
+        names = {f["filename"] for f in listed}
+        self.assertEqual(names, {"visible1.txt", "visible2.txt", "visible3.txt"})
+
 
 class TestAutoOrganizeSettingsGui(unittest.TestCase):
     def test_settings_dropdown_defaults_off_and_updates_config(self):

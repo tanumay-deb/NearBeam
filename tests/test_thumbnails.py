@@ -172,7 +172,7 @@ class TestNativeThumbnailsModule(unittest.TestCase):
             t0 = time.monotonic()
             out = pool.generate("dummy.mp4", timeout=0.1)
             elapsed = time.monotonic() - t0
-            self.assertEqual(out, b"")
+            self.assertIsNone(out)
             self.assertLess(elapsed, 0.8)
         finally:
             pool.shutdown()
@@ -199,6 +199,36 @@ class TestNativeThumbnailsModule(unittest.TestCase):
             self.assertEqual(txt_bytes, b"", "SIIGBF_THUMBNAILONLY must not return generic file icons")
         finally:
             pool.shutdown()
+
+    def test_transient_timeout_not_permanently_cached(self):
+        import core.thumbnails as thumbs_mod
+
+        thumbs_mod.make_thumbnail.cache_clear()
+        mp4 = os.path.join(self.tmp, "retry.mp4")
+        with open(mp4, "wb") as f:
+            f.write(b"fake-mp4")
+        st = os.stat(mp4)
+        fake_pool = mock.MagicMock()
+        fake_pool.generate.side_effect = [None, b"JPEGDATA"]
+        with mock.patch.object(thumbs_mod.sys, "platform", "win32"), mock.patch.object(
+            thumbs_mod, "_get_shell_pool", return_value=fake_pool
+        ):
+            first = thumbs_mod.make_thumbnail(mp4, st.st_mtime_ns, st.st_size)
+            second = thumbs_mod.make_thumbnail(mp4, st.st_mtime_ns, st.st_size)
+            third = thumbs_mod.make_thumbnail(mp4, st.st_mtime_ns, st.st_size)
+        self.assertEqual(first, b"")
+        self.assertEqual(second, b"JPEGDATA")
+        self.assertEqual(third, b"JPEGDATA")
+        self.assertEqual(fake_pool.generate.call_count, 2)
+
+    def test_extended_media_categories_for_m4v_heif_raw(self):
+        from core.batches import _default_category
+
+        self.assertEqual(srv_mod.get_file_type_category("movie.m4v"), "video")
+        self.assertEqual(_default_category("movie.m4v"), "video")
+        for img_name in ("a.heif", "b.avif", "c.tif", "d.tiff", "e.cr2", "f.nef", "g.arw", "h.dng"):
+            self.assertEqual(srv_mod.get_file_type_category(img_name), "image", img_name)
+            self.assertEqual(_default_category(img_name), "image", img_name)
 
 
 if __name__ == "__main__":
