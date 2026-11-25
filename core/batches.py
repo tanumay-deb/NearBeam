@@ -93,10 +93,12 @@ class BatchStore:
         max_batches: int = 20,
         format_size_fn: Callable[[int], str] = _default_format_size,
         category_fn: Callable[[str], str] = _default_category,
+        thumbnailable_fn: Optional[Callable[[str], bool]] = None,
     ):
         self.max_batches = max(1, int(max_batches))
         self._format_size = format_size_fn
         self._category = category_fn
+        self._thumbnailable = thumbnailable_fn or (lambda name: self._category(name) == "image")
         self._lock = threading.RLock()
         self._batches: "OrderedDict[str, dict]" = OrderedDict()
 
@@ -144,6 +146,7 @@ class BatchStore:
             "modified": _format_mtime(st.st_mtime),
             "mtime": st.st_mtime,
             "category": self._category(fname),
+            "has_thumb": bool(self._thumbnailable(fname)),
         }
 
     def _public_item(self, item: dict) -> dict:
@@ -155,12 +158,13 @@ class BatchStore:
             "formatted_size": item["formatted_size"],
             "modified": item["modified"],
             "category": item["category"],
+            "has_thumb": bool(item.get("has_thumb", item.get("category") == "image")),
             "is_dir": False,
         }
 
     def _summary(self, batch: dict) -> dict:
         items = batch["items"]
-        thumbs = [it["id"] for it in items if it["category"] == "image"][:4]
+        thumbs = [it["id"] for it in items if it.get("has_thumb", it.get("category") == "image")][:4]
         return {
             "id": batch["id"],
             "label": batch["label"],

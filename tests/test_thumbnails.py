@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from PIL import Image
 
@@ -67,6 +68,46 @@ class TestThumbnails(unittest.TestCase):
     def test_path_traversal_is_refused(self):
         self.assertIn(self._thumb("../cfg.json").status_code, (403, 404))
         self.assertIn(self._thumb("..\\cfg.json").status_code, (403, 404))
+
+    def test_video_and_pdf_expose_has_thumb_and_use_thumbnail_engine(self):
+        mp4 = os.path.join(self.share, "demo.mp4")
+        pdf = os.path.join(self.share, "doc.pdf")
+        with open(mp4, "wb") as f:
+            f.write(b"\x00\x00\x00\x18ftypmp42")
+        with open(pdf, "wb") as f:
+            f.write(b"%PDF-1.4\n%%EOF\n")
+
+        browse = self.client.get("/api/safelist/browse", query_string={"folder_id": self.folder_id}).get_json()
+        by_name = {it["name"]: it for it in browse["items"]}
+        self.assertTrue(by_name["big.jpg"].get("has_thumb"))
+        self.assertFalse(by_name["notes.txt"].get("has_thumb"))
+        expected_rich = sys.platform == "win32"
+        self.assertEqual(by_name["demo.mp4"].get("has_thumb"), expected_rich)
+        self.assertEqual(by_name["doc.pdf"].get("has_thumb"), expected_rich)
+
+        buf = io.BytesIO()
+        Image.new("RGB", (160, 90), (10, 120, 200)).save(buf, "JPEG")
+        fake_jpeg = buf.getvalue()
+
+        if sys.platform == "win32":
+            with mock.patch.object(srv_mod, "make_thumbnail", return_value=fake_jpeg):
+                resp = self._thumb("demo.mp4")
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.mimetype, "image/jpeg")
+                self.assertEqual(resp.data, fake_jpeg)
+
+                batch = self.server.batch_store.create_or_merge([mp4], source="Test")
+                self.assertTrue(batch["preview_thumbs"])
+                item_id = batch["preview_thumbs"][0]
+                b_resp = self.client.get(f"/api/batches/{batch['id']}/thumb/{item_id}")
+                self.assertEqual(b_resp.status_code, 200)
+                self.assertEqual(b_resp.mimetype, "image/jpeg")
+                self.assertEqual(b_resp.data, fake_jpeg)
+
+    def test_empty_thumbnail_returns_404(self):
+        with mock.patch.object(srv_mod, "make_thumbnail", return_value=b""):
+            resp = self._thumb("big.jpg")
+            self.assertEqual(resp.status_code, 404)
 
 
 class TestNativeThumbnailsModule(unittest.TestCase):

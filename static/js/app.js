@@ -364,13 +364,24 @@ function showAllSafeFolders(pushHistory = true) {
       const cat = f.category || "file";
       iconDiv.className = `file-icon ${cat}`;
       iconDiv.innerHTML = categoryIcons[cat] || categoryIcons.file;
-      if (browsePrefs.thumbs && cat === "image") {
+      if (browsePrefs.thumbs && (f.has_thumb || cat === "image")) {
         const thumb = document.createElement("img");
         thumb.className = "file-thumb";
         thumb.alt = "";
         thumb.loading = "lazy";
         thumb.decoding = "async";
         thumb.src = `/api/safelist/thumb?folder_id=${encodeURIComponent(f.id)}&subpath=`;
+        if (cat === "video") {
+          thumb.addEventListener("load", () => {
+            if (!iconDiv.querySelector(".video-thumb-badge")) {
+              const badge = document.createElement("span");
+              badge.className = "video-thumb-badge";
+              badge.setAttribute("aria-hidden", "true");
+              badge.textContent = "▶";
+              iconDiv.appendChild(badge);
+            }
+          });
+        }
         thumb.addEventListener("error", () => thumb.remove());
         iconDiv.appendChild(thumb);
       }
@@ -1458,14 +1469,25 @@ function renderSafeItems(items, filtered = false) {
     const iconDiv = document.createElement("div");
     iconDiv.className = `file-icon ${item.category || "file"}`;
     iconDiv.innerHTML = categoryIcons[item.category] || categoryIcons.file;
-    if (browsePrefs.thumbs && item.category === "image") {
+    if (browsePrefs.thumbs && (item.has_thumb || item.category === "image")) {
       const thumb = document.createElement("img");
       thumb.className = "file-thumb";
       thumb.alt = "";
       thumb.loading = "lazy";
       thumb.decoding = "async";
       thumb.src = safeItemUrl("thumb", item);
-      thumb.addEventListener("error", () => thumb.remove()); // HEIC/SVG/corrupt: keep the icon
+      if (item.category === "video") {
+        thumb.addEventListener("load", () => {
+          if (!iconDiv.querySelector(".video-thumb-badge")) {
+            const badge = document.createElement("span");
+            badge.className = "video-thumb-badge";
+            badge.setAttribute("aria-hidden", "true");
+            badge.textContent = "▶";
+            iconDiv.appendChild(badge);
+          }
+        });
+      }
+      thumb.addEventListener("error", () => thumb.remove()); // Unsupported/corrupt: keep the icon
       iconDiv.appendChild(thumb);
     }
 

@@ -359,6 +359,7 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
+from core.thumbnails import THUMB_PX, is_thumbnailable, make_thumbnail
 from core.version import APP_VERSION, check_for_updates
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -590,25 +591,6 @@ def resolve_receive_dir(
     return candidate
 
 
-THUMB_PX = 320  # sharp on 3x phone screens for grid tiles, still ~20 KB
-
-
-@lru_cache(maxsize=512)
-def make_thumbnail(path: str, mtime_ns: int, size: int) -> bytes:
-    """Small JPEG of a photo. mtime/size are part of the cache key so edits invalidate it."""
-    from PIL import Image, ImageOps
-
-    with Image.open(path) as im:
-        im.draft("RGB", (THUMB_PX * 2, THUMB_PX * 2))  # JPEGs decode at reduced scale: big photos stay fast
-        im = ImageOps.exif_transpose(im)
-        im.thumbnail((THUMB_PX, THUMB_PX))
-        if im.mode != "RGB":
-            im = im.convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=75, optimize=True)
-        return buf.getvalue()
-
-
 class NearBeamServer:
     def __init__(self, port: int = 5000, enable_mesh: bool = True):
         self.port = port
@@ -673,6 +655,7 @@ class NearBeamServer:
         self.batch_store = BatchStore(
             format_size_fn=format_size,
             category_fn=get_file_type_category,
+            thumbnailable_fn=is_thumbnailable,
         )
 
         # Recently finished uploads: a resent last chunk (its response got lost) gets the
@@ -1784,8 +1767,10 @@ class NearBeamServer:
                         entry["formatted_size"] = format_size(st.st_size)
                         entry["modified"] = _format_mtime(st.st_mtime)
                         entry["category"] = get_file_type_category(folder["name"])
+                        entry["has_thumb"] = is_thumbnailable(folder_path)
                     except OSError:
                         entry["category"] = get_file_type_category(folder["name"])
+                        entry["has_thumb"] = is_thumbnailable(folder_path)
                 elif exists and not is_file:
                     try:
                         entry["item_count"] = len(os.listdir(folder_path))
@@ -1834,6 +1819,7 @@ class NearBeamServer:
                         "subpath": fname,
                         "modified": _format_mtime(stat.st_mtime),
                         "category": get_file_type_category(fname),
+                        "has_thumb": is_thumbnailable(fname),
                     }],
                 })
 
@@ -1885,6 +1871,7 @@ class NearBeamServer:
                                     "subpath": rel_entry_subpath,
                                     "modified": mtime,
                                     "category": get_file_type_category(entry.name),
+                                    "has_thumb": is_thumbnailable(entry.name),
                                 })
                         except (PermissionError, OSError):
                             continue
@@ -1946,7 +1933,7 @@ class NearBeamServer:
 
         @app.route("/api/safelist/thumb")
         def api_safelist_thumb():
-            """Small cached JPEG of a shared photo, so browsing big folders doesn't pull full-size images."""
+            """Small cached JPEG thumbnail for shared photos, videos, PDFs, HEIC/RAW, and Office docs."""
             folder_id = request.args.get("folder_id", "")
             subpath = request.args.get("subpath", "")
             try:
@@ -1955,13 +1942,14 @@ class NearBeamServer:
                 return jsonify({"error": "Access denied"}), 403
             except Exception as e:
                 return jsonify({"error": str(e)}), 404
-            if not os.path.isfile(real_target) or get_file_type_category(real_target) != "image":
+            if not os.path.isfile(real_target) or not is_thumbnailable(real_target):
                 return jsonify({"error": "No thumbnail"}), 404
             try:
                 st = os.stat(real_target)
                 data = make_thumbnail(real_target, st.st_mtime_ns, st.st_size)
             except Exception:
-                # SVG, HEIC, corrupt files: the page shows the type icon instead.
+                return jsonify({"error": "No thumbnail"}), 404
+            if not data:
                 return jsonify({"error": "No thumbnail"}), 404
             resp = send_file(io.BytesIO(data), mimetype="image/jpeg")
             resp.headers["Cache-Control"] = "private, max-age=86400"
@@ -2106,12 +2094,14 @@ class NearBeamServer:
         @app.route("/api/batches/<batch_id>/thumb/<item_id>")
         def api_batches_thumb_item(batch_id, item_id):
             item = self.batch_store.get_item(batch_id, item_id)
-            if not item or not os.path.isfile(item["path"]) or item.get("category") != "image":
+            if not item or not os.path.isfile(item["path"]) or not is_thumbnailable(item["path"]):
                 return jsonify({"error": "No thumbnail"}), 404
             try:
                 st = os.stat(item["path"])
                 data = make_thumbnail(item["path"], st.st_mtime_ns, st.st_size)
             except Exception:
+                return jsonify({"error": "No thumbnail"}), 404
+            if not data:
                 return jsonify({"error": "No thumbnail"}), 404
             resp = send_file(io.BytesIO(data), mimetype="image/jpeg")
             resp.headers["Cache-Control"] = "private, max-age=86400"
@@ -2640,6 +2630,7 @@ class NearBeamServer:
                                 "modified": _format_mtime(stat.st_mtime),
                                 "mtime": stat.st_mtime,
                                 "category": get_file_type_category(fname),
+                                "has_thumb": is_thumbnailable(fname),
                             })
                 except Exception as e:
                     print(f"Error scanning save directory: {e}")
