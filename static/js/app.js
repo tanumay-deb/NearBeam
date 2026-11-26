@@ -2243,7 +2243,7 @@ function renderMeshNodesUI(role, nodes) {
   if (!meshClusterPill || !meshDestinationBar || !destinationPills) return;
 
   if (nodes && nodes.length > 1) {
-    meshClusterPill.style.display = "inline-flex";
+    meshClusterPill.classList.remove("hidden");
     meshClusterText.innerText = `${nodes.length} Hosts Connected`;
     meshDestinationBar.style.display = "flex";
 
@@ -2302,7 +2302,7 @@ function renderMeshNodesUI(role, nodes) {
     });
     destinationPills.appendChild(allBtn);
   } else {
-    meshClusterPill.style.display = "none";
+    meshClusterPill.classList.add("hidden");
     meshDestinationBar.style.display = "none";
     selectedTargetNodeId = "self";
   }

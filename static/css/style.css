@@ -1650,9 +1650,19 @@ body {
   .tab-btn .tab-badge {
     position: absolute;
     top: 3px;
-    right: calc(50% - 18px);
-    font-size: 0.6875rem;
+    left: calc(50% + 9px);
+    right: auto;
+    font-size: 0.65rem;
+    padding: 1px 5px;
+    line-height: 1.25;
+  }
+
+  .tab-btn .tab-badge.auto-badge {
+    top: 2px;
+    left: calc(50% + 10px);
+    font-size: 0.55rem;
     padding: 1px 4px;
+    letter-spacing: 0.02em;
   }
 
   /* The phone's active tab is a pale tint, not the blue gradient: solid badge, 5.9:1 in both themes. */
@@ -1717,21 +1727,35 @@ body {
   .host-pill {
     min-width: 0;
     flex-shrink: 1;
-    padding: 4px 8px;
+    padding: 4px 10px;
     font-size: 0.74rem;
-    max-width: 125px;
+    max-width: 190px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
+  .mesh-cluster-pill {
+    display: none !important;
+  }
+
   .nav-btn {
-    padding: 7px 10px;
+    padding: 7px 9px;
     font-size: 0.8rem;
   }
 
   .nav-btn .nav-btn-label {
     display: none;
+  }
+
+  .nav-btn.trust-nav-btn {
+    padding: 6px 10px;
+    gap: 5px;
+    font-size: 0.78rem;
+  }
+
+  .nav-btn.trust-nav-btn .nav-btn-label {
+    display: inline;
   }
 
   .desktop-only {
@@ -1926,6 +1950,15 @@ body {
     max-width: none;
     padding: 12px 16px;
     font-size: 0.86rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .host-pill {
+    display: none;
+  }
+  .tab-btn .tab-badge.auto-badge {
+    display: none;
   }
 }
 
