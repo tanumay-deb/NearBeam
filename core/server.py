@@ -3058,13 +3058,28 @@ class NearBeamServer:
         @app.route("/api/mesh/register", methods=["POST"])
         def api_mesh_register():
             """Secondary nodes register with Primary Leader."""
+            from core.mesh import is_valid_peer_ip, parse_valid_port
+
             data, err = _parse_json_dict()
             if err:
                 return err
             node_id = data.get("node_id")
             ip = data.get("ip")
-            if not isinstance(node_id, str) or not node_id.strip() or not isinstance(ip, str) or not ip.strip():
+            port = parse_valid_port(data.get("port"), default=5000)
+            if (
+                not isinstance(node_id, str)
+                or not node_id.strip()
+                or not is_valid_peer_ip(ip)
+                or port is None
+            ):
                 return jsonify({"error": "Invalid node registration data"}), 400
+
+            clean_data = {
+                **data,
+                "node_id": node_id.strip(),
+                "ip": ip.strip(),
+                "port": port,
+            }
 
             if self.mesh:
                 if self.mesh.role != "leader":
@@ -3073,13 +3088,13 @@ class NearBeamServer:
                         "role": self.mesh.role,
                         "leader": self.mesh.leader_info,
                     }), 409
-                if not self.mesh.register_node(data):
+                if not self.mesh.register_node(clean_data):
                     return jsonify({
                         "error": "Not leader",
                         "role": self.mesh.role,
                         "leader": self.mesh.leader_info,
                     }), 409
-                self.log_activity(f"Secondary Node joined cluster: {data.get('name')} ({ip})", "info")
+                self.log_activity(f"Secondary Node joined cluster: {clean_data.get('name')} ({clean_data['ip']})", "info")
                 self.broadcast_event({
                     "type": "mesh_nodes_changed",
                     "nodes": self.mesh.get_nodes_list(),
@@ -3090,6 +3105,7 @@ class NearBeamServer:
                     "leader_name": self.mesh.device_name,
                     "leader_role": self.mesh.role,
                     "leader_started_at": self.mesh.started_at,
+                    "nodes": self.mesh.get_cluster_snapshot(),
                 })
             return jsonify({"error": "Mesh not enabled on host"}), 503
 
@@ -3118,6 +3134,7 @@ class NearBeamServer:
                     "leader_name": self.mesh.device_name,
                     "leader_role": self.mesh.role,
                     "leader_started_at": self.mesh.started_at,
+                    "nodes": self.mesh.get_cluster_snapshot(),
                 })
             return jsonify({"error": "Mesh not enabled"}), 503
 

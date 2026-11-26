@@ -31,6 +31,10 @@ const globalDropOverlay = document.getElementById("globalDropOverlay");
 const nearbyDevicesList = document.getElementById("nearbyDevicesList");
 const nearbyDevicesCountBadge = document.getElementById("nearbyDevicesCountBadge");
 const selectSafeFolder = document.getElementById("selectSafeFolder");
+const browseHostBadge = document.getElementById("browseHostBadge");
+const browseHostDesc = document.getElementById("browseHostDesc");
+const browseHostSwitcher = document.getElementById("browseHostSwitcher");
+const browseHostPills = document.getElementById("browseHostPills");
 const safeFilesContainer = document.getElementById("safeFilesContainer");
 const breadcrumbBar = document.getElementById("breadcrumbBar");
 const btnSafeBack = document.getElementById("btnSafeBack");
@@ -286,6 +290,12 @@ async function fetchServerInfo() {
       nearbyDevices = serverInfo.nearby_devices;
       renderNearbyDevicesDashboard(serverInfo.nearby_devices);
     }
+    if (Array.isArray(serverInfo.mesh_nodes) && serverInfo.mesh_nodes.length > 0 && meshNodes.length === 0) {
+      meshNodes = serverInfo.mesh_nodes;
+      renderMeshNodesUI(serverInfo.mesh_role || "leader", meshNodes);
+    } else {
+      updateBrowseHostContext();
+    }
   } catch (e) {
     hostNameDisplay.innerText = "Offline / Connection Error";
   }
@@ -318,6 +328,146 @@ if (hostPill) {
   });
 }
 
+// Click on connected hosts pill jumps straight to the Browse Host Switcher
+if (meshClusterPill) {
+  meshClusterPill.addEventListener("click", () => {
+    activateTab("tab-safelist", false);
+    if (browseHostSwitcher && browseHostSwitcher.style.display !== "none") {
+      browseHostSwitcher.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+}
+
+// --- Multi-Host Helpers ---
+
+function safeHostUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return null;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.origin;
+  } catch (e) {
+    return null;
+  }
+}
+
+function cleanHostDisplayName(nodeOrName) {
+  const raw =
+    typeof nodeOrName === "string"
+      ? nodeOrName
+      : (nodeOrName && (nodeOrName.raw_name || nodeOrName.name)) || "";
+  return String(raw)
+    .replace(/\s*\((This PC|Leader)\)\s*$/i, "")
+    .trim();
+}
+
+function getCurrentHostName() {
+  if (serverInfo && serverInfo.hostname) {
+    return cleanHostDisplayName(serverInfo.hostname);
+  }
+  const selfNode = Array.isArray(meshNodes) ? meshNodes.find((n) => n && n.is_self) : null;
+  if (selfNode) {
+    return cleanHostDisplayName(selfNode);
+  }
+  return "";
+}
+
+function renderRootSafeBreadcrumb() {
+  if (!breadcrumbBar) return;
+  const hostName = getCurrentHostName();
+  const item = document.createElement("span");
+  item.className = "breadcrumb-item active";
+  item.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>`;
+  item.appendChild(
+    document.createTextNode(hostName ? `Shared Safe Folders · ${hostName}` : "Shared Safe Folders")
+  );
+  breadcrumbBar.replaceChildren(item);
+}
+
+function emptySafeListMessage() {
+  const hostName = getCurrentHostName();
+  const base = hostName
+    ? `No folders have been added to the Safe List on ${hostName} yet.`
+    : "No folders have been added to the Safe List on the host PC yet.";
+  if (Array.isArray(meshNodes) && meshNodes.length > 1) {
+    return `${base} Switch hosts above to browse another PC's shared folders.`;
+  }
+  return base;
+}
+
+function updateBrowseHostContext() {
+  const hostName = getCurrentHostName();
+  const multiHost = Array.isArray(meshNodes) && meshNodes.length > 1;
+  if (browseHostBadge) {
+    if (hostName) {
+      const icon = hostName.toLowerCase().includes("laptop") ? "💻" : "🖥️";
+      browseHostBadge.textContent = `${icon} ${hostName}`;
+      browseHostBadge.style.display = "inline-flex";
+    } else {
+      browseHostBadge.style.display = "none";
+    }
+  }
+  if (browseHostDesc) {
+    if (hostName && multiHost) {
+      browseHostDesc.textContent = `Showing shared folders from ${hostName} — switch hosts below to browse another PC`;
+    } else if (hostName) {
+      browseHostDesc.textContent = `Browse files and folders exposed by ${hostName} over Wi-Fi`;
+    } else {
+      browseHostDesc.textContent = "Browse files and folders exposed by your host computer over Wi-Fi";
+    }
+  }
+  if (!currentFolderId && !currentBatchId) {
+    renderRootSafeBreadcrumb();
+    if (Array.isArray(cachedSafeFolders) && cachedSafeFolders.length === 0 && safeFilesContainer) {
+      const emptyP = safeFilesContainer.querySelector(".empty-state p");
+      if (emptyP) emptyP.textContent = emptySafeListMessage();
+    }
+  }
+}
+
+function renderBrowseHostSwitcher(nodes) {
+  if (!browseHostSwitcher || !browseHostPills) return;
+  if (Array.isArray(nodes) && nodes.length > 1) {
+    browseHostSwitcher.style.display = "flex";
+    browseHostPills.innerHTML = "";
+
+    nodes.forEach((node) => {
+      const cleanName = cleanHostDisplayName(node) || "Host PC";
+      const icon = cleanName.toLowerCase().includes("laptop") ? "💻" : "🖥️";
+      const nameEl = document.createElement("span");
+      nameEl.textContent = `${icon} ${cleanName}`;
+      const badgeEl = document.createElement("span");
+      badgeEl.className = "dest-badge";
+
+      if (node.is_self) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dest-pill active";
+        btn.setAttribute("aria-current", "true");
+        btn.title = `Currently browsing shared folders on ${cleanName}`;
+        badgeEl.textContent = "Viewing";
+        btn.replaceChildren(nameEl, " ", badgeEl);
+        browseHostPills.appendChild(btn);
+      } else {
+        const safeOrigin = safeHostUrl(node.url);
+        if (!safeOrigin) return;
+        const link = document.createElement("a");
+        link.className = "dest-pill browse-host-link";
+        link.href = `${safeOrigin}/`;
+        link.rel = "noopener";
+        link.title = `Switch to browse ${cleanName}'s shared folders (${safeOrigin})`;
+        badgeEl.textContent = "Browse ↗";
+        link.replaceChildren(nameEl, " ", badgeEl);
+        browseHostPills.appendChild(link);
+      }
+    });
+  } else {
+    browseHostSwitcher.style.display = "none";
+    browseHostPills.innerHTML = "";
+  }
+  updateBrowseHostContext();
+}
+
 // --- Safe List Folder Explorer ---
 
 function getParentSubpath(subpath) {
@@ -341,7 +491,7 @@ function showAllSafeFolders(pushHistory = true) {
   if (browseToolbar) browseToolbar.hidden = true;
   safeFilesContainer.classList.remove("view-list", "view-grid");
 
-  breadcrumbBar.innerHTML = `<span class="breadcrumb-item active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>Shared Safe Folders</span>`;
+  renderRootSafeBreadcrumb();
 
   if (pushHistory) {
     window.history.pushState({ view: "safelist_root" }, "", window.location.pathname);
@@ -349,7 +499,7 @@ function showAllSafeFolders(pushHistory = true) {
 
   safeFilesContainer.innerHTML = "";
   if (!cachedSafeFolders || cachedSafeFolders.length === 0) {
-    renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
+    renderSafeEmptyState(emptySafeListMessage());
     return;
   }
 
@@ -718,7 +868,7 @@ async function fetchSafeFolders() {
         if (btnDownloadFolderZip) btnDownloadFolderZip.style.display = "none";
         if (btnSafeBack) btnSafeBack.style.display = "none";
         if (safeFilesContainer) safeFilesContainer.classList.remove("view-list", "view-grid");
-        renderSafeEmptyState("No folders have been added to the Safe List on the host PC yet.");
+        renderSafeEmptyState(emptySafeListMessage());
       }
       return;
     }
@@ -1121,7 +1271,9 @@ function renderBreadcrumbs(crumbs) {
   // Root Safe List item
   const rootItem = document.createElement("span");
   rootItem.className = "breadcrumb-item";
-  rootItem.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>Safe List`;
+  const hostName = getCurrentHostName();
+  rootItem.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>`;
+  rootItem.appendChild(document.createTextNode(hostName ? `Safe List · ${hostName}` : "Safe List"));
   rootItem.title = "View all shared safe folders";
   rootItem.addEventListener("click", () => {
     showAllSafeFolders();
@@ -1859,6 +2011,8 @@ function renderNearbyDevicesDashboard(devices) {
 
   nearbyDevicesList.innerHTML = "";
 
+  const hostCount = list.filter((d) => d.kind === "host").length;
+
   list.forEach((dev) => {
     const card = document.createElement("div");
     const isHost = dev.kind === "host";
@@ -1879,7 +2033,9 @@ function renderNearbyDevicesDashboard(devices) {
 
     const roleLabel = isHost
       ? dev.is_self
-        ? "Host PC"
+        ? hostCount > 1
+          ? "Viewing"
+          : "Host PC"
         : "LAN Host"
       : "Browser";
 
@@ -1898,7 +2054,26 @@ function renderNearbyDevicesDashboard(devices) {
     `;
 
     if (isHost) {
-      card.title = `Click to target ${dev.name} or drop files here to send`;
+      if (!dev.is_self) {
+        const safeOrigin = safeHostUrl(dev.url);
+        if (safeOrigin) {
+          const cleanName = cleanHostDisplayName(dev.name || "peer PC");
+          const browseLink = document.createElement("a");
+          browseLink.className = "nearby-browse-btn";
+          browseLink.href = `${safeOrigin}/`;
+          browseLink.rel = "noopener";
+          browseLink.title = `Open ${cleanName} to browse its shared folders`;
+          browseLink.setAttribute("aria-label", `Browse shared folders on ${cleanName}`);
+          browseLink.textContent = "Browse ↗";
+          browseLink.addEventListener("click", (e) => {
+            e.stopPropagation();
+          });
+          card.appendChild(browseLink);
+        }
+      }
+      card.title = dev.is_self
+        ? `Click to target ${dev.name} or drop files here to send`
+        : `Click to target ${dev.name} for Send, drop files here, or tap Browse to view its shared folders`;
       card.addEventListener("click", () => {
         selectedTargetNodeId = dev.is_self ? "self" : dev.id;
         renderNearbyDevicesDashboard(nearbyDevices);
@@ -2027,6 +2202,7 @@ function renderMeshNodesUI(role, nodes) {
     meshDestinationBar.style.display = "none";
     selectedTargetNodeId = "self";
   }
+  renderBrowseHostSwitcher(nodes);
 }
 
 

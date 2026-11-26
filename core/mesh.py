@@ -4,6 +4,7 @@ Enables Leader-Follower auto-discovery, heartbeat monitoring,
 and unified multi-host file transfer and clipboard coordination.
 """
 
+import ipaddress
 import json
 import socket
 import threading
@@ -17,6 +18,48 @@ from core.network import get_all_local_ips, get_hostname, get_local_ip
 
 MESH_DISCOVERY_PORT = 5005
 HEARTBEAT_INTERVAL = 3.0
+
+
+def is_valid_peer_ip(ip) -> bool:
+    """Returns True only for valid IPv4/IPv6 literal addresses (prevents URL/XSS injection)."""
+    if not isinstance(ip, str):
+        return False
+    stripped = ip.strip()
+    if not stripped:
+        return False
+    try:
+        ipaddress.ip_address(stripped)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_valid_port(port, default: Optional[int] = 5000) -> Optional[int]:
+    """Parses a TCP port in 1..65535; rejects booleans and out-of-range values."""
+    if port is None:
+        return default
+    if isinstance(port, bool):
+        return None
+    try:
+        parsed = int(port)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= parsed <= 65535:
+        return parsed
+    return None
+
+
+def _format_host_url(ip: str, port: int) -> str:
+    host = f"[{ip}]" if (":" in ip and not ip.startswith("[")) else ip
+    return f"http://{host}:{port}"
+
+
+def _clean_peer_name(name) -> str:
+    raw = str(name or "Unknown Node").strip()
+    for suffix in (" (This PC)", " (Leader)"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)].strip()
+    return raw or "Unknown Node"
 
 
 def _rank(info: dict) -> tuple:
@@ -46,9 +89,10 @@ class MeshNode:
         return {
             "id": self.node_id,
             "name": self.name,
+            "raw_name": self.name,
             "ip": self.ip,
             "port": self.port,
-            "url": f"http://{self.ip}:{self.port}",
+            "url": _format_host_url(self.ip, self.port),
             "role": self.role,
             "is_leader": (self.role == "leader"),
             "is_self": is_self,
@@ -82,6 +126,7 @@ class MeshManager:
         self._missed_leader_heartbeats = 0
         self.leader_info: Optional[dict] = None
         self.nodes: dict[str, MeshNode] = {}
+        self._peer_nodes: dict[str, MeshNode] = {}
 
         self.on_role_change = on_role_change
         self.on_nodes_change = on_nodes_change
@@ -293,12 +338,19 @@ class MeshManager:
                 is_leader = self.role == "leader"
             node_id = msg.get("node_id")
             ip = msg.get("ip")
-            if is_leader and isinstance(node_id, str) and node_id and isinstance(ip, str) and ip:
+            port = parse_valid_port(msg.get("port"), default=5000)
+            if (
+                is_leader
+                and isinstance(node_id, str)
+                and node_id.strip()
+                and is_valid_peer_ip(ip)
+                and port is not None
+            ):
                 self.register_node(MeshNode(
-                    node_id=node_id,
-                    name=str(msg.get("name") or "Unknown Node"),
-                    ip=ip,
-                    port=int(msg.get("port") or 5000),
+                    node_id=node_id.strip(),
+                    name=_clean_peer_name(msg.get("name")),
+                    ip=ip.strip(),
+                    port=port,
                     role="node",
                     last_seen=time.time(),
                 ))
@@ -310,6 +362,7 @@ class MeshManager:
             self.leader_info = leader
             self._missed_leader_heartbeats = 0
             self.nodes.clear()
+            self._peer_nodes.clear()
         print(f"  [Mesh] Another Leader found: {leader.get('name')} ({leader.get('ip')}). Joining it as a Secondary Node.")
         threading.Thread(target=self._register_with_leader, daemon=True).start()
         if self.on_role_change:
@@ -327,6 +380,63 @@ class MeshManager:
             self.leader_info["name"] = data["leader_name"]
         if data.get("leader_started_at") is not None:
             self.leader_info["started_at"] = data["leader_started_at"]
+
+    def _sync_cluster_peers(self, raw_nodes) -> None:
+        """Updates cached sibling peers received from Leader register/heartbeat responses."""
+        if not isinstance(raw_nodes, list):
+            return
+        now = time.time()
+        changed = False
+        with self._lock:
+            if self.role != "node":
+                return
+            leader_id = self.leader_info.get("node_id") if self.leader_info else None
+            leader_addr = (
+                (str(self.leader_info.get("ip", "")).strip(), parse_valid_port(self.leader_info.get("port"), default=5000))
+                if self.leader_info
+                else None
+            )
+            self_addr = (str(self.ip or "").strip(), self.port)
+
+            new_peers: dict[str, MeshNode] = {}
+            for item in raw_nodes:
+                if not isinstance(item, dict):
+                    continue
+                raw_id = item.get("id") or item.get("node_id")
+                if not isinstance(raw_id, str) or not raw_id.strip():
+                    continue
+                nid = raw_id.strip()
+                raw_ip = item.get("ip")
+                port = parse_valid_port(item.get("port"), default=None)
+                if not is_valid_peer_ip(raw_ip) or port is None:
+                    continue
+                ip = raw_ip.strip()
+                if nid == self.node_id or (leader_id and nid == leader_id):
+                    continue
+                if (ip, port) == self_addr or (leader_addr and (ip, port) == leader_addr):
+                    continue
+                name = _clean_peer_name(item.get("raw_name") or item.get("name"))
+                new_peers[nid] = MeshNode(
+                    node_id=nid,
+                    name=name,
+                    ip=ip,
+                    port=port,
+                    role="node",
+                    last_seen=now,
+                )
+
+            old_sig = {k: (v.name, v.ip, v.port, v.role) for k, v in self._peer_nodes.items()}
+            new_sig = {k: (v.name, v.ip, v.port, v.role) for k, v in new_peers.items()}
+            if new_sig != old_sig:
+                self._peer_nodes = new_peers
+                changed = True
+            else:
+                for nid, peer in new_peers.items():
+                    if nid in self._peer_nodes:
+                        self._peer_nodes[nid].last_seen = now
+
+        if changed and self.on_nodes_change:
+            self.on_nodes_change(self.get_nodes_list())
 
     def _handle_not_leader_response(self, err_data: dict, allow_redirect: bool = True):
         """Re-anchors a secondary node if its target stepped down to non-leader."""
@@ -347,12 +457,14 @@ class MeshManager:
                     "started_at": redirect.get("started_at") or 0,
                 }
                 self._missed_leader_heartbeats = 0
+                self._peer_nodes.clear()
             self._register_with_leader(allow_redirect=False)
             return
         # No valid redirect target: clear stale leader and run discovery/promotion.
         with self._lock:
             self.leader_info = None
             self._missed_leader_heartbeats = 0
+            self._peer_nodes.clear()
         if self.running and not self._stop_event.is_set():
             self._discover_and_elect()
 
@@ -387,6 +499,7 @@ class MeshManager:
                     with self._lock:
                         self._update_leader_metadata_locked(body)
                         self._missed_leader_heartbeats = 0
+                    self._sync_cluster_peers(body.get("nodes"))
                     print(f"  [Mesh] Registered successfully with Leader @ {leader['ip']}:{leader['port']}")
         except urllib.error.HTTPError as he:
             if he.code == 409:
@@ -429,6 +542,7 @@ class MeshManager:
                             with self._lock:
                                 self._missed_leader_heartbeats = 0
                                 self._update_leader_metadata_locked(body)
+                            self._sync_cluster_peers(body.get("nodes"))
                             # Leader restarted or merged and doesn't know us: register again.
                             if body.get("updated") is False:
                                 self._register_with_leader()
@@ -499,6 +613,7 @@ class MeshManager:
         with self._lock:
             self.role = "leader"
             self.leader_info = None
+            self._peer_nodes.clear()
 
         # Announce leadership to the network
         self._send_broadcast(self._leader_announcement())
@@ -514,11 +629,16 @@ class MeshManager:
             if self.role != "leader":
                 return False
             if isinstance(node_or_dict, dict):
+                ip = node_or_dict.get("ip")
+                port = parse_valid_port(node_or_dict.get("port"), default=5000)
+                node_id = node_or_dict.get("node_id")
+                if not isinstance(node_id, str) or not node_id.strip() or not is_valid_peer_ip(ip) or port is None:
+                    return False
                 node = MeshNode(
-                    node_id=node_or_dict["node_id"],
-                    name=node_or_dict.get("name", "Unknown Node"),
-                    ip=node_or_dict["ip"],
-                    port=node_or_dict.get("port", 5000),
+                    node_id=node_id.strip(),
+                    name=_clean_peer_name(node_or_dict.get("name")),
+                    ip=ip.strip(),
+                    port=port,
                     role="node",
                     last_seen=time.time(),
                 )
@@ -529,6 +649,26 @@ class MeshManager:
         if self.on_nodes_change:
             self.on_nodes_change(self.get_nodes_list())
         return True
+
+    def get_cluster_snapshot(self) -> list[dict]:
+        """Returns canonical cluster membership (clean hostnames, no self suffix) for peer sync."""
+        now = time.time()
+        with self._lock:
+            snapshot = [{
+                "id": self.node_id,
+                "name": self.device_name,
+                "raw_name": self.device_name,
+                "ip": self.ip,
+                "port": self.port,
+                "url": _format_host_url(self.ip, self.port),
+                "role": self.role,
+                "is_leader": (self.role == "leader"),
+                "last_seen": now,
+            }]
+            if self.role == "leader":
+                for node in self.nodes.values():
+                    snapshot.append(node.to_dict(is_self=False))
+            return snapshot
 
     def update_heartbeat(self, node_id: str) -> bool:
         """Updates last_seen timestamp for an active node."""
@@ -566,7 +706,7 @@ class MeshManager:
                 "raw_name": self.device_name,
                 "ip": self.ip,
                 "port": self.port,
-                "url": f"http://{self.ip}:{self.port}",
+                "url": _format_host_url(self.ip, self.port),
                 "role": self.role,
                 "is_leader": (self.role == "leader"),
                 "is_self": True,
@@ -579,19 +719,27 @@ class MeshManager:
                     nodes_list.append(node.to_dict(is_self=False))
             elif self.role == "node" and self.leader_info:
                 # Add leader to the list for the secondary node's perspective
+                leader_id = self.leader_info.get("node_id", "leader")
+                leader_ip = self.leader_info.get("ip") or ""
+                leader_port = parse_valid_port(self.leader_info.get("port"), default=5000) or 5000
+                leader_name = _clean_peer_name(self.leader_info.get("name", "Primary PC"))
                 leader_entry = {
-                    "id": self.leader_info.get("node_id", "leader"),
-                    "name": f"{self.leader_info.get('name', 'Primary PC')} (Leader)",
-                    "raw_name": self.leader_info.get("name", "Primary PC"),
-                    "ip": self.leader_info.get("ip"),
-                    "port": self.leader_info.get("port", 5000),
-                    "url": f"http://{self.leader_info.get('ip')}:{self.leader_info.get('port', 5000)}",
+                    "id": leader_id,
+                    "name": f"{leader_name} (Leader)",
+                    "raw_name": leader_name,
+                    "ip": leader_ip,
+                    "port": leader_port,
+                    "url": _format_host_url(leader_ip, leader_port),
                     "role": "leader",
                     "is_leader": True,
                     "is_self": False,
                     "last_seen": time.time(),
                 }
                 nodes_list.append(leader_entry)
+                for peer in self._peer_nodes.values():
+                    if peer.node_id in (self.node_id, leader_id):
+                        continue
+                    nodes_list.append(peer.to_dict(is_self=False))
 
             return nodes_list
 

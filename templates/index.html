@@ -173,7 +173,7 @@
             Nearby Devices
             <span class="nearby-role-tag" id="nearbyDevicesCountBadge">1 Online</span>
           </span>
-          <span class="nearby-devices-hint">Click a device to select target, or drag &amp; drop files directly onto a device card</span>
+          <span class="nearby-devices-hint">Click a PC to set Send target, drag &amp; drop files to send, or tap Browse to view its shared folders</span>
         </div>
         <div class="nearby-devices-grid" id="nearbyDevicesList">
           <!-- Dynamically populated by app.js -->
@@ -199,8 +199,8 @@
       <div class="section-card">
         <div class="safelist-header">
           <div class="safelist-title-group">
-            <h2 class="section-title">Safe List Explorer</h2>
-            <p class="section-desc">Browse files and folders exposed by your host computer over Wi-Fi</p>
+            <h2 class="section-title">Safe List Explorer <span class="browse-host-badge" id="browseHostBadge" style="display: none;"></span></h2>
+            <p class="section-desc" id="browseHostDesc">Browse files and folders exposed by your host computer over Wi-Fi</p>
           </div>
           <div class="safelist-actions">
             <select class="folder-selector" id="selectSafeFolder" aria-label="Select Safe Folder">
@@ -224,6 +224,19 @@
               </button>
             </div>
           </div>
+        </div>
+
+        <!-- Browse Host Switcher (Appears when >= 2 hosts are online) -->
+        <div class="mesh-host-switcher" id="browseHostSwitcher" style="display: none;">
+          <span class="destination-label">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+            Browsing Host:
+          </span>
+          <div class="destination-pills" id="browseHostPills"></div>
         </div>
 
         <!-- Breadcrumb & Back Navigation Bar -->
