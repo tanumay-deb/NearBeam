@@ -342,6 +342,12 @@ class TestTrustedPairingAndSafeDeleteAPI(unittest.TestCase):
         self.assertIn("/api/trust/pair", js)
         self.assertIn("/api/safelist/delete", js)
 
+        style_css = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "css", "style.css")
+        with open(style_css, "r", encoding="utf-8") as f:
+            css = f.read()
+        self.assertIn(".hidden {", css)
+        self.assertIn(".trust-modal-card .modal-body", css)
+
 
 class TestDesktopSettingsTrustedDevicesGui(unittest.TestCase):
     def test_settings_page_trusted_devices_widgets(self):

@@ -2134,14 +2134,20 @@ function renderNearbyDevicesDashboard(devices) {
         ? hostCount > 1
           ? "Viewing"
           : "Host PC"
+        : dev.is_leader
+        ? "Leader"
         : "LAN Host"
       : "Browser";
+
+    const displayName = isHost
+      ? cleanHostDisplayName(dev.name) || dev.name || "Host PC"
+      : dev.name || "Device";
 
     card.innerHTML = `
       <div class="nearby-device-icon">${icon}</div>
       <div class="nearby-device-info">
         <div class="nearby-device-name">
-          <span>${escapeHtml(dev.name || "Device")}</span>
+          <span>${escapeHtml(displayName)}</span>
           <span class="nearby-role-tag">${roleLabel}</span>
         </div>
         <div class="nearby-device-meta">

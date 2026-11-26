@@ -1371,6 +1371,12 @@ body {
   border-top: 1px solid var(--border-subtle);
   display: flex;
   justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.hidden {
+  display: none !important;
 }
 
 /* Toast Notifications */
@@ -2084,6 +2090,11 @@ a.dest-pill.browse-host-link {
   width: 92%;
 }
 
+.trust-modal-card .modal-body {
+  display: block;
+  min-height: auto;
+}
+
 .trust-modal-desc {
   font-size: 0.92rem;
   color: var(--text-main);
@@ -2657,12 +2668,20 @@ body.theme-light .zip-circle-wrap .progress-ring-track {
 }
 
 .nearby-device-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.9rem;
   font-weight: 700;
   color: var(--text-main);
-  white-space: nowrap;
+  min-width: 0;
+}
+
+.nearby-device-name > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .nearby-device-meta {
