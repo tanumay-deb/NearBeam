@@ -44,6 +44,12 @@
     </div>
 
     <div class="nav-right">
+      <button class="nav-btn trust-nav-btn" id="btnTrustNav" title="Pair this device to delete files in Shared Safe Folders">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+        </svg>
+        <span class="nav-btn-label" id="trustNavLabel">Pair</span>
+      </button>
       <button class="nav-btn" id="btnFaqNav" title="Connection Help & Device FAQ">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="10"></circle>
@@ -761,6 +767,16 @@
         <!-- Injected dynamically: img, video, audio, or pre/code -->
       </div>
       <div class="modal-footer">
+        <button type="button" class="danger-btn hidden" id="btnModalDelete" title="Move file to PC Recycle Bin">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+            <path d="M10 11v6"></path>
+            <path d="M14 11v6"></path>
+            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
+          </svg>
+          <span>Move to Recycle Bin</span>
+        </button>
         <a class="primary-btn" id="btnModalDownload" download>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -791,6 +807,64 @@
     </div>
   </div>
 
+  <!-- Trusted Device Pairing Modal -->
+  <div class="modal-backdrop hidden" id="trustModal">
+    <div class="modal-card trust-modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title">Trusted Device</h3>
+        <button class="modal-close-btn" id="btnCloseTrustModal" aria-label="Close Trusted Device dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="trustPairView">
+          <p class="trust-modal-desc">Pair this device once to move files in <strong>Shared Safe Folders</strong> to this PC's Windows Recycle Bin.</p>
+          <p class="trust-modal-steps">On your PC, open <strong>NearBeam → Settings → Trusted Devices → Pair a Device</strong>, then enter the 6-digit code:</p>
+          <div class="trust-form-group">
+            <label class="trust-field-label" for="trustCodeInput">6-Digit Pairing Code</label>
+            <input type="text" class="trust-code-input" id="trustCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000 000" />
+          </div>
+          <div class="trust-form-group">
+            <label class="trust-field-label" for="trustDeviceNameInput">Device Name (optional)</label>
+            <input type="text" class="trust-name-input" id="trustDeviceNameInput" maxlength="60" placeholder="e.g. My iPhone" />
+          </div>
+          <p class="trust-pair-error hidden" id="trustPairError" role="alert"></p>
+          <div class="trust-modal-actions">
+            <button type="button" class="primary-btn" id="btnSubmitPair">Pair Device</button>
+          </div>
+        </div>
+
+        <div id="trustActiveView" class="hidden">
+          <div class="trust-active-box">
+            <span class="trust-active-badge">✓ Trusted Device</span>
+            <p class="trust-active-name" id="trustActiveDeviceName"></p>
+            <p class="trust-modal-desc">This device can move files inside Shared Safe Folders to this PC's Windows Recycle Bin. Received files and root folders are never deleted.</p>
+          </div>
+          <div class="trust-modal-actions">
+            <button type="button" class="danger-btn" id="btnUnpairDevice">Unpair This Device</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Move to Recycle Bin Confirmation Modal -->
+  <div class="modal-backdrop hidden" id="deleteConfirmModal">
+    <div class="modal-card trust-modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title">Move to Recycle Bin?</h3>
+        <button class="modal-close-btn" id="btnCloseDeleteModal" aria-label="Cancel delete">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="trust-modal-desc" id="deleteConfirmSummary"></p>
+        <ul class="delete-confirm-list" id="deleteConfirmList"></ul>
+        <p class="delete-recycle-note">Files are moved to this PC's <strong>Windows Recycle Bin</strong> and can be restored from there.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="secondary-btn" id="btnCancelDelete">Cancel</button>
+        <button type="button" class="danger-btn" id="btnConfirmDelete">Move to Recycle Bin</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Sticky Selection Bar (outside .section-card so backdrop-filter doesn't trap fixed positioning) -->
   <div class="selection-bar hidden" id="selectionActionBar" role="region" aria-label="Selected files actions">
     <div class="selection-bar-info">
@@ -799,6 +873,7 @@
     <div class="selection-bar-actions">
       <button type="button" class="card-action-btn" id="btnSelectAllVisible">Select all</button>
       <button type="button" class="card-action-btn" id="btnCancelSelect">Cancel</button>
+      <button type="button" class="danger-btn btn-xs hidden" id="btnDeleteSelected" disabled>Delete</button>
       <button type="button" class="primary-btn btn-xs" id="btnDownloadSelected" disabled>Download</button>
     </div>
   </div>

@@ -385,8 +385,16 @@ from core.network import (
     get_hostname,
     get_local_ip,
 )
+import hmac
+import secrets
+from core.recycle import RecycleError, send_to_recycle_bin
 from core.thumbnails import THUMB_PX, is_thumbnailable, make_thumbnail, shutdown_thumbnail_pool
 from core.version import APP_VERSION, check_for_updates
+
+TRUST_COOKIE_NAME = "nearbeam_trust"
+PAIR_CODE_TTL_SECONDS = 120
+PAIR_CODE_MAX_ATTEMPTS = 5
+TRUST_COOKIE_MAX_AGE = 365 * 24 * 3600
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _PARTIAL_UPLOAD_RE = re.compile(r"\.[A-Za-z0-9_-]{1,128}\.tmp")  # dot first: a received 'notes.tmp' isn't one
@@ -704,6 +712,8 @@ class NearBeamServer:
         self._clients_lock = threading.Lock()
         self._upload_state_lock = threading.Lock()
         self._drop_zones_lock = threading.Lock()
+        self._trust_lock = threading.Lock()
+        self._active_pair_code: Optional[Dict[str, Any]] = None
         self.clipboard_content = ""
         self.clipboard_updated_at = None
         self.clipboard_image_bytes: Optional[bytes] = None
@@ -717,6 +727,7 @@ class NearBeamServer:
         self.clipboard_callbacks = []
         self.clipboard_image_callbacks = []
         self.mesh_callbacks = []
+        self.trust_callbacks = []
 
         # Mesh / Cluster management
         self.enable_mesh = enable_mesh
@@ -1061,6 +1072,83 @@ class NearBeamServer:
     def add_mesh_callback(self, callback):
         """Registers a callback for desktop GUI cluster status updates."""
         self.mesh_callbacks.append(callback)
+
+    def add_trust_callback(self, callback):
+        """Registers a callback for desktop GUI trusted-device changes."""
+        self.trust_callbacks.append(callback)
+
+    def _notify_trust_change(self):
+        self.broadcast_event({"type": "trusted_devices_changed"})
+        for cb in list(self.trust_callbacks):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def start_device_pairing(self) -> Dict[str, Any]:
+        """Generates a fresh single-use 6-digit pairing code valid for 2 minutes."""
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        with self._trust_lock:
+            self._active_pair_code = {
+                "code": code,
+                "expires_at": time.monotonic() + PAIR_CODE_TTL_SECONDS,
+                "attempts": 0,
+            }
+        self.log_activity("Device pairing started (6-digit code valid for 2 min)", "info")
+        self._notify_trust_change()
+        return {"code": code, "expires_in": PAIR_CODE_TTL_SECONDS}
+
+    def cancel_device_pairing(self) -> None:
+        with self._trust_lock:
+            was_active = self._active_pair_code is not None
+            self._active_pair_code = None
+        if was_active:
+            self._notify_trust_change()
+
+    def get_active_pairing(self) -> Optional[Dict[str, Any]]:
+        with self._trust_lock:
+            active = self._active_pair_code
+            if not active:
+                return None
+            remaining = int(active["expires_at"] - time.monotonic())
+            if remaining <= 0:
+                self._active_pair_code = None
+                return None
+            return {"code": active["code"], "remaining_seconds": remaining}
+
+    def revoke_trusted_device(self, device_id: str) -> bool:
+        removed = config.revoke_trusted_device(device_id)
+        if removed:
+            self.log_activity(f"Revoked trusted device ({device_id})", "info")
+            self._notify_trust_change()
+        return removed
+
+    def revoke_all_trusted_devices(self) -> int:
+        count = config.revoke_all_trusted_devices()
+        if count > 0:
+            self.log_activity(f"Revoked all {count} trusted device(s)", "info")
+            self._notify_trust_change()
+        return count
+
+    def _get_trusted_device_from_request(self) -> Optional[Dict[str, Any]]:
+        token = request.cookies.get(TRUST_COOKIE_NAME, "")
+        if not token:
+            return None
+        return config.verify_trusted_token(token, touch_ip=request.remote_addr or "")
+
+    @staticmethod
+    def _has_link_segment(base_real: str, clean_subpath: str) -> bool:
+        """Returns True if any path component from base_real down to clean_subpath is a symlink/junction."""
+        cur = base_real
+        if not clean_subpath:
+            return is_link_or_junction(cur)
+        for part in clean_subpath.split("/"):
+            if not part:
+                continue
+            cur = os.path.join(cur, part)
+            if is_link_or_junction(cur):
+                return True
+        return False
 
     def _on_mesh_role_change(self, role: str):
         """Triggered when role transitions between LEADER and NODE."""
@@ -2257,6 +2345,245 @@ class NearBeamServer:
                     total_bytes += f_size
 
             return jsonify(self._start_zip_job(folder_name, files_list, total_bytes))
+
+        # --- Trusted Device Pairing & Safe List Recycle Bin Delete ---
+
+        @app.route("/api/trust/status")
+        def api_trust_status():
+            dev = self._get_trusted_device_from_request()
+            return jsonify({
+                "trusted": dev is not None,
+                "device": dev,
+                "pairing_active": self.get_active_pairing() is not None,
+            })
+
+        @app.route("/api/trust/pair", methods=["POST"])
+        def api_trust_pair():
+            data, err = _parse_json_dict()
+            if err:
+                return err
+            raw_code = data.get("code", "")
+            if not isinstance(raw_code, str):
+                return jsonify({"error": "6-digit pairing code required"}), 400
+            clean_code = "".join(ch for ch in raw_code if ch.isdigit())
+            if len(clean_code) != 6:
+                return jsonify({"error": "Enter the 6-digit pairing code shown on your PC"}), 400
+
+            with self._trust_lock:
+                active = self._active_pair_code
+                if not active or time.monotonic() >= active["expires_at"]:
+                    self._active_pair_code = None
+                    return jsonify({
+                        "error": "No active pairing code. Click 'Pair a Device' in NearBeam Settings on your PC."
+                    }), 400
+                if not hmac.compare_digest(active["code"], clean_code):
+                    active["attempts"] += 1
+                    remaining = PAIR_CODE_MAX_ATTEMPTS - active["attempts"]
+                    if remaining <= 0:
+                        self._active_pair_code = None
+                        self.log_activity(f"Device pairing locked out after too many bad codes from {request.remote_addr}", "warning")
+                        return jsonify({
+                            "error": "Too many incorrect attempts. Pairing cancelled — generate a new code on the PC."
+                        }), 429
+                    return jsonify({"error": f"Invalid pairing code ({remaining} attempts left)"}), 403
+                # Valid code: single-use, consume immediately.
+                self._active_pair_code = None
+
+            raw_name = data.get("device_name", "")
+            if isinstance(raw_name, str) and raw_name.strip():
+                device_name = raw_name.strip()[:60]
+            else:
+                device_name = self._parse_client_info(
+                    request.remote_addr or "",
+                    request.headers.get("User-Agent", ""),
+                ).get("name", "Trusted Device")
+
+            raw_token = secrets.token_urlsafe(32)
+            dev = config.add_trusted_device(
+                name=device_name,
+                raw_token=raw_token,
+                ip=request.remote_addr or "",
+            )
+            self.log_activity(f"Trusted device paired: {dev['name']} ({request.remote_addr})", "info")
+            self._notify_trust_change()
+
+            resp = jsonify({"success": True, "trusted": True, "device": dev})
+            resp.set_cookie(
+                TRUST_COOKIE_NAME,
+                raw_token,
+                max_age=TRUST_COOKIE_MAX_AGE,
+                httponly=True,
+                samesite="Lax",
+                path="/",
+            )
+            return resp
+
+        @app.route("/api/trust/unpair", methods=["POST"])
+        def api_trust_unpair():
+            token = request.cookies.get(TRUST_COOKIE_NAME, "")
+            revoked = config.revoke_trusted_token(token) if token else False
+            if revoked:
+                self.log_activity(f"Trusted device unpaired itself ({request.remote_addr})", "info")
+                self._notify_trust_change()
+            resp = jsonify({"success": True, "trusted": False})
+            resp.delete_cookie(TRUST_COOKIE_NAME, path="/")
+            return resp
+
+        @app.route("/api/safelist/delete", methods=["POST"])
+        def api_safelist_delete():
+            """Moves file(s) inside a Shared Safe Folder to the Windows Recycle Bin (trusted devices only)."""
+            dev = self._get_trusted_device_from_request()
+            if dev is None:
+                return jsonify({"error": "Trusted device pairing required to delete files"}), 403
+
+            data, err = _parse_json_dict()
+            if err:
+                return err
+
+            folder_id = data.get("folder_id", "")
+            if not isinstance(folder_id, str) or not folder_id.strip():
+                return jsonify({"error": "folder_id is required"}), 400
+            folder_id = folder_id.strip()
+
+            safe_folder = config.get_safe_folder_by_id(folder_id)
+            if not safe_folder:
+                return jsonify({"error": "Safe folder not found"}), 404
+
+            base_real = os.path.realpath(safe_folder["path"])
+            if not os.path.exists(base_real):
+                return jsonify({"error": "Safe folder path does not exist"}), 404
+            is_single_file = os.path.isfile(base_real)
+
+            raw_items = data.get("items")
+            bulk_mode = raw_items is not None
+            if bulk_mode:
+                if not isinstance(raw_items, list) or len(raw_items) == 0:
+                    return jsonify({"error": "items must be a non-empty list"}), 400
+                if len(raw_items) > 500:
+                    return jsonify({"error": "Too many files in one delete request (max 500)"}), 400
+                targets = raw_items
+            else:
+                subpath = data.get("subpath", "")
+                if not isinstance(subpath, str):
+                    return jsonify({"error": "Invalid subpath"}), 400
+                targets = [subpath]
+
+            deleted = []
+            failed = []
+            pruned_folder = False
+            first_error_status = 400
+            seen_real: set[str] = set()
+
+            for raw_sp in targets:
+                if not isinstance(raw_sp, str):
+                    failed.append({"subpath": str(raw_sp), "error": "Invalid subpath", "status": 400})
+                    continue
+                clean_sp = raw_sp.replace("\\", "/").strip("/")
+                if any(":" in part for part in clean_sp.split("/") if part):
+                    failed.append({"subpath": raw_sp, "error": "Invalid path syntax", "status": 403})
+                    first_error_status = 403
+                    continue
+                if not is_single_file and not clean_sp:
+                    failed.append({"subpath": raw_sp, "error": "Root shared folders cannot be deleted", "status": 403})
+                    first_error_status = 403
+                    continue
+
+                if self._has_link_segment(base_real, "" if is_single_file else clean_sp):
+                    failed.append({"subpath": raw_sp, "error": "Symbolic links and junctions cannot be deleted", "status": 403})
+                    first_error_status = 403
+                    continue
+
+                try:
+                    real_target = config.resolve_safe_path(folder_id, raw_sp)
+                except PermissionError as pe:
+                    failed.append({"subpath": raw_sp, "error": str(pe), "status": 403})
+                    first_error_status = 403
+                    continue
+                except (FileNotFoundError, KeyError) as fe:
+                    failed.append({"subpath": raw_sp, "error": str(fe), "status": 404})
+                    first_error_status = 404
+                    continue
+
+                if not is_single_file and real_target == base_real:
+                    failed.append({"subpath": raw_sp, "error": "Root shared folders cannot be deleted", "status": 403})
+                    first_error_status = 403
+                    continue
+
+                if real_target in seen_real:
+                    continue
+                seen_real.add(real_target)
+
+                if not os.path.lexists(real_target):
+                    failed.append({"subpath": raw_sp, "error": "File not found", "status": 404})
+                    first_error_status = 404
+                    continue
+                if is_link_or_junction(real_target):
+                    failed.append({"subpath": raw_sp, "error": "Symbolic links and junctions cannot be deleted", "status": 403})
+                    first_error_status = 403
+                    continue
+                if os.path.isdir(real_target):
+                    failed.append({
+                        "subpath": raw_sp,
+                        "error": "Folders cannot be deleted; only files can be moved to the Recycle Bin",
+                        "status": 403,
+                    })
+                    first_error_status = 403
+                    continue
+                if not os.path.isfile(real_target):
+                    failed.append({"subpath": raw_sp, "error": "Only regular files can be deleted", "status": 403})
+                    first_error_status = 403
+                    continue
+
+                try:
+                    send_to_recycle_bin(real_target)
+                except PermissionError as pe:
+                    failed.append({"subpath": raw_sp, "error": str(pe), "status": 403})
+                    first_error_status = 403
+                    continue
+                except FileNotFoundError as fe:
+                    failed.append({"subpath": raw_sp, "error": str(fe), "status": 404})
+                    first_error_status = 404
+                    continue
+                except (RecycleError, OSError) as re_err:
+                    failed.append({"subpath": raw_sp, "error": str(re_err), "status": 500})
+                    first_error_status = 500
+                    continue
+
+                fname = os.path.basename(real_target)
+                deleted.append({"subpath": clean_sp, "name": fname})
+                if is_single_file:
+                    if config.remove_safe_folder(folder_id):
+                        pruned_folder = True
+
+            if deleted:
+                names_preview = ", ".join(d["name"] for d in deleted[:3])
+                if len(deleted) > 3:
+                    names_preview += f" (+{len(deleted) - 3} more)"
+                self.log_activity(
+                    f"Moved {len(deleted)} file(s) to Recycle Bin by {dev['name']} ({request.remote_addr}): {names_preview}",
+                    "info",
+                )
+                self.broadcast_event({
+                    "type": "safelist_updated",
+                    "message": f"Moved {len(deleted)} file(s) to Recycle Bin",
+                })
+
+            if not deleted and failed:
+                err_status = failed[0].get("status", first_error_status)
+                return jsonify({
+                    "success": False,
+                    "error": failed[0]["error"],
+                    "deleted": [],
+                    "failed": [{k: v for k, v in f.items() if k != "status"} for f in failed],
+                    "pruned_folder": pruned_folder,
+                }), err_status
+
+            return jsonify({
+                "success": len(deleted) > 0 and len(failed) == 0,
+                "deleted": deleted,
+                "failed": [{k: v for k, v in f.items() if k != "status"} for f in failed],
+                "pruned_folder": pruned_folder,
+            })
 
         # --- Ephemeral PC -> Devices Send Batches Endpoints ---
 

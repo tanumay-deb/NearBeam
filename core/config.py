@@ -3,11 +3,15 @@ Configuration and persistence management for NearBeam.
 Handles Safe List folders, Auto-Save preferences, and settings.
 """
 
+import datetime
+import hashlib
+import hmac
 import json
 import os
 import shutil
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -55,9 +59,11 @@ class ConfigManager:
             "save_directory": self.default_save_dir,
             "safe_folders": [],
             "transfer_history": [],
+            "trusted_devices": [],
             "pin_enabled": False,
             "pin": "",
         }
+        self._trust_last_touch: dict[str, float] = {}
 
         self.load()
         self.ensure_save_directory()
@@ -93,6 +99,16 @@ class ConfigManager:
                     self.data["safe_folders"] = []
                 if not isinstance(self.data.get("transfer_history"), list):
                     self.data["transfer_history"] = []
+                raw_trusted = self.data.get("trusted_devices")
+                if not isinstance(raw_trusted, list):
+                    self.data["trusted_devices"] = []
+                else:
+                    self.data["trusted_devices"] = [
+                        d for d in raw_trusted
+                        if isinstance(d, dict)
+                        and isinstance(d.get("id"), str) and d["id"]
+                        and isinstance(d.get("token_hash"), str) and len(d["token_hash"]) == 64
+                    ]
                 if not isinstance(self.data.get("save_directory"), str) or not self.data["save_directory"].strip():
                     self.data["save_directory"] = self.default_save_dir
                 if not isinstance(self.data.get("port"), int) or isinstance(self.data.get("port"), bool):
@@ -353,6 +369,121 @@ class ConfigManager:
         with self._lock:
             self.data["transfer_history"] = []
             self.save()
+
+    # --- Trusted Devices (One-Time Pairing for Safe List Delete) ---
+
+    @staticmethod
+    def hash_trust_token(raw_token: str) -> str:
+        return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _public_trusted_device(entry: dict) -> dict:
+        return {
+            "id": entry.get("id", ""),
+            "name": entry.get("name", "Trusted Device"),
+            "paired_at": entry.get("paired_at", ""),
+            "last_used": entry.get("last_used", ""),
+            "ip": entry.get("ip", ""),
+        }
+
+    def get_trusted_devices(self) -> list[dict]:
+        """Returns public metadata for all paired trusted devices (never includes token_hash)."""
+        with self._lock:
+            return [self._public_trusted_device(d) for d in self.data.get("trusted_devices", [])]
+
+    def add_trusted_device(self, name: str, raw_token: str, ip: str = "") -> dict:
+        """Stores a newly paired trusted device using SHA-256 of its raw token."""
+        if not isinstance(raw_token, str) or len(raw_token) < 16:
+            raise ValueError("Invalid trust token")
+        clean_name = (name or "").strip()[:60] or "Trusted Device"
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "name": clean_name,
+            "token_hash": self.hash_trust_token(raw_token),
+            "paired_at": now_str,
+            "last_used": now_str,
+            "ip": (ip or "").strip()[:64],
+        }
+        with self._lock:
+            self.data.setdefault("trusted_devices", []).append(entry)
+            self._trust_last_touch[entry["id"]] = time.monotonic()
+            self.save()
+        return self._public_trusted_device(entry)
+
+    def verify_trusted_token(self, raw_token: str, touch_ip: str = "") -> dict | None:
+        """Verifies a raw cookie token in constant time; returns public device metadata if valid."""
+        if not isinstance(raw_token, str) or len(raw_token) < 16:
+            return None
+        cand_hash = self.hash_trust_token(raw_token)
+        with self._lock:
+            matched = None
+            for entry in self.data.get("trusted_devices", []):
+                stored = entry.get("token_hash", "")
+                if isinstance(stored, str) and hmac.compare_digest(stored, cand_hash):
+                    matched = entry
+                    break
+            if matched is None:
+                return None
+            now_mono = time.monotonic()
+            dev_id = matched["id"]
+            clean_ip = (touch_ip or "").strip()[:64]
+            needs_save = False
+            if clean_ip and matched.get("ip") != clean_ip:
+                matched["ip"] = clean_ip
+                needs_save = True
+            if now_mono - self._trust_last_touch.get(dev_id, 0.0) >= 60.0:
+                matched["last_used"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                self._trust_last_touch[dev_id] = now_mono
+                needs_save = True
+            if needs_save:
+                self.save()
+            return self._public_trusted_device(matched)
+
+    def revoke_trusted_device(self, device_id: str) -> bool:
+        """Revokes a single trusted device by ID."""
+        if not device_id:
+            return False
+        with self._lock:
+            devices = self.data.get("trusted_devices", [])
+            kept = [d for d in devices if d.get("id") != device_id]
+            if len(kept) != len(devices):
+                self.data["trusted_devices"] = kept
+                self._trust_last_touch.pop(device_id, None)
+                self.save()
+                return True
+        return False
+
+    def revoke_trusted_token(self, raw_token: str) -> bool:
+        """Revokes whichever trusted device matches raw_token."""
+        if not isinstance(raw_token, str) or len(raw_token) < 16:
+            return False
+        cand_hash = self.hash_trust_token(raw_token)
+        with self._lock:
+            devices = self.data.get("trusted_devices", [])
+            kept = []
+            removed = False
+            for d in devices:
+                stored = d.get("token_hash", "")
+                if not removed and isinstance(stored, str) and hmac.compare_digest(stored, cand_hash):
+                    self._trust_last_touch.pop(d.get("id", ""), None)
+                    removed = True
+                else:
+                    kept.append(d)
+            if removed:
+                self.data["trusted_devices"] = kept
+                self.save()
+            return removed
+
+    def revoke_all_trusted_devices(self) -> int:
+        """Revokes all trusted devices."""
+        with self._lock:
+            count = len(self.data.get("trusted_devices", []))
+            if count > 0:
+                self.data["trusted_devices"] = []
+                self._trust_last_touch.clear()
+                self.save()
+            return count
 
 
 # Global default instance

@@ -6,6 +6,7 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -366,6 +367,61 @@ class SettingsPage(Page):
         receiving.body.addLayout(org_row)
         self.body.addWidget(receiving)
 
+        trusted = Card(spacing=10)
+        trusted.body.addWidget(label("Trusted Devices", "h2"))
+        trusted.body.addWidget(
+            label(
+                "Pair your phone once with a 6-digit code so it can move files in Shared Safe Folders to the Windows Recycle Bin. Revoke access anytime.",
+                "dim",
+                wrap=True,
+            )
+        )
+        trust_actions = QHBoxLayout()
+        trust_actions.setSpacing(8)
+        self.btn_pair_device = button("Pair a Device", "shield")
+        trust_actions.addWidget(self.btn_pair_device)
+        trust_actions.addStretch()
+        self.btn_revoke_all_trusted = button("Revoke All", "trash", "dangerBtn")
+        self.btn_revoke_all_trusted.hide()
+        trust_actions.addWidget(self.btn_revoke_all_trusted)
+        trusted.body.addLayout(trust_actions)
+
+        self.pair_box = QFrame()
+        self.pair_box.setStyleSheet(
+            f"QFrame {{ background: rgba(99, 102, 241, 0.10); border: 1px solid rgba(129, 140, 248, 0.35); border-radius: 10px; padding: 10px; }}"
+        )
+        pair_col = QVBoxLayout(self.pair_box)
+        pair_col.setContentsMargins(12, 10, 12, 10)
+        pair_col.setSpacing(6)
+        pair_col.addWidget(label("On your phone, open NearBeam → tap Pair → enter this 6-digit code:", "dim", wrap=True))
+        code_row = QHBoxLayout()
+        code_row.setSpacing(10)
+        self.lbl_pair_code = QLabel("000 000")
+        self.lbl_pair_code.setTextFormat(Qt.PlainText)
+        self.lbl_pair_code.setStyleSheet(
+            f"font-size: 26px; font-weight: 800; letter-spacing: 5px; color: {theme.TEXT}; "
+            "font-family: 'Cascadia Mono', 'Consolas', monospace; background: transparent; border: none;"
+        )
+        code_row.addWidget(self.lbl_pair_code)
+        self.lbl_pair_countdown = label("Expires in 2:00", "dim")
+        self.lbl_pair_countdown.setStyleSheet("background: transparent; border: none;")
+        code_row.addWidget(self.lbl_pair_countdown, 0, Qt.AlignVCenter)
+        code_row.addStretch()
+        self.btn_copy_pair_code = button("Copy", "copy")
+        self.btn_cancel_pair = button("Cancel", "x")
+        code_row.addWidget(self.btn_copy_pair_code)
+        code_row.addWidget(self.btn_cancel_pair)
+        pair_col.addLayout(code_row)
+        self.pair_box.hide()
+        trusted.body.addWidget(self.pair_box)
+
+        self.trusted_list_widget = QWidget()
+        self.trusted_list_layout = QVBoxLayout(self.trusted_list_widget)
+        self.trusted_list_layout.setContentsMargins(0, 4, 0, 0)
+        self.trusted_list_layout.setSpacing(6)
+        trusted.body.addWidget(self.trusted_list_widget)
+        self.body.addWidget(trusted)
+
         clip = Card(spacing=4)
         clip.body.addWidget(label("Clipboard", "h2"))
         self.clipboard = ToggleRow("Live clipboard sync", "Share text and screenshots you copy with your other devices.", clipboard)
@@ -393,3 +449,51 @@ class SettingsPage(Page):
         net.body.addLayout(fw)
         self.body.addWidget(net)
         self.body.addStretch()
+
+    def set_pairing_state(self, code: str | None, remaining_seconds: int = 0):
+        if code and len(code) == 6:
+            self.lbl_pair_code.setText(f"{code[:3]} {code[3:]}")
+            mins, secs = divmod(max(0, int(remaining_seconds)), 60)
+            self.lbl_pair_countdown.setText(f"Expires in {mins}:{secs:02d}")
+            self.pair_box.show()
+            self.btn_pair_device.setText("New Code")
+        else:
+            self.pair_box.hide()
+            self.btn_pair_device.setText("Pair a Device")
+
+    def set_trusted_devices(self, devices: list[dict], on_revoke=None):
+        clear_layout(self.trusted_list_layout)
+        if not devices:
+            self.btn_revoke_all_trusted.hide()
+            self.trusted_list_layout.addWidget(label("No trusted devices paired yet.", "dim"))
+            return
+        self.btn_revoke_all_trusted.show()
+        for dev in devices:
+            row_frame = QFrame()
+            row_frame.setStyleSheet(
+                "QFrame { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 8px; }"
+            )
+            row = QHBoxLayout(row_frame)
+            row.setContentsMargins(10, 8, 10, 8)
+            row.setSpacing(10)
+            row.addWidget(icon_label("phone", theme.ACCENT, 18))
+            info_col = QVBoxLayout()
+            info_col.setSpacing(1)
+            name_lbl = label(dev.get("name", "Trusted Device"))
+            name_lbl.setStyleSheet("font-weight: 600; background: transparent; border: none;")
+            meta_parts = []
+            if dev.get("ip"):
+                meta_parts.append(dev["ip"])
+            if dev.get("paired_at"):
+                meta_parts.append(f"Paired {dev['paired_at']}")
+            meta_lbl = label(" · ".join(meta_parts) or "Paired", "dim")
+            meta_lbl.setStyleSheet("background: transparent; border: none;")
+            info_col.addWidget(name_lbl)
+            info_col.addWidget(meta_lbl)
+            row.addLayout(info_col, 1)
+            btn_rev = button("Revoke", "trash", "dangerBtn")
+            dev_id = dev.get("id", "")
+            if on_revoke and dev_id:
+                btn_rev.clicked.connect(lambda _=False, did=dev_id: on_revoke(did))
+            row.addWidget(btn_rev)
+            self.trusted_list_layout.addWidget(row_frame)

@@ -21,6 +21,10 @@ let serverInfo = null;
 let meshNodes = [];
 let nearbyDevices = [];
 let selectedTargetNodeId = "self";
+let isTrustedDevice = false;
+let trustedDeviceInfo = null;
+let currentPreviewDeleteTarget = null;
+let pendingDeletePayload = null;
 
 // DOM Elements
 const hostPill = document.getElementById("hostPill");
@@ -52,6 +56,7 @@ const selectionActionBar = document.getElementById("selectionActionBar");
 const selectionCountLabel = document.getElementById("selectionCountLabel");
 const btnSelectAllVisible = document.getElementById("btnSelectAllVisible");
 const btnCancelSelect = document.getElementById("btnCancelSelect");
+const btnDeleteSelected = document.getElementById("btnDeleteSelected");
 const btnDownloadSelected = document.getElementById("btnDownloadSelected");
 const incomingBatchesSection = document.getElementById("incomingBatchesSection");
 const incomingBatchesList = document.getElementById("incomingBatchesList");
@@ -96,6 +101,27 @@ const previewModalTitle = document.getElementById("previewModalTitle");
 const previewModalBody = document.getElementById("previewModalBody");
 const btnClosePreview = document.getElementById("btnClosePreview");
 const btnModalDownload = document.getElementById("btnModalDownload");
+const btnModalDelete = document.getElementById("btnModalDelete");
+
+const btnTrustNav = document.getElementById("btnTrustNav");
+const trustNavLabel = document.getElementById("trustNavLabel");
+const trustModal = document.getElementById("trustModal");
+const btnCloseTrustModal = document.getElementById("btnCloseTrustModal");
+const trustPairView = document.getElementById("trustPairView");
+const trustActiveView = document.getElementById("trustActiveView");
+const trustCodeInput = document.getElementById("trustCodeInput");
+const trustDeviceNameInput = document.getElementById("trustDeviceNameInput");
+const trustPairError = document.getElementById("trustPairError");
+const btnSubmitPair = document.getElementById("btnSubmitPair");
+const trustActiveDeviceName = document.getElementById("trustActiveDeviceName");
+const btnUnpairDevice = document.getElementById("btnUnpairDevice");
+
+const deleteConfirmModal = document.getElementById("deleteConfirmModal");
+const btnCloseDeleteModal = document.getElementById("btnCloseDeleteModal");
+const deleteConfirmSummary = document.getElementById("deleteConfirmSummary");
+const deleteConfirmList = document.getElementById("deleteConfirmList");
+const btnCancelDelete = document.getElementById("btnCancelDelete");
+const btnConfirmDelete = document.getElementById("btnConfirmDelete");
 
 const qrModal = document.getElementById("qrModal");
 const btnQrModal = document.getElementById("btnQrModal");
@@ -152,6 +178,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupTabs();
   setupHeroDashboardActions();
   fetchServerInfo();
+  fetchTrustStatus();
   fetchSendBatches(false);
   fetchSafeFolders();
   fetchClipboard();
@@ -566,6 +593,12 @@ function showAllSafeFolders(pushHistory = true) {
     const actions = document.createElement("div");
     actions.className = "file-card-actions";
     if (f.is_file) {
+      const fileDeleteTarget = {
+        folderId: f.id,
+        subpath: "",
+        names: [f.name],
+        isSingleFile: true,
+      };
       const previewBtn = document.createElement("button");
       previewBtn.type = "button";
       previewBtn.className = "card-action-btn btn-preview";
@@ -576,7 +609,8 @@ function showAllSafeFolders(pushHistory = true) {
           f.name,
           f.category || "file",
           `/api/safelist/preview?folder_id=${encodeURIComponent(f.id)}&subpath=`,
-          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`
+          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`,
+          fileDeleteTarget
         );
       });
       actions.appendChild(previewBtn);
@@ -585,12 +619,20 @@ function showAllSafeFolders(pushHistory = true) {
           window.location.href = `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`;
         })
       );
+      if (isTrustedDevice) {
+        actions.appendChild(
+          deleteButton(`Move ${f.name} to Recycle Bin`, () => {
+            openDeleteConfirm(fileDeleteTarget);
+          })
+        );
+      }
       card.addEventListener("click", () => {
         openPreviewModal(
           f.name,
           f.category || "file",
           `/api/safelist/preview?folder_id=${encodeURIComponent(f.id)}&subpath=`,
-          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`
+          `/api/safelist/download?folder_id=${encodeURIComponent(f.id)}&subpath=`,
+          fileDeleteTarget
         );
       });
     } else {
@@ -1395,15 +1437,30 @@ function updateSelectionBar() {
   const count = selectedKeys.size;
   let totalBytes = 0;
   let hasDir = false;
+  let selectedFiles = [];
   safeItemsCache.forEach((it) => {
     if (selectedKeys.has(itemSelectionKey(it))) {
       if (it.is_dir) hasDir = true;
-      else totalBytes += Number(it.size || 0);
+      else {
+        totalBytes += Number(it.size || 0);
+        selectedFiles.push(it);
+      }
     }
   });
   if (selectionCountLabel) {
     const sizeText = totalBytes > 0 ? ` · ${formatBytes(totalBytes)}` : "";
     selectionCountLabel.innerText = `${count} selected${sizeText}`;
+  }
+  if (btnDeleteSelected) {
+    const canDelete = isTrustedDevice && Boolean(currentFolderId) && !currentBatchId;
+    btnDeleteSelected.classList.toggle("hidden", !canDelete);
+    btnDeleteSelected.disabled = !canDelete || selectedFiles.length === 0;
+    btnDeleteSelected.textContent =
+      selectedFiles.length > 0 ? `Delete (${selectedFiles.length})` : "Delete";
+    btnDeleteSelected.title =
+      selectedFiles.length === 0 && count > 0
+        ? "Only files can be moved to the Recycle Bin (folders are skipped)"
+        : "Move selected file(s) to PC Recycle Bin";
   }
   if (btnDownloadSelected) {
     btnDownloadSelected.disabled = count === 0;
@@ -1511,6 +1568,20 @@ if (btnSelectAllVisible) {
     applyBrowseView();
   });
 }
+if (btnDeleteSelected) {
+  btnDeleteSelected.addEventListener("click", () => {
+    if (!isTrustedDevice || !currentFolderId || currentBatchId) return;
+    const filesToDelete = safeItemsCache.filter(
+      (it) => !it.is_dir && selectedKeys.has(itemSelectionKey(it))
+    );
+    if (filesToDelete.length === 0) return;
+    openDeleteConfirm({
+      folderId: currentFolderId,
+      items: filesToDelete.map((it) => it.subpath),
+      names: filesToDelete.map((it) => it.name),
+    });
+  });
+}
 if (btnDownloadSelected) {
   btnDownloadSelected.addEventListener("click", () => {
     const keys = Array.from(selectedKeys);
@@ -1541,6 +1612,7 @@ document.querySelectorAll(".view-btn").forEach((btn) => {
 });
 
 const DOWNLOAD_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`;
+const TRASH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>`;
 
 function downloadButton(label, onClick) {
   const btn = document.createElement("button");
@@ -1551,6 +1623,20 @@ function downloadButton(label, onClick) {
   btn.innerHTML = `${DOWNLOAD_ICON}<span>Download</span>`;
   btn.addEventListener("click", (e) => {
     e.stopPropagation(); // don't also open/preview the card
+    onClick();
+  });
+  return btn;
+}
+
+function deleteButton(label, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "card-action-btn btn-delete";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = `${TRASH_ICON}<span>Delete</span>`;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
     onClick();
   });
   return btn;
@@ -1719,13 +1805,17 @@ function renderSafeItems(items, filtered = false) {
     } else {
       const previewUrl = safeItemUrl("preview", item);
       const downloadUrl = safeItemUrl("download", item);
+      const safeDeleteTarget =
+        !currentBatchId && currentFolderId
+          ? { folderId: currentFolderId, subpath: item.subpath, names: [item.name] }
+          : null;
 
       const previewBtn = document.createElement("button");
       previewBtn.className = "card-action-btn btn-preview";
       previewBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg><span>Preview</span>`;
       previewBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        openPreviewModal(item.name, item.category, previewUrl, downloadUrl);
+        openPreviewModal(item.name, item.category, previewUrl, downloadUrl, safeDeleteTarget);
       });
       actions.appendChild(previewBtn);
 
@@ -1733,8 +1823,16 @@ function renderSafeItems(items, filtered = false) {
         window.location.href = downloadUrl;
       }));
 
+      if (isTrustedDevice && safeDeleteTarget) {
+        actions.appendChild(
+          deleteButton(`Move ${item.name} to Recycle Bin`, () => {
+            openDeleteConfirm(safeDeleteTarget);
+          })
+        );
+      }
+
       card.addEventListener("click", () => {
-        openPreviewModal(item.name, item.category, previewUrl, downloadUrl);
+        openPreviewModal(item.name, item.category, previewUrl, downloadUrl, safeDeleteTarget);
       });
     }
 
@@ -3392,6 +3490,7 @@ function setupSSE() {
           fetchSendBatches(false);
           fetchSafeFolders();
           fetchMeshNodes();
+          fetchTrustStatus();
         }
       } else if (data.type === "file_received") {
         removeIncomingProgress(data.session_id);
@@ -3452,6 +3551,8 @@ function setupSSE() {
         fetchNearbyDevices();
       } else if (data.type === "mesh_role_changed") {
         fetchMeshNodes();
+      } else if (data.type === "trusted_devices_changed") {
+        fetchTrustStatus();
       }
     } catch (err) {
       // heartbeats or non-json messages
@@ -3525,6 +3626,225 @@ function closePreviewModal() {
     });
     previewModalBody.innerHTML = "";
   }
+  currentPreviewDeleteTarget = null;
+  if (btnModalDelete) btnModalDelete.classList.add("hidden");
+}
+
+function guessDefaultDeviceName() {
+  const ua = navigator.userAgent || "";
+  if (/iPhone/i.test(ua)) return "iPhone";
+  if (/iPad/i.test(ua)) return "iPad";
+  if (/Android/i.test(ua)) return "Android Phone";
+  if (/Macintosh|Mac OS/i.test(ua)) return "Mac Browser";
+  if (/Windows/i.test(ua)) return "Windows Browser";
+  return "My Device";
+}
+
+function applyTrustState(trusted, deviceInfo = null) {
+  const changed = isTrustedDevice !== Boolean(trusted);
+  isTrustedDevice = Boolean(trusted);
+  trustedDeviceInfo = isTrustedDevice ? deviceInfo : null;
+
+  if (btnTrustNav) {
+    btnTrustNav.classList.toggle("trusted", isTrustedDevice);
+    btnTrustNav.title = isTrustedDevice
+      ? `Trusted device (${trustedDeviceInfo?.name || "Paired"}) — click to manage or unpair`
+      : "Pair this device to move Safe List files to PC Recycle Bin";
+  }
+  if (trustNavLabel) {
+    trustNavLabel.textContent = isTrustedDevice ? "Trusted" : "Pair";
+  }
+  if (trustPairView && trustActiveView) {
+    trustPairView.classList.toggle("hidden", isTrustedDevice);
+    trustActiveView.classList.toggle("hidden", !isTrustedDevice);
+  }
+  if (trustActiveDeviceName) {
+    trustActiveDeviceName.textContent = trustedDeviceInfo?.name || "Paired Device";
+  }
+  if (btnModalDelete) {
+    btnModalDelete.classList.toggle("hidden", !(isTrustedDevice && currentPreviewDeleteTarget));
+  }
+  updateSelectionBar();
+
+  if (changed) {
+    if (currentFolderId || currentBatchId) {
+      applyBrowseView();
+    } else if (cachedSafeFolders && cachedSafeFolders.length > 0) {
+      showAllSafeFolders(false);
+    }
+  }
+}
+
+async function fetchTrustStatus() {
+  try {
+    const res = await fetch("/api/trust/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    applyTrustState(Boolean(data.trusted), data.device || null);
+  } catch (e) {
+    // Ignore transient network errors
+  }
+}
+
+function openTrustModal() {
+  if (!trustModal) return;
+  if (trustPairError) {
+    trustPairError.textContent = "";
+    trustPairError.classList.add("hidden");
+  }
+  if (trustPairView && trustActiveView) {
+    trustPairView.classList.toggle("hidden", isTrustedDevice);
+    trustActiveView.classList.toggle("hidden", !isTrustedDevice);
+  }
+  if (!isTrustedDevice) {
+    if (trustCodeInput) trustCodeInput.value = "";
+    if (trustDeviceNameInput && !trustDeviceNameInput.value) {
+      trustDeviceNameInput.value = guessDefaultDeviceName();
+    }
+  }
+  trustModal.classList.remove("hidden");
+  if (!isTrustedDevice && trustCodeInput) {
+    setTimeout(() => trustCodeInput.focus(), 50);
+  }
+}
+
+async function submitDevicePair() {
+  if (!trustCodeInput || !btnSubmitPair) return;
+  const digits = trustCodeInput.value.replace(/\D/g, "");
+  if (digits.length !== 6) {
+    if (trustPairError) {
+      trustPairError.textContent = "Enter the 6-digit code shown in NearBeam Settings on your PC.";
+      trustPairError.classList.remove("hidden");
+    }
+    return;
+  }
+  btnSubmitPair.disabled = true;
+  if (trustPairError) trustPairError.classList.add("hidden");
+  try {
+    const res = await fetch("/api/trust/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: digits,
+        device_name: trustDeviceNameInput ? trustDeviceNameInput.value.trim() : "",
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (trustPairError) {
+        trustPairError.textContent = data.error || "Pairing failed. Check the code on your PC.";
+        trustPairError.classList.remove("hidden");
+      }
+      return;
+    }
+    applyTrustState(true, data.device || null);
+    if (trustModal) trustModal.classList.add("hidden");
+    showToast("✓ Paired as trusted device! You can now delete Safe List files to Recycle Bin.", "success");
+  } catch (e) {
+    if (trustPairError) {
+      trustPairError.textContent = "Network error while pairing. Make sure you are on the same Wi-Fi.";
+      trustPairError.classList.remove("hidden");
+    }
+  } finally {
+    btnSubmitPair.disabled = false;
+  }
+}
+
+async function unpairThisDevice() {
+  try {
+    await fetch("/api/trust/unpair", { method: "POST" });
+  } catch (e) {
+    // Best-effort clear
+  }
+  applyTrustState(false, null);
+  if (trustModal) trustModal.classList.add("hidden");
+  showToast("Device unpaired. Delete buttons hidden.", "info");
+}
+
+function openDeleteConfirm(payload) {
+  if (!deleteConfirmModal || !payload) return;
+  pendingDeletePayload = payload;
+  const names = Array.isArray(payload.names) ? payload.names : [];
+  if (deleteConfirmSummary) {
+    deleteConfirmSummary.textContent =
+      names.length === 1
+        ? `Move "${names[0]}" to this PC's Recycle Bin?`
+        : `Move ${names.length} selected files to this PC's Recycle Bin?`;
+  }
+  if (deleteConfirmList) {
+    deleteConfirmList.innerHTML = "";
+    const preview = names.slice(0, 5);
+    preview.forEach((n) => {
+      const li = document.createElement("li");
+      li.textContent = n;
+      deleteConfirmList.appendChild(li);
+    });
+    if (names.length > 5) {
+      const more = document.createElement("li");
+      more.className = "delete-more-item";
+      more.textContent = `...and ${names.length - 5} more file(s)`;
+      deleteConfirmList.appendChild(more);
+    }
+  }
+  deleteConfirmModal.classList.remove("hidden");
+}
+
+function closeDeleteConfirm() {
+  pendingDeletePayload = null;
+  if (deleteConfirmModal) deleteConfirmModal.classList.add("hidden");
+}
+
+async function executePendingDelete() {
+  if (!pendingDeletePayload || !btnConfirmDelete) return;
+  const payload = pendingDeletePayload;
+  btnConfirmDelete.disabled = true;
+  try {
+    const body = Array.isArray(payload.items)
+      ? { folder_id: payload.folderId, items: payload.items }
+      : { folder_id: payload.folderId, subpath: payload.subpath || "" };
+    const res = await fetch("/api/safelist/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 403) {
+      closeDeleteConfirm();
+      fetchTrustStatus();
+      showToast(data.error || "Trusted device pairing required to delete files", "error");
+      return;
+    }
+    if (!res.ok) {
+      closeDeleteConfirm();
+      showToast(data.error || "Could not move file(s) to Recycle Bin", "error");
+      return;
+    }
+
+    const delCount = Array.isArray(data.deleted) ? data.deleted.length : 0;
+    const failCount = Array.isArray(data.failed) ? data.failed.length : 0;
+    closeDeleteConfirm();
+    if (previewModal && !previewModal.classList.contains("hidden")) {
+      closePreviewModal();
+    }
+    if (selectMode) {
+      setSelectMode(false, false);
+    }
+    if (data.pruned_folder || !currentFolderId) {
+      await fetchSafeFolders();
+    } else {
+      await browseSafeFolder(currentFolderId, currentSubpath, false);
+    }
+    if (failCount > 0) {
+      showToast(`Moved ${delCount} file(s) to Recycle Bin (${failCount} skipped)`, "info");
+    } else {
+      showToast(`Moved ${delCount} file(s) to PC Recycle Bin`, "success");
+    }
+  } catch (e) {
+    closeDeleteConfirm();
+    showToast("Network error while deleting file(s)", "error");
+  } finally {
+    btnConfirmDelete.disabled = false;
+  }
 }
 
 function setupModalEvents() {
@@ -3533,6 +3853,52 @@ function setupModalEvents() {
     btnClosePreview.addEventListener("click", closePreviewModal);
     previewModal.addEventListener("click", (e) => {
       if (e.target === previewModal) closePreviewModal();
+    });
+  }
+  if (btnModalDelete) {
+    btnModalDelete.addEventListener("click", () => {
+      if (isTrustedDevice && currentPreviewDeleteTarget) {
+        openDeleteConfirm(currentPreviewDeleteTarget);
+      }
+    });
+  }
+
+  // Trusted Device Pairing Modal
+  if (btnTrustNav) {
+    btnTrustNav.addEventListener("click", openTrustModal);
+  }
+  if (btnCloseTrustModal && trustModal) {
+    btnCloseTrustModal.addEventListener("click", () => trustModal.classList.add("hidden"));
+    trustModal.addEventListener("click", (e) => {
+      if (e.target === trustModal) trustModal.classList.add("hidden");
+    });
+  }
+  if (btnSubmitPair) {
+    btnSubmitPair.addEventListener("click", submitDevicePair);
+  }
+  if (trustCodeInput) {
+    trustCodeInput.addEventListener("input", () => {
+      const d = trustCodeInput.value.replace(/\D/g, "").slice(0, 6);
+      trustCodeInput.value = d.length > 3 ? `${d.slice(0, 3)} ${d.slice(3)}` : d;
+    });
+    trustCodeInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submitDevicePair();
+      }
+    });
+  }
+  if (btnUnpairDevice) {
+    btnUnpairDevice.addEventListener("click", unpairThisDevice);
+  }
+
+  // Delete Confirmation Modal
+  if (btnCloseDeleteModal) btnCloseDeleteModal.addEventListener("click", closeDeleteConfirm);
+  if (btnCancelDelete) btnCancelDelete.addEventListener("click", closeDeleteConfirm);
+  if (btnConfirmDelete) btnConfirmDelete.addEventListener("click", executePendingDelete);
+  if (deleteConfirmModal) {
+    deleteConfirmModal.addEventListener("click", (e) => {
+      if (e.target === deleteConfirmModal) closeDeleteConfirm();
     });
   }
 
@@ -3568,6 +3934,12 @@ function setupModalEvents() {
   // ESC key closes modals
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      if (deleteConfirmModal && !deleteConfirmModal.classList.contains("hidden")) {
+        closeDeleteConfirm();
+      }
+      if (trustModal && !trustModal.classList.contains("hidden")) {
+        trustModal.classList.add("hidden");
+      }
       if (previewModal && !previewModal.classList.contains("hidden")) {
         closePreviewModal();
       }
@@ -3582,8 +3954,12 @@ function setupModalEvents() {
 // Documents that read as plain text; PDFs and Office files are binary and would show as garbage.
 const TEXT_PREVIEW_EXTS = new Set(["txt", "md", "csv", "log"]);
 
-async function openPreviewModal(title, category, previewUrl, downloadUrl) {
+async function openPreviewModal(title, category, previewUrl, downloadUrl, deleteTarget = null) {
   const seq = ++previewSeq;
+  currentPreviewDeleteTarget = deleteTarget || null;
+  if (btnModalDelete) {
+    btnModalDelete.classList.toggle("hidden", !(isTrustedDevice && currentPreviewDeleteTarget));
+  }
   previewModalTitle.innerText = title;
   previewModalBody.innerHTML = "<p>Loading preview...</p>";
   btnModalDownload.href = downloadUrl;

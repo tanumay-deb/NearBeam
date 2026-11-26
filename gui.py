@@ -167,6 +167,7 @@ class ActivityBridge(QObject):
     clipboard_received = Signal(str)
     clipboard_image_received = Signal(bytes, str)
     mesh_updated = Signal(str, list)
+    trusted_changed = Signal()
     transfer_progress = Signal(str, object, object, float)
     transfer_done = Signal(str, bool, str)
 
@@ -349,6 +350,7 @@ class MainWindow(QMainWindow):
         self.bridge.clipboard_received.connect(self._on_remote_clipboard_received)
         self.bridge.clipboard_image_received.connect(self._on_remote_clipboard_image_received)
         self.bridge.mesh_updated.connect(self._on_mesh_updated)
+        self.bridge.trusted_changed.connect(self._refresh_trusted_devices_ui)
         self.bridge.transfer_progress.connect(self._on_transfer_progress)
         self.bridge.transfer_done.connect(self._on_transfer_done)
         self.current_mesh_nodes = []
@@ -390,6 +392,10 @@ class MainWindow(QMainWindow):
         self.events_timer = QTimer(self)
         self.events_timer.timeout.connect(self._drain_server_events)
         self.events_timer.start(250)
+
+        self._pair_timer = QTimer(self)
+        self._pair_timer.setInterval(1000)
+        self._pair_timer.timeout.connect(self._tick_pairing_countdown)
 
         if self.initial_send_paths:
             QTimer.singleShot(400, self, lambda: self._handle_shared_paths(self.initial_send_paths, source="Explorer"))
@@ -467,9 +473,14 @@ class MainWindow(QMainWindow):
         self.chk_autostart = s.autostart.switch
         self.chk_autostart.toggled.connect(self._toggle_autostart)
         s.btn_firewall.clicked.connect(self._configure_firewall)
+        s.btn_pair_device.clicked.connect(self._start_device_pairing)
+        s.btn_cancel_pair.clicked.connect(self._cancel_device_pairing)
+        s.btn_copy_pair_code.clicked.connect(self._copy_pair_code)
+        s.btn_revoke_all_trusted.clicked.connect(self._revoke_all_trusted_devices)
 
         self.nav_buttons[0].setChecked(True)
         self._refresh_safe_table()
+        self._refresh_trusted_devices_ui()
         self.transfers_page.refresh_empty_states()
 
     def _build_sidebar(self) -> QFrame:
@@ -653,6 +664,9 @@ class MainWindow(QMainWindow):
             # Register mesh cluster callback
             self.server_instance.add_mesh_callback(
                 lambda role, nodes: self.bridge.mesh_updated.emit(role, nodes)
+            )
+            self.server_instance.add_trust_callback(
+                lambda: self.bridge.trusted_changed.emit()
             )
             with self.server_instance._events_lock:
                 self.server_instance.event_subscribers.append(self.server_events)
@@ -1518,6 +1532,91 @@ class MainWindow(QMainWindow):
             os.startfile(save_dir)
         else:
             QMessageBox.warning(self, "Folder Not Found", f"Directory does not exist: {save_dir}")
+
+    # ------------------------------------------------------------------
+    # Trusted Devices (One-Time Pairing for Safe List Recycle Bin Delete)
+    # ------------------------------------------------------------------
+    def _start_device_pairing(self):
+        if not self.server_instance:
+            return
+        info = self.server_instance.start_device_pairing()
+        self.settings_page.set_pairing_state(info["code"], info["expires_in"])
+        if hasattr(self, "_pair_timer") and not self._pair_timer.isActive():
+            self._pair_timer.start()
+
+    def _cancel_device_pairing(self):
+        if self.server_instance:
+            self.server_instance.cancel_device_pairing()
+        if hasattr(self, "_pair_timer"):
+            self._pair_timer.stop()
+        self.settings_page.set_pairing_state(None, 0)
+
+    def _copy_pair_code(self):
+        if not self.server_instance:
+            return
+        active = self.server_instance.get_active_pairing()
+        if not active:
+            return
+        self._ignore_clipboard_until = time.monotonic() + 2.0
+        QApplication.clipboard().setText(active["code"])
+        self._append_log("Copied 6-digit device pairing code to clipboard.", "info")
+
+    def _tick_pairing_countdown(self):
+        if not self.server_instance:
+            if hasattr(self, "_pair_timer"):
+                self._pair_timer.stop()
+            self.settings_page.set_pairing_state(None, 0)
+            return
+        active = self.server_instance.get_active_pairing()
+        if not active:
+            if hasattr(self, "_pair_timer"):
+                self._pair_timer.stop()
+            self.settings_page.set_pairing_state(None, 0)
+            return
+        self.settings_page.set_pairing_state(active["code"], active["remaining_seconds"])
+
+    def _revoke_trusted_device(self, device_id: str):
+        if self.server_instance:
+            self.server_instance.revoke_trusted_device(device_id)
+        else:
+            config.revoke_trusted_device(device_id)
+        self._refresh_trusted_devices_ui()
+
+    def _revoke_all_trusted_devices(self):
+        devices = config.get_trusted_devices()
+        if not devices:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Revoke All Trusted Devices",
+            f"Revoke delete access for all {len(devices)} paired device(s)?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if self.server_instance:
+            self.server_instance.revoke_all_trusted_devices()
+        else:
+            config.revoke_all_trusted_devices()
+        self._refresh_trusted_devices_ui()
+
+    def _refresh_trusted_devices_ui(self):
+        if not hasattr(self, "settings_page"):
+            return
+        self.settings_page.set_trusted_devices(
+            config.get_trusted_devices(),
+            on_revoke=self._revoke_trusted_device,
+        )
+        active = self.server_instance.get_active_pairing() if self.server_instance else None
+        if active:
+            self.settings_page.set_pairing_state(active["code"], active["remaining_seconds"])
+            if hasattr(self, "_pair_timer") and not self._pair_timer.isActive():
+                self._pair_timer.start()
+        else:
+            if hasattr(self, "_pair_timer"):
+                self._pair_timer.stop()
+            self.settings_page.set_pairing_state(None, 0)
 
     def _refresh_safe_table(self):
         folders = config.get_safe_folders()
