@@ -1608,66 +1608,68 @@ class NearBeamServer:
             file_part = request.files.get("file")
             using_multipart = file_part is not None
             expected_cl = None if using_multipart else request.content_length
-            with open(temp_path, mode, buffering=8 * 1024 * 1024) as f:
-                if offset is not None:
-                    # A resent chunk overwrites its own range instead of being appended twice.
-                    f.seek(offset)
-                    f.truncate()
-                stream = file_part.stream if using_multipart else request.stream
-                while True:
-                    if self._is_upload_cancelled(session_id):
-                        cancelled = True
-                        break
-                    data = stream.read(read_size)
-                    if not data:
-                        break
-                    f.write(data)
-                    written += len(data)
-                    received += len(data)
-                    now = time.monotonic()
-                    if now - last_emit >= 0.5:
-                        last_emit = now
-                        emit_progress()
+            finalized = False
+            try:
+                with open(temp_path, mode, buffering=8 * 1024 * 1024) as f:
+                    if offset is not None:
+                        # A resent chunk overwrites its own range instead of being appended twice.
+                        f.seek(offset)
+                        f.truncate()
+                    stream = file_part.stream if using_multipart else request.stream
+                    while True:
+                        if self._is_upload_cancelled(session_id):
+                            cancelled = True
+                            break
+                        data = stream.read(read_size)
+                        if not data:
+                            break
+                        f.write(data)
+                        written += len(data)
+                        received += len(data)
+                        now = time.monotonic()
+                        if now - last_emit >= 0.5:
+                            last_emit = now
+                            emit_progress()
 
-            if cancelled or self._is_upload_cancelled(session_id):
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except OSError:
-                    pass
-                return jsonify({"success": False, "cancelled": True}), 499
+                if cancelled or self._is_upload_cancelled(session_id):
+                    return jsonify({"success": False, "cancelled": True}), 499
 
-            if expected_cl is not None and written != expected_cl:
-                return jsonify({"error": "Incomplete chunk payload"}), 400
+                if expected_cl is not None and written != expected_cl:
+                    return jsonify({"error": "Incomplete chunk payload"}), 400
 
-            emit_progress()
+                emit_progress()
 
-            # Re-check cancellation right before returning/finalizing (guards cancel during emit_progress).
-            if self._is_upload_cancelled(session_id):
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except OSError:
-                    pass
-                return jsonify({"success": False, "cancelled": True}), 499
+                # Re-check cancellation right before returning/finalizing (guards cancel during emit_progress).
+                if self._is_upload_cancelled(session_id):
+                    return jsonify({"success": False, "cancelled": True}), 499
 
-            if chunk_index < total_chunks - 1:
-                return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
+                if chunk_index < total_chunks - 1:
+                    return jsonify({"success": True, "completed": False, "chunk_index": chunk_index})
 
-            if file_size is not None:
-                actual_size = os.path.getsize(temp_path) if os.path.isfile(temp_path) else -1
-                if actual_size != file_size:
-                    return jsonify({"error": "Uploaded file size does not match X-File-Size"}), 400
+                if file_size is not None:
+                    actual_size = os.path.getsize(temp_path) if os.path.isfile(temp_path) else -1
+                    if actual_size != file_size:
+                        return jsonify({"error": "Uploaded file size does not match X-File-Size"}), 400
 
-            file_info = self._complete_received_upload(
-                session_id=session_id,
-                temp_path=temp_path,
-                dest_dir=dest_dir,
-                filename=filename,
-                peer=peer,
-                log_template=log_template,
-            )
-            return jsonify({"success": True, "completed": True, "file": file_info})
+                file_info = self._complete_received_upload(
+                    session_id=session_id,
+                    temp_path=temp_path,
+                    dest_dir=dest_dir,
+                    filename=filename,
+                    peer=peer,
+                    log_template=log_template,
+                )
+                finalized = True
+                return jsonify({"success": True, "completed": True, "file": file_info})
+            finally:
+                # Runs with file handle closed and session_lock still held: closes the TOCTOU window
+                # where /api/upload/cancel arrives after EOF/400/socket-reset but before lock release.
+                if not finalized and (cancelled or self._is_upload_cancelled(session_id)):
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except OSError:
+                        pass
 
     def _complete_received_upload(
         self,
@@ -3048,9 +3050,9 @@ class NearBeamServer:
                     os.path.join(tempfile.gettempdir(), "nearbeam_uploads", f"{session_id}.tmp"),
                 ]
                 session_lock = self._get_session_lock(session_id)
-                # Parallel writers never hold session_lock across stream I/O, so a short bounded wait
-                # prevents momentary status-poll/progress locks from skipping cleanup.
-                acquired = session_lock.acquire(timeout=0.2) if is_parallel else session_lock.acquire(blocking=False)
+                # Bounded short wait closes the race when an aborted chunk handler just exited its
+                # finally-check and is about to release session_lock.
+                acquired = session_lock.acquire(timeout=0.3)
                 try:
                     can_delete = acquired
                     if acquired:
